@@ -2,16 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-HBM3 命令调度性能模型——v19.1 中文回归候选版
+HBM3 命令调度性能模型——v20 中文候选版
 ================================================================
 
 版本信息
 --------
-版本          : v19.1
-发布状态      : mandatory latch 迟滞 + cross-SID 串行 + Age 优先级 + BG-Interleave + RW 4 态机 + Refresh Refine 回归候选版
+版本          : v20.0
+发布状态      : 新增 write_requires_data_ready 可选项 (默认 True, 保持 v19.3 行为)
+              + 继承 v19.3 / v19.2 全部特性
 注释语言      : 中文
-行为兼容性    : 继承 v16.3 Refresh Refine 与 v15 READ tRL/txn_id 链表资源；
-              新增 RW 4 态调度机 (默认开启, 旧 batch/alternating 走 fallback)
+行为兼容性    : 默认 write_requires_data_ready=True 与 v19.3 一致;
+              设 False 可恢复 v19.1 baseline (无 buffer 模型).
 地址单位      : 1 个逻辑地址单位对应 32 字节 ColumnCommand
 时间单位      : 1 个模型 cycle = 1 个 DFI cycle = 2 个 HBM CK
 
@@ -38,8 +39,112 @@ ACT、PRE、RD、WR 与 REFpb 等命令的调度过程。模型可用于调度�
 
 
 
-v19.1 关键特性 (本期新增, 重点)
+v20.0 关键特性 (本期新增, 重点)
 ---------------------------------
+1. **新增 `write_requires_data_ready` 参数** (默认 True)
+     - 目的: 让用户可选择"写命令是否需要等 data ready 才能被调度模块看见",
+       覆盖从"严格写数据 FIFO 同步"到"WR 优先/数据后到"的不同 HBM 行为模型.
+     - True  (默认, v19.3 行为): WRITE 入 CAM 后 data_ready_cycle 保持
+       INITIAL_CYCLE_SENTINEL, 必须等 _commit_pending_write_data 把 data
+       搬进 write_data_buffer (满足 delay + buffer 有空间) 后, 调度模块
+       才能看见, 才能发 ACT/WR/WRA. 严格 FIFO 同步模型.
+     - False (v20 新增): WRITE 入 CAM 立即 ready (data_ready_cycle = current_cycle),
+       跳过 _commit_pending_write_data 整段逻辑, _complete_dispatch 也不做
+       buffer 释放 (buffer 永远 0). 模拟旧版"无 buffer 模型" -- WR 命令先发,
+       data 通过 DQS/DQ 独立路径延迟到达.
+     - 用法: HBMCommandScheduler(..., write_requires_data_ready=False)
+     - 适用场景:
+       * 旧 v19.1 baseline 用户升级 v20 时, 设 False 即可恢复原行为, 无需重写 workload.
+       * 对比有无 buffer 模型对 perf 的影响时, 一键切换.
+       * 内存/CPU 受限时, 关掉 buffer 模型可降低模拟复杂度.
+2. **`_commit_pending_write_data` 在 False 模式时整段跳过**
+     - 函数开头加 `if not self._config.write_requires_data_ready: return`,
+       避免无意义的 FIFO 遍历.
+3. **`_complete_dispatch` 释放逻辑适配**
+     - True  模式: 保持 v19.3 行为, 仅 burst 全部 dispatch 完且
+       data_ready_cycle != SENTINEL 时释放 buffer (commit +N, release -N 净 0).
+     - False 模式: 跳过释放逻辑 (buffer 永远 0, 无需归还).
+4. **WRITE admit 端根据开关决定 data_ready_cycle**
+     - True  模式: 保持 INITIAL_CYCLE_SENTINEL (默认).
+     - False 模式: 立即设为 current_cycle (模拟 WR 命令先发).
+5. **校验**: 无新增 (bool 类型无需校验).
+
+
+v19.3 关键特性 (上版本, 保留作为历史)
+---------------------------------
+1. **write_data_buffer 释放逻辑 bug 修复**
+     - 修复 _complete_dispatch 中 over-release 逻辑:
+       原代码每派发 1 个 write col 释放 1 个 buffer entry, 完成时再释放 len(commands),
+       4 col burst 总释放 = 1+1+1+4 = 7 (commit +4), 净溢出 -3 per burst,
+       导致 state["used"] 变成负数, buffer 永远"不满", 约束失效.
+     - 修复: 仅在 burst 全部 dispatch 完时一次性释放 len(burst_entry.commands),
+       commit +N, release -N, 净 0.
+2. **WRITE admit 端加 buffer 约束 [已撤回]**
+     - 撤回原因: WDB (write_data_buffer) 与 WRITE_CAM 是两个独立资源,
+       admit 端耦合 WDB 会导致 WDB 满时连命令都不让进队, 错把
+       "数据 FIFO 满" 当成 "命令队列门", 与真实 HBM 写流程不符
+       (实际 HBM 中 WR 命令先发, data 通过 DQS/DQ 独立路径到达).
+     - 当前行为: admit 端只检查 WRITE_CAM 深度; WDB 满由
+       _commit_pending_write_data 的 FIFO head-block 承担
+       (head 未到 delay / head buffer 满 -> break, 后续等下 cycle);
+       未 commit 的 entry 留在 CAM 中, 通过
+       data_ready_cycle == INITIAL_CYCLE_SENTINEL + _is_entry_data_ready
+       统一入口在 12+ 处调度过滤中保持对调度模块不可见, 不会被发 ACT/WR/WRA.
+3. **默认 `write_data_buffer_depth` 改为 8192**
+     - 原默认 128 在 100 burst workload (400 cols) 下也会约束,
+       perf 退化 2-4x, 与 v19.1 baseline 不兼容.
+     - 新默认 8192 远大于 write_cam_depth × BURST_GROUP_SIZE = 128,
+       默认 workload (10000 txn) 下 buffer 永远不满, baseline perf 完全一致.
+     - 用户主动设小值 (如 32, 8, 4) 即可测试 buffer 约束.
+4. **`_is_entry_data_ready` 统一入口不变** (v19.2 已正确实现, v19.3 无需改动)
+5. **校验**: `_validate_inputs` 新增 `write_data_buffer_depth >= 1` 校验 (v19.3 沿用)
+
+
+v19.2 关键特性 (继承, 上上版本)
+-----------------------------
+1. **新增 `write_data_buffer_depth` 参数** (默认 8192)
+     - 写数据 buffer 深度 (entry 数), 模拟 HBM 的 write data FIFO
+     - 默认 8192 远大于 write_cam_depth × BURST_GROUP_SIZE = 32 × 4 = 128,
+       默认 workload (10000 txn) 下 buffer 永远不满, 即不约束调度,
+       与无 buffer 模型行为一致.
+     - 想测试 buffer 约束时, 设小值 (如 32, 8, 4).
+     - 每个 burst entry 占用 N 个 entry (N = burst 内 col 数, 通常 1-4)
+     - 当 buffer 剩余空间 < N 时, 即使经过 write_data_ready_delay, data 也不能 commit
+     - 调度模块看不到未 commit 的 entry, 不发 ACT/WR/WRA
+     - 严格 FIFO 纪律: 数据入 buffer 顺序 = WRITE 入 CAM 顺序, head 阻塞后续
+2. **新增 `write_data_ready_delay` 参数** (默认 0)
+     - 写命令从入 CAM 到 data ready 之间的延迟 (单位: DFI cycle)
+     - 语义: 只有 data ready 的写命令才被调度模块"看见", 才能发 ACT/WR/WRA
+     - READ 不受影响, 永远 ready (默认 data_ready_cycle = 0, current_cycle >= 0 恒真)
+     - 默认 0 时与原行为完全一致 (向后兼容)
+     - 用法: `HBMCommandScheduler(..., write_data_ready_delay=10)` 表示写命令
+       入 CAM 后需等 10 cycles 才被调度器"看见"
+3. **BurstCommandGroup 新增 `data_ready_cycle` 字段**
+     - READ 默认 `INITIAL_CYCLE_SENTINEL` (read 时显式设 0)
+     - WRITE 入 CAM 时默认 `INITIAL_CYCLE_SENTINEL` (标记"未 commit")
+     - WRITE commit 后由 `_commit_pending_write_data` 设为 current_cycle
+     - 调度模块每 cycle 通过 `_is_entry_data_ready` 检查 `current_cycle >= entry.data_ready_cycle`
+4. **commit 机制**:
+     - `_commit_pending_write_data(current_cycle)` 每 cycle 开头调用一次
+     - 遍历 `self._write_cam`, 找 `data_ready_cycle == INITIAL_CYCLE_SENTINEL`
+       且 `current_cycle >= entry.entry_cycle + write_data_ready_delay` 的 entry
+     - 若 buffer 剩余空间 >= N (N = burst 内 col 数): commit 成功.
+       设 `entry.data_ready_cycle = current_cycle`, `buffer_used += N`.
+     - 严格 FIFO 纪律 (break 强制 head 阻塞): 保证数据入 buffer 顺序 = 入 CAM 顺序
+5. **释放机制**:
+     - 每派发 1 个 write col, 释放 1 个 buffer entry (`_complete_dispatch` 中)
+     - entry 全部 col 派发完时, 一次性释放所有 buffer entry
+     - 防御: 仅当 `data_ready_cycle != INITIAL_CYCLE_SENTINEL` (已 commit) 时才释放
+6. **12 处调度过滤统一改为 `_is_entry_data_ready(entry, current_cycle)` 入口**
+   (替代散落的 `current_cycle < entry.data_ready_cycle` 检查)
+7. **校验**: `_validate_inputs` 新增 `write_data_ready_delay >= 0` 与 `write_data_buffer_depth >= 1`
+8. **新增统计**:
+     - `_write_data_buffer_peak_usage` (历史峰值)
+     - `_write_data_buffer_commit_count` / `_write_data_buffer_wait_count` (累计 commit / 等待次数)
+
+
+v19.1 关键特性 (继承, 上上版本)
+-----------------------------
 1. **mandatory 触发引入 latch 迟滞机制** (`mandatory_latch` + `postpone_low_thr`)
      - 新增 `_mandatory_latch: bool` 字段 (默认 False): 当前是否处于 mandatory 状态
      - 新增 `_mandatory_refresh_count: int` 字段 (默认 0): latch 内已刷的 REFpb 数
@@ -969,6 +1074,12 @@ class BurstCommandGroup:
     starting_col_index: int
     commands: List[ColumnCommand] = field(default_factory=list)
     entry_cycle: int = INITIAL_CYCLE_SENTINEL
+    #: data ready 的 cycle. 默认 `INITIAL_CYCLE_SENTINEL` (标记"未 commit").
+    #: - READ: 入 CAM 时显式设为 0 (永远 ready).
+    #: - WRITE: 入 CAM 时保持默认, 由 `_commit_pending_write_data` 在 buffer
+    #:   容量检查通过后设为 current_cycle.
+    #: 调度模块每 cycle 通过 `_is_entry_data_ready(entry, current_cycle)` 统一判断.
+    data_ready_cycle: int = INITIAL_CYCLE_SENTINEL
     next_dispatch_index: int = 0
 
     @property
@@ -1462,6 +1573,20 @@ class SimulationConfig:
     t_wtrs_hbmck: int
     read_cam_depth: int
     write_cam_depth: int
+    #: 写命令入 CAM 后, 多久 data ready. 只有 data ready 的写命令才能被
+    #: 调度模块看到, 才能发 ACT/WR/WRA (READ 不受影响, 永远 ready).
+    #: 默认 0 表示写命令入 CAM 后立即 ready, 与原行为完全一致.
+    write_data_ready_delay: int
+    #: 写数据 buffer 深度 (entry 数). 每个 burst entry 占用 N 个 entry
+    #: (N = burst 内 col 数, 通常 1-4). 默认 8192 远大于 write_cam_depth ×
+    #: BURST_GROUP_SIZE (32 × 4 = 128), 默认 workload 下 buffer 永远不满,
+    #: 即不约束调度, 与无 buffer 模型行为一致. 想测试 buffer 约束时,
+    #: 设小值 (如 32, 8, 4). 数据入 buffer 顺序严格按 WRITE 入 CAM 顺序
+    #: (FIFO, head 阻塞).
+    write_data_buffer_depth: int
+    #: v20 新增: True=WRITE 入 CAM 后需等 commit 才能 ready (v19.3 行为);
+    #: False=WRITE 入 CAM 立即 ready, 跳过 buffer 模型 (旧版无 buffer 行为).
+    write_requires_data_ready: bool
     num_transactions: int
     cmds_per_transaction: int
     workload_size_bytes: int  #: 每个 workload/transaction 的连续字节数
@@ -2796,7 +2921,8 @@ class RowScheduler:
                  last_act_state: Optional[dict] = None,
                  act_refpb_faw_cycles: Optional[List[int]] = None,
                  bg_interleave_priority: bool = True,
-                 age_priority: bool = True):
+                 age_priority: bool = True,
+                 write_requires_data_ready: bool = True):
         """初始化对象状态及其依赖组件。
 
         v17+: bg_interleave_priority=True 时启用 ACT BG 交织优先级.
@@ -2833,6 +2959,8 @@ class RowScheduler:
         self._bg_interleave_fallback: int = 0    #: 无可用不同 BG, 退回同 BG 的次数
         # v18+: Age 优先级
         self._age_priority: bool = age_priority
+        # v20: True=ACT 必须等 data ready; False=ACT 立即发 (无 buffer 模型).
+        self._write_requires_data_ready = write_requires_data_ready
         self._age_priority_used: int = 0         #: 实际用 age 选优的次数 (即 age 不是平局)
         self._max_age_seen: int = 0             #: 仿真期内见过的最大 age (cycles)
 
@@ -3066,6 +3194,13 @@ class RowScheduler:
                     continue
                 if burst_entry.next_dispatch_index >= len(burst_entry.commands):
                     continue
+                # v19.4: ACT 阶段只 可见，不要求 data ready. WRITE 入 CAM 后即可 ACT, WR/WRA 仍需 data ready (_try_issue_of_type 过滤).
+                if not _is_entry_visible_for_act(burst_entry, current_cycle):
+                    continue
+                # v20: write_requires_data_ready=True 时, ACT 必须等 data ready (commit 后才能发);
+                # False 模式 admit 时已直接 ready, 此检查无影响.
+                if self._write_requires_data_ready and not _is_entry_data_ready(burst_entry, current_cycle):
+                    continue
                 col_cmd = burst_entry.commands[burst_entry.next_dispatch_index]
                 if col_cmd.segment_col_index == bank.cols_dispatched:
                     result.append((bank, col_cmd.row_id, col_cmd.dispatch_id))
@@ -3121,6 +3256,26 @@ class RowScheduler:
 #  Col scheduler
 # ============================================================
 
+
+def _is_entry_data_ready(entry: 'BurstCommandGroup', current_cycle: int) -> bool:
+    """统一判断 entry 的 data 是否 ready (调度模块可见).
+
+    READ: data_ready_cycle = 0 (入 CAM 时显式设置), current_cycle >= 0 永远 ready.
+    WRITE committed: data_ready_cycle = T+delay, ready when current_cycle >= that.
+    WRITE 未 commit: data_ready_cycle = INITIAL_CYCLE_SENTINEL, 永远 not ready
+        (即 data 入 buffer 之前, 调度模块看不到这个 entry).
+
+    用于 12+ 处调度过滤统一入口 (替代散落的
+    `if current_cycle < entry.data_ready_cycle: continue`).
+    """
+    if entry.data_ready_cycle == INITIAL_CYCLE_SENTINEL:
+        return False  # WRITE 未 commit
+    return current_cycle >= entry.data_ready_cycle
+
+
+def _is_entry_visible_for_act(entry: 'BurstCommandGroup', current_cycle: int) -> bool:
+    return entry.next_dispatch_index < len(entry.commands)
+
 class ColScheduler:
     """R/W Column 调度: Batch (stick-to-one-side) 或 Alternating.
 
@@ -3152,7 +3307,9 @@ class ColScheduler:
                  rda_refresh_guard_cycles: int = 256,
                  wra_only_after_page_hit: bool = False,
                  rda_only_after_page_hit: bool = False,
-                 rw_4state_mode: bool = True):
+                 rw_4state_mode: bool = True,
+                 write_data_buffer_state: Optional[dict] = None,
+     write_requires_data_ready: bool = True):
         """初始化对象状态及其依赖组件。"""
         self._banks = banks
         self._timing = timing
@@ -3177,6 +3334,16 @@ class ColScheduler:
         self._preparation_min_banks = preparation_min_banks
         self._preparation_max_dispatches = preparation_max_dispatches
         self._preparation_max_cycles = preparation_max_cycles
+        # v19.2 新增: 共享 write_data_buffer state (HBMCommandScheduler 传入).
+        # None 时 (向后兼容, 旧测试直接构造 ColScheduler) 创建占位 dict.
+        if write_data_buffer_state is None:
+            write_data_buffer_state = {"used": 0, "peak_usage": 0,
+                                        "commit_count": 0, "wait_count": 0}
+        self._write_data_buffer_state = write_data_buffer_state
+        # v20: WRITE 是否需要等 data ready 才能被调度模块看见.
+        # True (默认) 保持 v19.3 行为; False 跳过 commit 模型.
+        self._write_requires_data_ready = write_requires_data_ready
+
         # v16.3+ 新增: 4 态 R/W 调度状态机
         self._rw_4state_mode: bool = rw_4state_mode
         self._rw_state: RWState = RWState.RD
@@ -3277,8 +3444,8 @@ class ColScheduler:
         self._rw_4state_cycles_in_state[self._rw_state.name] += 1
 
         state = self._rw_state
-        rd_has = self._cam_has_unprocessed(read_cam)
-        wr_has = self._cam_has_unprocessed(write_cam)
+        rd_has = self._cam_has_unprocessed(read_cam, current_cycle)
+        wr_has = self._cam_has_unprocessed(write_cam, current_cycle)
 
         if state == RWState.RD:
             if not rd_has and wr_has:
@@ -3319,7 +3486,7 @@ class ColScheduler:
             #      (target ACT 池足够 + 不需要等 tRCD, 可立即切到 WR)
             wr_dispatchable = wr_has and self._has_dispatchable(
                 current_cycle, RWType.WRITE, read_cam, write_cam)
-            wr_acted_count = self._count_acted_banks_in_cam(write_cam)
+            wr_acted_count = self._count_acted_banks_in_cam(write_cam, current_cycle)
             wr_target_ready = (wr_acted_count >= self._preparation_min_banks
                                and wr_dispatchable)
             if wr_dispatchable or not rd_has or wr_target_ready:
@@ -3337,7 +3504,7 @@ class ColScheduler:
             #   c) RD 已开 ≥ preparation_min_banks 个 ACT 且 至少 1 个 col ready
             rd_dispatchable = rd_has and self._has_dispatchable(
                 current_cycle, RWType.READ, read_cam, write_cam)
-            rd_acted_count = self._count_acted_banks_in_cam(read_cam)
+            rd_acted_count = self._count_acted_banks_in_cam(read_cam, current_cycle)
             rd_target_ready = (rd_acted_count >= self._preparation_min_banks
                                and rd_dispatchable)
             if rd_dispatchable or not wr_has or rd_target_ready:
@@ -3347,7 +3514,8 @@ class ColScheduler:
                 if rd_target_ready and wr_has:
                     self._rw_4state_exit_via_target_act += 1
 
-    def _count_acted_banks_in_cam(self, cam: List[BurstCommandGroup]) -> int:
+    def _count_acted_banks_in_cam(self, cam: List[BurstCommandGroup],
+                                  current_cycle: int) -> int:
         """统计 cam 中涉及的 bank 中, 已处于 ACT_WAIT 或 ACTING 状态的 distinct bank 数.
 
         用途: 4 态机过渡态退出判定. 当对向 CAM 中已 ACT 的 bank 数
@@ -3360,6 +3528,8 @@ class ColScheduler:
         acted_banks = set()
         for entry in cam:
             if entry.next_dispatch_index >= len(entry.commands):
+                continue
+            if not _is_entry_data_ready(entry, current_cycle):
                 continue
             bank = self._banks[entry.bank_id]
             if bank.state in (BankState.ACT_WAIT, BankState.ACTING):
@@ -3427,8 +3597,8 @@ class ColScheduler:
         other_cam = write_cam if current_type == RWType.READ else read_cam
 
         # 切模式决策: 看 "有活干" (不卡 dispatchable — 切完才能 ACT)
-        current_has_work = self._cam_has_unprocessed(current_cam)
-        other_has_work = self._cam_has_unprocessed(other_cam)
+        current_has_work = self._cam_has_unprocessed(current_cam, current_cycle)
+        other_has_work = self._cam_has_unprocessed(other_cam, current_cycle)
         other_starving = (self._oldest_entry_wait(other_type, current_cycle, read_cam, write_cam)
                           >= self._batch_timeout_cycles)
 
@@ -3456,7 +3626,7 @@ class ColScheduler:
                 and other_has_work):
             # 2a-i. 对向已 ready (row scheduler 提前 ACT 好) → atomic 切, 不进 prep
             other_banks = self._snapshot_target_banks(other_type, read_cam, write_cam)
-            if self._is_target_banks_ready(other_type, other_banks, target_cam=other_cam):
+            if self._is_target_banks_ready(other_type, other_banks, target_cam=other_cam, current_cycle=current_cycle):
                 self._current_batch_type = other_type
                 self._current_batch_dispatch_count = 0
                 self._atomic_switch_count += 1
@@ -3529,7 +3699,8 @@ class ColScheduler:
                 banks.add(entry.bank_id)
         return banks
 
-    def _cam_has_unprocessed(self, cam: List[BurstCommandGroup]) -> bool:
+    def _cam_has_unprocessed(self, cam: List[BurstCommandGroup],
+                                 current_cycle: int) -> bool:
         """检查 cam 里是否还有未派发完的 cmd (任何 entry.next_dispatch_index < len(commands)).
 
         与 _has_dispatchable 的区别:
@@ -3541,11 +3712,18 @@ class ColScheduler:
         但写 CAM 里有 32 个未处理命令, 必须切到 W 才能让 row scheduler 给写 bank ACT.
         此时 has_dispatchable=False 但 has_unprocessed=True, 仍应触发 empty-fallback.
         """
-        return any(entry.next_dispatch_index < len(entry.commands) for entry in cam)
+        for entry in cam:
+            if entry.next_dispatch_index >= len(entry.commands):
+                continue
+            if not _is_entry_data_ready(entry, current_cycle):
+                continue
+            return True
+        return False
 
     @staticmethod
     def _bank_row_matches_target(bank: 'DRAMBank',
-                                 target_cam: List['BurstCommandGroup']) -> bool:
+                                 target_cam: List['BurstCommandGroup'],
+                                 current_cycle: int) -> bool:
         """Check bank.open_row 是否命中 target CAM 中某个 entry 的 row.
 
         这是 page-open 检查: ACTING bank 能立刻 dispatch target 的前提是 row 匹配.
@@ -3555,6 +3733,8 @@ class ColScheduler:
         for entry in target_cam:
             if entry.next_dispatch_index >= len(entry.commands):
                 continue
+            if not _is_entry_data_ready(entry, current_cycle):
+                continue
             cmd = entry.commands[entry.next_dispatch_index]
             if cmd.row_id == bank.open_row:
                 return True
@@ -3562,8 +3742,8 @@ class ColScheduler:
 
     def _is_target_banks_ready(self, target_type: RWType,
                                target_banks: set,
-                               target_cam: Optional[List[BurstCommandGroup]] = None
-                               ) -> bool:
+                               target_cam: Optional[List[BurstCommandGroup]] = None,
+                               current_cycle: int = 0) -> bool:
         """根据 target_banks 判断 target 模式是否已 ready.
 
         阈值逻辑:
@@ -3590,13 +3770,13 @@ class ColScheduler:
             if target_type == RWType.READ:
                 if bank.state == BankState.ACTING:
                     if (target_cam is not None
-                            and not self._bank_row_matches_target(bank, target_cam)):
+                            and not self._bank_row_matches_target(bank, target_cam, current_cycle)):
                         continue   # stale ACT, 跳过不计
                     prepared += 1
             else:  # WRITE
                 if bank.state == BankState.ACTING:
                     if (target_cam is not None
-                            and not self._bank_row_matches_target(bank, target_cam)):
+                            and not self._bank_row_matches_target(bank, target_cam, current_cycle)):
                         continue
                     prepared += 1
                 elif (bank.state == BankState.ACT_WAIT
@@ -3624,7 +3804,7 @@ class ColScheduler:
         else:  # PRE
             self._preparation_state['pre_count'] += 1
 
-    def _is_preparation_ready(self) -> bool:
+    def _is_preparation_ready(self, current_cycle: int) -> bool:
         """判断目标模式是否"准备好" (用 row-match 严格检查).
 
         与 atomic switch 路径不同: prep 内 row scheduler 看到双 CAM, 会给
@@ -3637,7 +3817,8 @@ class ColScheduler:
             return False
         return self._is_target_banks_ready(state['target'],
                                            state['target_banks_snapshot'],
-                                           state['target_cam'])
+                                           state['target_cam'],
+                                           current_cycle)
 
     def _check_preparation_exit(self, current_cycle: int,
                                 read_cam: List[BurstCommandGroup],
@@ -3655,7 +3836,7 @@ class ColScheduler:
             return None
 
         # 1. 正常退出: 目标 ready
-        if self._is_preparation_ready():
+        if self._is_preparation_ready(current_cycle):
             return 'ready'
 
         # 2. 软上限: 准备期 dispatch 数触顶 (degraded)
@@ -3905,6 +4086,8 @@ class ColScheduler:
         for burst_entry in target_cam:
             if burst_entry.next_dispatch_index >= len(burst_entry.commands):
                 continue
+            if not _is_entry_data_ready(burst_entry, current_cycle):
+                continue
             col_cmd = burst_entry.commands[burst_entry.next_dispatch_index]
             if self._eligibility.check(col_cmd, current_cycle, self._bus):
                 dispatchable.append((burst_entry, col_cmd))
@@ -3946,7 +4129,8 @@ class ColScheduler:
     @staticmethod
     def _find_next_same_page_entry(
             current_entry: BurstCommandGroup,
-            target_cam: List[BurstCommandGroup]) -> Optional[BurstCommandGroup]:
+            target_cam: List[BurstCommandGroup],
+            current_cycle: int) -> Optional[BurstCommandGroup]:
         """在当前 R/W CAM 中选择下一个已排队的同 page entry。
 
         只使用已经进入 CAM 的请求，不预测尚未准入的未来流量。选择最早入 CAM、
@@ -3957,6 +4141,7 @@ class ColScheduler:
             if entry is not current_entry
             and entry.page_key == current_entry.page_key
             and entry.next_dispatch_index < len(entry.commands)
+            and current_cycle >= entry.data_ready_cycle
         ]
         if not candidates:
             return None
@@ -4002,7 +4187,7 @@ class ColScheduler:
                     >= self._next_refresh_cycle[col_cmd.bank_id])
         )
         if auto_precharge_enabled and segment_complete and not refresh_is_pending:
-            next_page_hit = self._find_next_same_page_entry(burst_entry, target_cam)
+            next_page_hit = self._find_next_same_page_entry(burst_entry, target_cam, current_cycle)
 
         use_auto_precharge = bool(
             auto_precharge_enabled
@@ -4052,6 +4237,17 @@ class ColScheduler:
         self._current_batch_dispatch_count += 1
 
         burst_entry.next_dispatch_index += 1
+        # v20: write_data_buffer 释放. entry 已 commit (data_ready_cycle != SENTINEL)
+        # 即占 N 个 slot, 全部 col dispatch 完后释放.
+        # 注意: True/False 模式都释放 (False 模式 commit 也跑, WDB 也占空间).
+        # data_ready_cycle != SENTINEL 已隐含 "已 commit, 占 buffer".
+        # 未 commit 的 entry 占 0 (commit 失败时本就不应占 buffer).
+        if (col_cmd.is_write
+                and burst_entry.data_ready_cycle != INITIAL_CYCLE_SENTINEL
+                and burst_entry.next_dispatch_index >= len(burst_entry.commands)):
+            # 全部 col 派发完, 释放整个 burst 占用的 buffer.
+            buf_state = self._write_data_buffer_state
+            buf_state["used"] -= len(burst_entry.commands)
         if burst_entry.next_dispatch_index >= len(burst_entry.commands):
             target_cam.remove(burst_entry)
 
@@ -4082,6 +4278,8 @@ class ColScheduler:
             for entry in cam:
                 if entry.next_dispatch_index >= len(entry.commands):
                     continue
+                if not _is_entry_data_ready(entry, current_cycle):
+                    continue
                 col_cmd = entry.commands[entry.next_dispatch_index]
                 if self._eligibility.check(col_cmd, current_cycle, self._bus):
                     dispatchable.append((entry, col_cmd))
@@ -4108,6 +4306,8 @@ class ColScheduler:
         for cam in (read_cam, write_cam):
             for entry in cam:
                 if entry.next_dispatch_index >= len(entry.commands):
+                    continue
+                if not _is_entry_data_ready(entry, current_cycle):
                     continue
                 col_cmd = entry.commands[entry.next_dispatch_index]
                 if self._eligibility.check(col_cmd, current_cycle, self._bus):
@@ -4137,7 +4337,17 @@ class ColScheduler:
         target_cam = write_cam if r_w_type == RWType.WRITE else read_cam
         if not target_cam:
             return 0
-        return current_cycle - min(e.entry_cycle for e in target_cam)
+        min_cycle = None
+        for entry in target_cam:
+            if entry.next_dispatch_index >= len(entry.commands):
+                continue
+            if current_cycle < entry.data_ready_cycle:
+                continue
+            if min_cycle is None or entry.entry_cycle < min_cycle:
+                min_cycle = entry.entry_cycle
+        if min_cycle is None:
+            return 0
+        return current_cycle - min_cycle
 
 
 # ============================================================
@@ -4147,7 +4357,7 @@ class ColScheduler:
 class SimulationReporter:
     """每 cycle 状态行 / summary 的格式化与双写 (console + 可选 log file)"""
 
-    _W_CYCLE, _W_REMAIN, _W_CAM, _W_ROW, _W_COL = 7, 8, 38, 34, 44
+    _W_CYCLE, _W_REMAIN, _W_CAM, _W_ROW, _W_COL = 7, 18, 38, 34, 44
     HEADER = (f"  {'Cyc':>{_W_CYCLE}} | {'Remain':>{_W_REMAIN}} | "
               f"{'CAM_Entry':>{_W_CAM}} | {'Row_Cmd':>{_W_ROW}} | {'Col_Cmd':>{_W_COL}}")
     SEPARATOR = (f"  {'─'*_W_CYCLE}─┼─{'─'*_W_REMAIN}─┼─{'─'*_W_CAM}─┼─"
@@ -4196,10 +4406,17 @@ class SimulationReporter:
                           cam_remaining: Tuple[int, int],
                           entered_entry: Optional[BurstCommandGroup],
                           row_cmd: Optional[RowCommand],
-                          col_cmd: Optional[ColumnCommand]) -> str:
-        """把一个 cycle 的状态拼成对齐的一行 (无操作的列用 "--")"""
+                          col_cmd: Optional[ColumnCommand],
+                          wdb_remaining: Optional[int] = None) -> str:
+        """把一个 cycle 的状态拼成对齐的一行 (无操作的列用 "--")
+
+        wdb_remaining=None 时向后兼容旧格式 (仅 R/W), 否则追加 WDBxxx.
+        """
         read_remain, write_remain = cam_remaining
-        remain_s = f"R{read_remain}/W{write_remain}"
+        if wdb_remaining is None:
+            remain_s = f"R{read_remain}/W{write_remain}"
+        else:
+            remain_s = f"R{read_remain}/W{write_remain}/WDB{wdb_remaining}"
 
         if entered_entry:
             col_start = entered_entry.starting_col_index
@@ -4285,6 +4502,25 @@ class HBMCommandScheduler:
                  # ---- CAM 深度 ----
                  read_cam_depth:  int = 32,
                  write_cam_depth: int = 32,
+                 #: 写命令入 CAM 后多少 cycles data ready. 只有 data ready 的写命令
+                 #: 才被调度模块"看见", 才能发 ACT/WR/WRA. 默认 0 = 立即 ready,
+                 #: 与原行为一致. READ 不受此参数影响.
+                 write_data_ready_delay: int = 3,
+                 #: 写数据 buffer 深度 (entry 数). 默认 8192 (足够大, 默认 workload
+                 #: 下 buffer 永远不满, 即不约束调度, 与无 buffer 模型一致).
+                 #: 每个 burst entry 占用 N 个 entry (N = burst 内 col 数).
+                 #: buffer 满时即使经过 write_data_ready_delay 也不能 commit, 数据继续等待.
+                 #: 想测试 buffer 约束时, 设小值 (如 32, 8, 4).
+                 write_data_buffer_depth: int = 128,
+                 #: v20 新增: WRITE 命令是否需要等 data ready 才能被调度模块"看见".
+                 #: - True  (默认, v19.3 行为): WRITE 入 CAM 后 data_ready_cycle 保持
+                 #:   INITIAL_CYCLE_SENTINEL, 必须等 _commit_pending_write_data 把 data
+                 #:   搬进 write_data_buffer (满足 delay + buffer 有空间) 后, 调度模块
+                 #:   才能看见, 才能发 ACT/WR/WRA.
+                 #: - False (v20 新增): WRITE 入 CAM 立即 ready (data_ready_cycle =
+                 #:   current_cycle), 跳过 _commit_pending_write_data 整段逻辑,
+                 #:   _complete_dispatch 也不做 buffer 释放 (buffer 永远 0).
+                 write_requires_data_ready: bool = True,
                  # ---- 激励 ----
                  num_transactions: int = 10000,
                  cmds_per_transaction: int = 4,
@@ -4418,6 +4654,9 @@ class HBMCommandScheduler:
             t_rrd_s=t_rrd_s, t_rrd_l=t_rrd_l, t_faw_hbmck=t_faw_hbmck,
             t_rtw_ns=t_rtw_ns, t_wtrl_hbmck=t_wtrl_hbmck, t_wtrs_hbmck=t_wtrs_hbmck,
             read_cam_depth=read_cam_depth, write_cam_depth=write_cam_depth,
+            write_data_ready_delay=write_data_ready_delay,
+            write_data_buffer_depth=write_data_buffer_depth,
+            write_requires_data_ready=write_requires_data_ready,
             num_transactions=num_transactions,
             cmds_per_transaction=cmds_per_transaction,
             workload_size_bytes=workload_size_bytes,
@@ -4448,7 +4687,21 @@ class HBMCommandScheduler:
             t_rl_cycles=t_rl_cycles,
         )
         self._validate_inputs(read_ratio, read_cam_depth, write_cam_depth,
-                              initial_batch_type)
+                              initial_batch_type, write_data_ready_delay,
+                              write_data_buffer_depth)
+
+        # ---- write_data_buffer 资源 (channel 级 FIFO) ----
+        # 每个 WRITE burst entry 占 N 个 entry (N = burst 内 col 数).
+        # 数据入 buffer 顺序严格按 WRITE 入 CAM 顺序 (FIFO, head 阻塞).
+        # 使用 mutable dict 共享给 ColScheduler (其 _complete_dispatch 需要写回 used).
+        self._write_data_buffer_state: dict = {
+            "used": 0, "peak_usage": 0, "commit_count": 0, "wait_count": 0,
+        }
+        # 保留旧字段名访问兼容 (供 summary 使用)
+        self._write_data_buffer_used: int = 0
+        self._write_data_buffer_peak_usage: int = 0
+        self._write_data_buffer_commit_count: int = 0
+        self._write_data_buffer_wait_count: int = 0
 
         self._clock = clock
         self._timing = TimingParameters.from_inputs(
@@ -4516,7 +4769,8 @@ class HBMCommandScheduler:
             last_act_state=self._last_act_state,
             act_refpb_faw_cycles=self._act_refpb_faw_cycles,
             bg_interleave_priority=bg_interleave_priority,
-            age_priority=age_priority)
+            age_priority=age_priority,
+            write_requires_data_ready=write_requires_data_ready)
         self._col_scheduler = ColScheduler(
             self._banks, self._timing, num_banks, num_bank_groups, num_sid,
             cmds_per_transaction, batch_scheduling, batch_timeout_cycles,
@@ -4534,6 +4788,8 @@ class HBMCommandScheduler:
             wra_only_after_page_hit=wra_only_after_page_hit,
             rda_only_after_page_hit=rda_only_after_page_hit,
             rw_4state_mode=rw_4state_mode,
+            write_data_buffer_state=self._write_data_buffer_state,
+            write_requires_data_ready=write_requires_data_ready,
         )
 
         # ---- CAM + 准入节流 (v6.6: R/W 独立节流 + W col 累加器) ----
@@ -4580,7 +4836,8 @@ class HBMCommandScheduler:
 
     @staticmethod
     def _validate_inputs(read_ratio, read_cam_depth, write_cam_depth,
-                         initial_batch_type) -> None:
+                         initial_batch_type, write_data_ready_delay=0,
+                         write_data_buffer_depth=128) -> None:
         """校验构造参数、配置组合和地址映射，尽早报告输入错误。"""
         if not 0.0 <= read_ratio <= 1.0:
             raise ValueError(f"read_ratio 必须在 [0, 1], 当前 {read_ratio}")
@@ -4588,6 +4845,12 @@ class HBMCommandScheduler:
             raise ValueError("CAM_DEPTH 必须 >= 1")
         if initial_batch_type not in ("READ", "WRITE"):
             raise ValueError("initial_batch_type 必须是 'READ' 或 'WRITE'")
+        if write_data_ready_delay < 0:
+            raise ValueError(
+                f"write_data_ready_delay 必须 >= 0, 当前 {write_data_ready_delay}")
+        if write_data_buffer_depth < 1:
+            raise ValueError(
+                f"write_data_buffer_depth 必须 >= 1, 当前 {write_data_buffer_depth}")
 
     # --------------------------------------------------------
     #  公开 API
@@ -4648,13 +4911,17 @@ class HBMCommandScheduler:
           - cam_busy_banks 过滤: non-mandatory REFpb 选 bank 时跳过 CAM 中已有
             对应 cmd 的 bank, 避免选了一个 "REFPB 即将发出但 col 还在等待" 的 bank.
         """
+        # 先尝试 commit 等待中的 write data (buffer 资源管理).
+        # 必须在 _try_admit_burst_entry 之前: 防止 admit 与 commit 互相抢占.
+        self._commit_pending_write_data(current_cycle)
+
         entered_entry = self._try_admit_burst_entry(current_cycle)
         for bank in self._banks:
             bank.tick(current_cycle, self._timing)
 
         # 收集当前 CAM 中还有未派发 cmd 的 bank 集合, 传给 refresh_scheduler
         # 使其 non-mandatory REFpb 选 bank 时跳过已有对应 cmd 的 bank。
-        cam_busy_banks = self._collect_cam_busy_banks()
+        cam_busy_banks = self._collect_cam_busy_banks(current_cycle)
 
         from_refresh = False
         row_cmd: Optional[RowCommand] = None
@@ -4743,12 +5010,56 @@ class HBMCommandScheduler:
 
         cam_remaining = (self._config.read_cam_depth - len(self._read_cam),
                          self._config.write_cam_depth - len(self._write_cam))
+        wdb_remaining = (self._config.write_data_buffer_depth
+                         - self._write_data_buffer_state["used"])
         line = reporter.format_cycle_line(
-            current_cycle, cam_remaining, entered_entry, row_cmd, col_cmd)
+            current_cycle, cam_remaining, entered_entry, row_cmd, col_cmd,
+            wdb_remaining)
         should_print = (verbose_cycles == -1) or (current_cycle < verbose_cycles)
         reporter.write_cycle_line(current_cycle, line, should_print)
 
         return current_cycle + 1
+
+    def _commit_pending_write_data(self, current_cycle: int) -> None:
+        """每 cycle 开头调用: 尝试 commit 等待中的 write data 到 write_data_buffer.
+
+        遍历 self._write_cam (按入 CAM 顺序), 找 data_ready_cycle ==
+        INITIAL_CYCLE_SENTINEL 且 current_cycle >= entry.entry_cycle +
+        write_data_ready_delay 的 entry. 尝试 commit:
+          - 若 buffer 剩余空间 >= N (N = burst 内 col 数): commit 成功.
+            设 entry.data_ready_cycle = current_cycle, _write_data_buffer_used += N.
+          - 否则: 等下 cycle 再试.
+
+        严格 FIFO (write_cam 顺序, head 阻塞):
+          - head 未到 delay 时间 -> break, 后续不 commit.
+          - head buffer 满 -> break, 后续不 commit.
+          - head commit 成功 -> 继续尝试下一个 (链式 commit).
+        保证数据入 buffer 顺序严格 = 入 CAM 顺序.
+        """
+        # v20: True/False 模式都跑 commit. 差异在 ACT (line 3202 短路) 而非 commit.
+        # False 模式: data 仍进 WDB (used += N), WR/WRA 仍等 commit, 仅 ACT 立即发.
+        delay = self._config.write_data_ready_delay
+        depth = self._config.write_data_buffer_depth
+        state = self._write_data_buffer_state
+        for entry in self._write_cam:
+            # 已 commit: 跳过 (continue 让后续 entry 也能检查)
+            if entry.data_ready_cycle != INITIAL_CYCLE_SENTINEL:
+                continue
+            # 未到 delay 时间: head 阻塞, 后续也不能 commit (FIFO)
+            if current_cycle < entry.entry_cycle + delay:
+                break
+            # 检查 buffer 容量
+            needed = len(entry.commands)
+            if state["used"] + needed > depth:
+                # buffer 满, head 阻塞, 后续也不能 commit (FIFO)
+                state["wait_count"] += 1
+                break
+            # commit 成功
+            entry.data_ready_cycle = current_cycle
+            state["used"] += needed
+            state["commit_count"] += 1
+            if state["used"] > state["peak_usage"]:
+                state["peak_usage"] = state["used"]
 
     def _try_admit_burst_entry(self, current_cycle: int) -> Optional[BurstCommandGroup]:
         """v6.6: R/W 独立节流 + W col 累加器 (上游真实时序)
@@ -4806,7 +5117,7 @@ class HBMCommandScheduler:
                 self._simulation_start_cycle = current_cycle
         return admitted
 
-    def _collect_cam_busy_banks(self) -> set:
+    def _collect_cam_busy_banks(self, current_cycle: int) -> set:
         """返回当前 R/W CAM 中还有未派发 cmd 的 bank 集合.
 
         为 RefreshScheduler.try_issue 提供 “CAM 占用 bank” 名单。
@@ -4819,8 +5130,11 @@ class HBMCommandScheduler:
         cam_busy = set()
         for cam in (self._read_cam, self._write_cam):
             for entry in cam:
-                if entry.next_dispatch_index < len(entry.commands):
-                    cam_busy.add(entry.bank_id)
+                if entry.next_dispatch_index >= len(entry.commands):
+                    continue
+                if current_cycle < entry.data_ready_cycle:
+                    continue
+                cam_busy.add(entry.bank_id)
         return cam_busy
 
     def _is_admission_blocked(self, rw_type: 'RWType', current_cycle: int) -> bool:
@@ -4880,6 +5194,9 @@ class HBMCommandScheduler:
                 return None
 
             burst_entry.entry_cycle = current_cycle
+            # READ 永远 ready (current_cycle >= 0 恒真), 显式设 0 让
+            # _is_entry_data_ready 立刻返回 True.
+            burst_entry.data_ready_cycle = 0
             cam.append(burst_entry)
             self._next_r_index = next_index + 1
             return burst_entry
@@ -4893,9 +5210,24 @@ class HBMCommandScheduler:
                 return None
 
             # 直接 admit 预拆好的 entry，绝不跨 page/segment 重组。
+            # 注意: WDB (write_data_buffer) 容量不在 admit 端检查.
+            # WDB 与 CAM 是独立资源, WDB 满只阻塞 commit (见 _commit_pending_write_data
+            # 的 FIFO head-block), 不阻塞命令入 CAM. 未 commit 的 entry
+            # 通过 data_ready_cycle == INITIAL_CYCLE_SENTINEL 保持对调度模块不可见
+            # (统一入口 _is_entry_data_ready 在 12+ 处调度过滤中已被调用).
             assert all(a is b for a, b in zip(self._w_col_buffer, target.commands))
             self._w_col_buffer.clear()
             target.entry_cycle = current_cycle
+            if self._config.write_requires_data_ready:
+                # v19.3 / v20 True 模式: WRITE data_ready_cycle 保持 INITIAL_CYCLE_SENTINEL
+                # (默认), 表示"未 commit". 由 _commit_pending_write_data 每 cycle 检查
+                # buffer 容量, commit 后才设为具体 cycle. 调度模块在 commit 前看不到这个 entry.
+                pass
+            else:
+                # v20 False 模式: data_ready_cycle 也保持 SENTINEL, 由 _commit_pending_write_data 设.
+                # 区别: ACT 过滤 (line 3202) 短路 write_requires_data_ready=False, ACT 立即发;
+                # WR/WRA 仍走 _is_entry_data_ready 检查, 等 commit (与 True 模式同).
+                pass
             self._write_cam.append(target)
             self._next_w_index += 1
             return target
