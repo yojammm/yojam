@@ -138,6 +138,8 @@ UIF address（sub-command 地址）
 
 每个 sub-command 固定 64B——**恰好与 DDR5/LPDDR5 的一条 col 命令、CHI 的一个包、一个 cache line 三者对齐**，这是全流水线粒度统一的锚点。
 
+> **移位量注记**：上图中 `>> 6` 是 64B/sub-command 的示例配置；真实移位量 = log2(一笔 col command 的大小)，随协议/配置变化——例：LPDDR5 DQ32×BL16 = 64B → 右移 6bit；HBM per PC DQ32×BL8 = 32B → 右移 5bit（见 1.2.3 粒度注记）。
+
 ### 1.2.2 Page hit 判定：不需要知道 page 边界
 
 **悖论**：CAM burst 的准入条件是"同 page"（3.3），但 page 大小要等第 1 章的地址映射才知道——而映射在 XMU 下游。
@@ -150,7 +152,12 @@ col 位宽是一个静态配置常量，"除 col 全同"与"同 page"严格等�
 
 ### 1.2.3 4KB 语义
 
-拆分逻辑**不主动体现 4KB**；地址边界类的计算按 4KB 语义进行——例如**边界只看低 13bit**（4KB = 2^13）。
+4KB 在这里**不是功能路径，而是简化地址边界计算的前提**：
+
+- **协议前提**：txn 不跨 4KB 边界是 AXI 对 master 的协议约束，本设计**没有硬件检测逻辑**，完全依赖该契约；
+- **为什么简化**：INCR txn 每个 transfer 的起始地址若用 full address（36bit）计算，组合逻辑深度大，且位宽会随不同项目（协议/配置）变化；
+- **怎么简化**：利用"不跨 4KB"约束，计算只需**低 13bit（bit[12:0]）**——低 12bit 是页内偏移，bit12 是 4KB 位（即"4KB"的"4"那一位）。计算过程中最多发生一次进位使 bit12 翻转，而**此时必然已到达 txn 边界**，翻转结果不再被后续计算使用，功能安全；
+- **粒度注记**：地址移位量取决于一笔 col command 的大小——LPDDR5 DQ32×BL16 = 64B → 右移 6bit；HBM per PC DQ32×BL8 = 32B → 右移 5bit。">>6" 是示例配置，不是协议常量。
 
 ---
 
@@ -175,7 +182,7 @@ AXI ID = B 的 sub-commands → 另一条 link list
   ③ 每个 cycle 只有一个读数据返回
 ```
 
-效果：**不同 AXI ID 之间乱序交织（谁的数据先回谁先走），同 AXI ID 之间严格保序**——正是 AXI 协议要求的顺序语义。
+效果：**不同 AXI ID 之间乱序交织（谁的数据先回谁先走）；同 AXI ID 同方向严格保序——这是 AXI 协议要求 slave 保证的全部顺序义务**（Ordering 责任五分类见 1.4.4）。
 
 ### 1.3.2 配置公式（经验值）
 
@@ -203,11 +210,30 @@ link list 与 link node 个数均独立可配。node 数公式里"CAM depth × 2
 
 - write response 在 **PA grant + 数据到达 XMU** 即返回（3.5.2），**不等到写进 DRAM**；
 - AXI ID 的作用就是维护顺序：**上游 master 认定"不同方向、同地址的 response 顺序 = 命令执行顺序"**；
+- **提前返回的可见性保证**：BRESP 返回时命令必已通过 PA grant 进入 PA→CQ buffer/CAM，后续同地址命令（**无论 ID**）在 CAM 入口被 RAW/WAR 检测拦截 Pending（§3.5.1）——可见性不靠 ID，靠入口冲突检测 + 单通路阻塞；
 - 把保序点尽量前移，是读延迟之外的另一个端到端延迟收益来源。
 
 ### 1.4.3 明确的取舍：不做超时防死锁
 
-AW/W 数据不同步到达的场景**没有设计超时/死锁防护**——理由：如果数据不来，**master 侧一定可以感知**（它自己的 outstanding/超时机制兜底）。controller 不重复造防护，是边界清晰的表现。
+AW/W 数据不同步到达的场景**没有设计超时/死锁防护**：
+
+- **协议依据**：AXI 对 AW 与 W 的到达**没有任何时间约束**——不规定先后、不规定间隔上限，协议本身不存在"超时"概念；
+- **后果链（W 永远不来）**：该 txn 卡住无法完成 → 该 port 的 AW ostd 逐渐占满 → **该 port 不再接受新请求（单 port 自饿）**；PA 仲裁不会锁定在无请求的 port（设计保证），**其他 port 与已进入 core 的命令均不受影响**——故障域隔离在单个 port；
+- **卡点位置随 mask write 能力不同**：支持 mask write 的系统，命令可**先于数据下发**（最多推进到当前 txn 命令发送结束）；不支持 mask write 的系统（HBM→RMW），命令必须**等待数据 resize 完成**才能下发——W 不来则完全卡在 XMU ostd；
+- **责任边界**：slave（CTRL）**不处理** W 长时间不来——属 master 侧系统问题（超时中断、重启/复位兜底）；
+- **为什么不防御**：若 CTRL 等 W 收齐才接受 AW，AW/W 流水重叠的效率收益全部损失——不能用小概率异常场景的防护污染主通路设计。
+
+### 1.4.4 Ordering 责任五分类（协议义务 vs 正确性保险）
+
+| # | 组合 | 顺序义务 | 责任方 | 本设计实现 |
+|---|---|---|---|---|
+| 1 | 同 ID 同方向（read→read） | AXI 协议要求 slave 保证 | **slave（controller）** | link list，head-only 释放（1.3.1） |
+| 2 | 同 ID 同方向（write→write） | 同上 | **slave（controller）** | B outstanding FIFO 顺序（1.4.2） |
+| 3 | 同 ID 不同方向（r vs w） | slave **无**保序义务 | **master**：利用同 ID 特性，按 response 顺序自行维护 | BRESP 在 PA grant + 数据到达即回，master 观察 BRESP 即认定 write 对后续 read 可见 |
+| 4 | 不同 ID（任意方向） | 无保序要求 | 双方均不保证 | 乱序交织，link list + RR 分配（1.3.1） |
+| 5 | 地址维度 | **地址不参与保序**——slave 不维护地址间的顺序 | — | RAW/WAR 入口拦截（3.5.1）是**数据正确性机制**，不是 AXI 保序义务 |
+
+> 注意第 5 行：本设计的 RAW/WAR 入口拦截（3.5.1）**不是在履行 AXI 保序义务**——协议里 slave 不维护地址序；它是 BRESP 提前返回架构下自加的**数据正确性机制**。面试中若被问"你们 controller 的 ordering 靠什么"，先分清对方问的是**协议义务**还是**正确性保险**。
 
 ---
 
@@ -560,7 +586,7 @@ TPW credit              = 写 CAM 深度
 
 - **LPR/HPR 共存时 credit 不可配 0**——否则一条优先级通路被断流（配置约束，软件须知）；
 - **CamAging 只提升 CAM 内优先级，不改变优先级队列从属**——GPR 的"队列内晋升"（4.2）与 credit 从属一致；
-- PA→CQ 之间还有 buffer：**PA grant 的命令先落在这里**，所以 Pending 命令也已消耗 credit，反压语义自洽。
+- PA→CQ 之间还有 buffer：**PA grant 的命令先落在这里**，所以 Pending 命令也已消耗 credit，反压语义自洽；冲突命令的 Pending 也缓存在这里（3.5.1）——它是入队前唯一的等待点。
 
 ### 3.4.2 水线与 GSC 的联动
 
@@ -574,16 +600,21 @@ TPW credit              = 写 CAM 深度
 
 发生 RAW/WAR 冲突时：
 
-1. **incoming 命令 Pending 在 CAM 入口，并阻塞后续命令入队**（队头阻塞）；
+1. **incoming 命令 Pending 在 CAM 入口（缓存在 PA→CQ 一级 buffer），并阻塞后续命令入队**（队头阻塞）——入队是单条通路，冲突命令进不去 CAM，其后的命令也随之进不去，**后续命令的顺序由通路结构天然保证**；
 2. **已在 CAM 的冲突对象升为最高优先级参与调度**；
 3. 若冲突对象在**对侧方向**（如 read 到达、write 对象还在 buffer 未下发）→ **更早触发读写切换**（5.4.1 条件 3 的实证——冲突天然转化为 GSC 切换动机）。
 
 Pending 命令已消耗 credit（PA grant 时消耗），不会造成 credit 泄漏。
 
+**放行条件**：冲突对象**从 CQ 调度下发（离开 CAM）**即放行 Pending 命令——此后数据顺序由颗粒按命令序保证，controller 不再介入。
+
+**ID 语义**：RAW/WAR 检测**与 AXI ID 无关**——PA grant 后命令已不含 AXI txn 信息，仅剩物理地址 + 属性；AXI 的"同 ID 保序"指**同方向**，反方向、同地址的保序由 master 按 response 顺序保证（1.4.2 提前返回的前提）。
+
 ### 3.5.2 WAW：byte-enable 合并
 
 - 未上 CCT 的 WAW 可 **merge，按 byte enable 合并数据**（两次 partial write 拼成一份）；
-- **response 条件**：txn 的**所有 sub-command 被 PA grant 且数据全部到达 XMU** 后返回（AXI 每笔 txn 独立 response，merge 只合并数据不吞 response）。
+- **response 条件**：txn 的**所有 sub-command 被 PA grant 且数据全部到达 XMU** 后返回（AXI 每笔 txn 独立 response，merge 只合并数据不吞 response）；
+- merge 后 entry 不携带 AXI txn 信息，RAW/WAR 判定仅按物理地址——**merge 对冲突检测无影响**（3.5.1）。
 
 ### 3.5.3 RMW：排斥 merge，只能快冲
 
