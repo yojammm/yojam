@@ -140,15 +140,19 @@ UIF address（sub-command 地址）
 
 > **移位量注记**：上图中 `>> 6` 是 64B/sub-command 的示例配置；真实移位量 = log2(一笔 col command 的大小)，随协议/配置变化——例：LPDDR5 DQ32×BL16 = 64B → 右移 6bit；HBM per PC DQ32×BL8 = 32B → 右移 5bit（见 1.2.3 粒度注记）。
 
-### 1.2.2 Page hit 判定：不需要知道 page 边界
+### 1.2.2 page_match_next 预判：不需要知道 page 边界
 
-**悖论**：CAM burst 的准入条件是"同 page"（3.3），但 page 大小要等第 1 章的地址映射才知道——而映射在 XMU 下游。
+**悖论**：CAM burst 的准入条件是"同 page"（3.3），但 page 大小要等第 2 章的地址映射才知道——而映射在 XMU 下游。
 
 **解法**：
 
 > 在 XMU 中只判断 **UIF address 除 col 位外是否全部相同**来判定 page hit——不需要显式计算 page 边界。
 
 col 位宽是一个静态配置常量，"除 col 全同"与"同 page"严格等价，且比较在拆分现场即可完成。**这是把协议知识（page size）转化为位宽知识（col 位数）的典型手法。**
+
+**RTL 形态与消费点**：每个 sub-command 携带一位 `page_match_next`（XMU→PA），指示**当前 sub-command 与同 txn 的下一个 sub-command 是否同 page**；PA 据此**提高该 port 的优先级**——让同一 txn 的后续 sub-command 尽快跟进，缩短拆分 txn 的完成延迟。
+
+> **术语澄清（面试易混）**：本节判定是**静态地址等价**，与 open row 无关。真正的"hit 当前 open row、可直接发 col 不用 ACT"在 CS/BSC（第 4/5 章）——那才是 FR-FCFS 的 FR。全文三个 "page hit"：XMU `page_match_next`（静态，PA 提权）、CAM burst"同 page"准入（静态，§3.3）、CS page hit（动态 open-row hit）。
 
 ### 1.2.3 4KB 语义
 
@@ -189,9 +193,18 @@ AXI ID = B 的 sub-commands → 另一条 link list
 | 参数 | 含义 | 典型值 |
 |---|---|---|
 | **link list 数** | interleave 粒度：多少个 txn 可以交织 | 32 |
-| **link node 数** | 允许的 outstanding sub-command 数 = **reorder buffer 深度** | link list + CAM depth × 2 |
+| **link node 数** | 允许的 outstanding sub-command 数 = **reorder buffer 深度** | CTL_CAM_DEPTH × CTL_CAM_BURST_SIZE / 2 + 补偿值 |
 
-link list 与 link node 个数均独立可配。node 数公式里"CAM depth × 2"的含义：CAM 里在读的命令 + 飞行在 PHY/数据通路上的一半余量。
+link list 与 link node 个数独立可配。
+
+**link node 与 reorder buffer 的关系（结构）**：link node 存 **AXI 侧元数据**（AXI ID / size / len 等），用于把颗粒返回数据重组为 AXI RDATA；**node 索引即 reorder buffer SRAM 的地址**——node 与数据缓冲一一对应，"node 数 = reorder buffer 深度"在结构与容量两个层面同时成立。
+
+**node 数公式的推导逻辑**：按**平均每个 CAM entry 装 2 条命令**折算：
+- **大包**（txn ≥ 4 sub-command）：CAM 空间 > reorder buffer 需求，瓶颈在 node 侧；
+- **小包**（txn ≤ 2 sub-command）：reorder buffer ≥ CAM 空间，瓶颈在 CAM 侧；
+- **补偿值**为按配置 tune 的工程值：加大 → 在途命令更多、攒批/交织效率更高，代价是单笔延迟与面积上升（实测：LPDDR6 CAM32 / HBM4 CAM96 补偿 32，HBM3 CAM64 补偿 64）。
+
+*交叉验证：LPDDR6 32×4/2+32 = 96、HBM4 96×4/2+32 = 224，与 6.2.3 实测配置吻合。*
 
 ---
 
@@ -264,7 +277,10 @@ QoS 值到队列的映射是**软件可配的分段线性映射**——不是硬
 ## 1.6 CHI 支持范围
 
 - 仅 **NoSnp** 命令：read / prefetch read / full write / partial write；
-- **"AXI 和 CHI 没有核心差异，只是 CHI 每个包最大只有 64B"**——恰好等于 1 个 sub-command，拆分逻辑天然对齐，无需额外适配；
+- **定位（面试口径）**：CHI 与 AXI **协议本身差异很大**（snoop filter、DVM、ordering model、独立 data channel）；"无核心差异"仅指 **CTRL 视野内**——CTRL 只支持 NoSnp 最小特性集，snoop/DVM 一律不支持，normalization 之后的 internal request 与 AXI 同构；
+- **normalization 规则**：ReadNoSnp → 内部 read；**PrefetchRead → LPR（低优先级 read）**——当前上游不投递可丢弃 prefetch，按普通 LPR 处理，不会丢弃；WriteNoSnpFull / WriteNoSnpPt → 内部 write（PtlWrite 借助 datachunk——CHI 类似 strb 的 BE 机制——可发 mask write 到 core）；QoS 划分类似 AXI；
+- **包大小**：固定 size = 64B（**产品配置**，非协议上限）——恰好等于 1 个 sub-command，拆分逻辑天然对齐，无需额外适配；
+- **response**：**wdat 接收后才发生 PA grant，Comp / CompDB 在 PA grant 即返回**——与 AXI 模式"PA grant + 数据到达"是同一原则（CHI 模式数据先到，条件合并为 PA grant）；read 数据由 rdat 返回；
 - snoop/DVM 类一致性流量由上游（interconnect/代理）处理，不在 controller 视野内。
 
 ---
@@ -298,8 +314,8 @@ QoS 值到队列的映射是**软件可配的分段线性映射**——不是硬
 
 > 1. "保序节点 = PA grant：sub-command 一被 grant 就可以回 response。"
 > 2. "Outstanding 设置过大也没有用，过大的 outstanding 会增加单个 txn 的 latency。"
-> 3. "Page hit 在 XMU 只判断除 col 位外 UIF address 是否相同——不需要显式计算 page 边界。"
-> 4. "AXI 和 CHI 没有核心差异，只是 CHI 每个包最大只有 64B——恰好等于一个 sub-command。"
+> 3. "XMU 的 page_match_next 只判断除 col 位外 UIF address 是否相同——不需要显式计算 page 边界；它是静态同 page 判定，真正的 open-row hit 在 CS。"
+> 4. "CHI 与 AXI 协议本身差异很大；CTRL 只支持 NoSnp 最小特性集，normalization 后的 internal request 与 AXI 无核心差异——包大小固定 64B，恰好等于一个 sub-command。"
 
 **本章术语表**：
 
