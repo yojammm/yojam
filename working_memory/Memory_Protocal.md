@@ -1,8 +1,68 @@
 # 多协议内存对比：HBM3/3E/4 · DDR5 · LPDDR5/5X/6
 
-> **定位**：Memory Controller 方向的日常查阅速查手册 + 核心考点手册。
+> **定位**：Memory Controller 方向的日常查阅速查手册 + 核心考点手册；以《研究纲领》为纲——横向对比（HBM/DDR/LPDDR/3D DRAM）+ 纵向演进（每代新 Feature 的六层追问），覆盖状态见"问题路线图"一节。
 > **数据口径**：以 JEDEC 标准原文核对为准 —— JESD238（HBM3）、JESD270-4（HBM4）、JESD79-5B（DDR5）、JESD209-5B（LPDDR5/5X）、JESD209-6（LPDDR6）；核对日期 2026-09。厂商公开资料单独标注。仍存疑的数字以 ⚠️ 标记（见附录 D）。
-> **约定**：每节末尾的【核心速答】为 30 秒口径的高频问题答案；题目编号（A1/B1…）对应原始问题清单，便于回溯。
+> **约定**：每节末尾的【核心速答】为 30 秒口径的高频问题答案；正文小节标题中的题号已统一迁移为《研究纲领》Part I~XII 问题编号（A1~O10 等），完整清单与覆盖状态见"问题路线图"；旧清单（A1~H4）编号作废，映射见维护说明。
+
+## 研究纲领（本文方法论）
+
+> 本节回答"这份手册怎么用、往哪里长"：正文速查提供 [JEDEC] 层的"是什么"；"问题路线图"追踪每个纲领问题的回答状态；六层追问框架负责"为什么"。当前正文覆盖 HBM / DDR5 / LPDDR 三族，横向纲领中的 3D DRAM 专题待扩展。
+
+### 纲 0.1 文档目标：横向与纵向
+
+- **横向**：HBM / DDR / LPDDR / 3D DRAM——面对相同问题时为什么选择不同方案。
+- **纵向**：DDR4→DDR5、LPDDR4→LPDDR5→LPDDR6、HBM2→HBM3→HBM4——同一种 Memory 为什么会出现新的 Channel、Clock、Refresh、RAS、Training、Power Feature。
+- 终极问题：**一个协议 Feature 是为了修复上一代的什么瓶颈？它把复杂度从哪里转移到了哪里？Controller、PHY、Package 分别付出了什么代价？**
+
+### 纲 0.2 一个 Feature 必须追六层
+
+| 层 | 追问 | 关注度 |
+|---|---|---|
+| 1. Problem | 上一代遇到了什么问题？ | 入口 |
+| 2. Protocol Mechanism | 协议具体增加或改变了什么？ | 入口 |
+| 3. Physical Cause | 为什么物理上需要这样做？ | ★ 核心 |
+| 4. Controller Cost | Controller 需要新增什么状态机、counter、queue、sequence？ | ★ 核心 |
+| 5. PHY / Package Cost | PHY、信号、电源、封装需要新增什么？ | ★ 核心 |
+| 6. Tradeoff / Evolution | 获得了什么？付出了什么？下一代往哪个方向继续？ | ★ 核心 |
+
+本文真正关心第 3～6 层。
+
+### 纲 0.3 信息来源纪律
+
+| 标签 | 含义 |
+|---|---|
+| [JEDEC] | 标准明确规定 |
+| [VENDOR] | 厂商 datasheet / whitepaper |
+| [DFI] | DFI Specification |
+| [PROJECT] | 项目真实实现 |
+| [PHYSICAL-EXPLANATION] | 基于电气/阵列原理的解释 |
+| [INFERENCE] | 本人架构推论 |
+| [UNKNOWN] | 尚未理解 |
+
+- **JEDEC 通常告诉我"必须做什么"，但不一定告诉我"物理上为什么这样做"**——"为什么"若非标准原文，不得伪装成标准结论。
+- 执行方式：新内容落笔必须带标签；既有正文的标签映射见文末维护说明与附录 D（✅=[JEDEC]、厂商口径=[VENDOR]、⚠️=[UNKNOWN]）。
+
+### 纲 0.4 PHY 学习深度边界
+
+不要求设计 analog PHY，要求打通：
+
+```text
+Protocol Feature
+      ↓
+Physical Problem
+      ↓
+Training / Calibration
+      ↓
+DFI Handshake
+      ↓
+Controller Responsibility
+```
+
+示例（应能完整复述）：Data rate 增加 → UI 变窄 → jitter/skew 占比增加 → static timing margin 不足 → 引入 per-lane deskew / Vref / equalization → PHY 完成实际 delay/Vref tuning → Controller 通过 DFI 发起并管理 training sequence。
+
+### 纲 0.5 最终完成标准
+
+看到任何一个新协议 Feature，不再满足于"Spec 规定如此"，而是能回答：**上一代哪里不够？物理根因是什么？协议怎么解决？Controller 要增加什么？PHY/Package 要付出什么？性能、功耗、面积和可靠性最终交换了什么？**
 
 ## 0. 速查表（一页纸）
 
@@ -30,7 +90,7 @@
 
 ## 1. 顶层指标对比
 
-### 1.1 带宽与速率（A1 / A3）
+### 1.1 带宽与速率（纲领 O10 / L3 / A8~A9）
 
 **HBM：带宽翻倍的两种姿势**
 
@@ -57,7 +117,7 @@
 
 【核心速答】HBM 三代的公式都是 位宽×速率：3→3E 靠速率，3E→4 靠位宽翻倍（基线速率还回落到 8G），产品带宽靠代内速率爬坡到 12.8G/3.3TB/s。LPDDR5→5X→6 是速率阶梯（6.4→10.7→14.4G）；LPDDR6 注意 288-bit 突发里只有 256-bit 是有效数据。
 
-### 1.2 容量与扩展路径（A2 / A4）
+### 1.2 容量与扩展路径（纲领 A4 / A12 / O5）
 
 | 维度 | HBM | DDR5 | LPDDR5/6 |
 |---|---|---|---|
@@ -70,7 +130,7 @@
 - **LPDDR6 窄通道与容量（A4）**：x24 Normal Mode 与 x12 Dynamic/Static Efficiency Mode（JESD209-6 §2.2.2 / §7.8.29），并支持 **Mixed Package**（x24 die 与 Static Efficiency die 混装）——通道配置与容量配置解耦。⚠️ 原问题清单中"x6"的说法在 JESD209-6 中不存在（x6 / 6-DQ 全文 0 命中），标准口径为 x24/x12。
 - **HBM4 的解耦（B2 预告）**：4 die 即满 32 通道，第 5~16 die 只增加容量、SID 与 bank 数（16/32/48/64 banks per channel）——通道数与容量/bank 并行度解耦。
 
-### 1.3 应用定位
+### 1.3 应用定位（纲领 O5）
 
 - **HBM**：AI 加速器/GPU 的片旁带宽引擎（near-compute），2.5D 中介层互装；持续满带宽型负载。
 - **DDR5**：服务器/PC 主存；容量、单位成本与系统 RAS（side-band ECC、刷新管理族、模组生态）优先。
@@ -80,7 +140,7 @@
 
 ## 2. 架构与通道组织
 
-### 2.1 HBM3/4：stack → channel → pseudo-channel → DWORD（B1 / B2）
+### 2.1 HBM3/4：stack → channel → pseudo-channel → DWORD（纲领 A5~A7 / A11~A12）
 
 **层级结构（JESD238 §3.1 / JESD270-4 §2）**
 
@@ -98,19 +158,19 @@
 
 【核心速答】HBM 记三层：**通道管命令并发、伪通道管电源/刷新/时序分区、DWORD 管训练修复**。每 PC 数据出 32-bit 时还带 DBI、接口 ECC 和 SEV 严重度位。HBM4 通道翻倍到 32 且通道与容量解耦——调度器横向复制扩状态表，地址映射要防通道热点。
 
-### 2.2 DDR5：DIMM → 子通道 → Bank Group（B3）
+### 2.2 DDR5：DIMM → 子通道 → Bank Group（纲领 A4）
 
 - 每 DIMM **2 个完全独立子通道**：各 32-bit（ECC 模组 40-bit = 32 数据 + 8 side-band ECC）；各自 14-bit CA、CS、行列译码器、时序状态机与刷新相位，可同时执行不同命令（一个在 tRFC、另一个满带宽读）。
 - BG/bank：bank group 架构，16Gb 档为 8BG×4B=32 banks/子通道 ⚠️（以厂商 datasheet 为准）；BL16。
 - 控制器利用：① cache line 级子通道交错，命令级并行 ×2；② **刷新错峰**（两子通道 tRFC 相位错开，避免整条 DIMM 同时不可用）；③ 读写翻转（bus turnaround）按子通道独立优化；④ DFI/训练均为双实例。
 
-### 2.3 LPDDR5/6：BG 架构与 x24/x12 效率模式（B4）
+### 2.3 LPDDR5/6：BG 架构与 x24/x12 效率模式（纲领 A1 / A8 / O8）
 
 - **LPDDR5**：16 banks / 4BG×4B，BL16；调度上区分跨 BG（短时序）与同 BG（长时序）的列命令间隔，BG-aware 排序（把连续请求按 BG 交织）直接抬高总线利用率；per-byte WCK/RDQS。
 - **LPDDR6（JESD209-6 §2.2.2）**：x24 Normal Mode = **2 个 Sub-Channel（SC0/SC1）**，每 SC 含 12DQ+RDQS_t/c + WCK_t/c + 4 CA + CS + CK_t/c；每 SC 4BG×4B = 16 banks；**x12 Dynamic / Static Efficiency Mode**（§7.8.29）重构子通道配置以提升引脚/容量效率，且支持 x24 die 与 SEM die **混装**（Mixed Packages）。
 - 突发：BL24/BL48（12n/24n prefetch）；BL24 在 12-DQ SC 上 = 288-bit（256 数据 + 32 非数据），I/O 侧为 12 个 12-bit 半 WCK 周期传输；**BL/n（Effective Burst Length）** 定义不同模式的有效突发，同 BG tCCD 随 BL 取 6/8/12/24nCK。
 
-### 2.4 对比小结：调度粒度与并行度
+### 2.4 对比小结：调度粒度与并行度（纲领 A6 / A7 / O1）
 
 | 协议 | 独立命令流 | 电源/刷新管理粒度 | 训练/修复粒度 |
 |---|---|---|---|
@@ -122,7 +182,7 @@
 
 ## 3. 命令与时序
 
-### 3.1 HBM3/4：双命令接口与无 CKE（C1 / C2）
+### 3.1 HBM3/4：双命令接口与无 CKE（纲领 B5~B7）
 
 **双命令接口（JESD238 §3.1.3，HBM3/3E/4 通用）**
 
@@ -139,7 +199,7 @@
 
 【核心速答】HBM3 起每通道行 10-bit/列 8-bit 两条总线，ACT 1.5 拍、列命令 1 拍，行/列同窗口并行——行开销被列流吃掉。CKE 删除后低功耗全靠命令+MR，控制器要自己做排空、定时和唤醒预测。
 
-### 3.2 DDR5：CA 总线与 DFI 命令编排（C3）
+### 3.2 DDR5：CA 总线与 DFI 命令编排（纲领 B1~B4 / B8）
 
 - 每子通道 **14-bit CA**。**1T（单周期）**：NOP / PRE / REF(REFab/REFsb) / RFM / MPC 等无地址承载命令；**2T（双周期）**：ACT / RD / WR / MRS 等带地址命令——两拍共 28-bit（第 1 拍 opcode+BG/bank+行地址高位，第 2 拍列地址/行地址余位）。
 - 动机：CA 位宽从 DDR4 的 20+ 根压到 14 根（子通道化使引脚预算减半），本质是"引脚换拍数"；列命令第 2 拍带列地址，保持 BL16 粒度。
@@ -148,7 +208,7 @@
 
 【核心速答】DDR5 每子通道 14-bit CA：无地址命令单拍，ACT/RD/WR/MRS 双拍共 28-bit；DFI 里 2T 是原子操作，训练命令走 MPC。
 
-### 3.3 LPDDR5/6：三时钟域与 CKR（C4）
+### 3.3 LPDDR5/6：三时钟域与 CKR（纲领 H1~H7）
 
 - 时钟域：**CK**（低频命令时钟，CA 7-bit DDR）+ **WCK**（写数据时钟）+ **RDQS**（读选通，per-byte）。数据速率 = 2×WCK 频率。
 - **CKR = WCK:CK 分频比**（JESD209-5B）：
@@ -160,7 +220,7 @@
 
 【核心速答】LPDDR 是三时钟域：命令走低速 CK（CKR 4:1 覆盖 533~6400，2:1 只到 3200），数据走全速 WCK 按 byte 门控。WCK 与 CK 异步，开机靠 WCK2CK Leveling 锁 FIFO 指针，每次变频都要重做——这是 LPDDR 控制器比 DDR 多出来的核心机制。
 
-### 3.4 关键时序参数对比（C5）
+### 3.4 关键时序参数对比（纲领 C1 / C5~C12 / B9）
 
 | 参数 | LPDDR5 | DDR5-8400 | HBM4-12000（CK=3GHz = rate/4） |
 |---|---|---|---|
@@ -178,7 +238,7 @@
 
 ## 4. 训练与校准（LPDDR5/6 重点）
 
-### 4.1 LPDDR5/6 训练流程（D3）
+### 4.1 LPDDR5/6 训练流程（纲领 I 组自举链：CA→WCK2CK→读均衡→写均衡→Vref/DFE→频点 training set）
 
 顺序由自举依赖决定（后一步依赖前一步打通的通路）：
 
@@ -189,7 +249,7 @@
 5. **VREF(DQ) 训练** + LPDDR5X 起的 **per-pin DFE**（§7.7.7）。
 6. 频率维度：低频 f0 初始化训练 → DFS 后用 **training set 保存/恢复**（多 frequency setpoint）；DVFSC/DVFSQ 等低功耗模式依赖该机制（见 5.3）。
 
-### 4.2 三协议训练机制一览
+### 4.2 三协议训练机制一览（纲领 O2）
 
 | 维度 | HBM3/4 | DDR5 | LPDDR5/6 |
 |---|---|---|---|
@@ -204,7 +264,7 @@
 
 ## 5. 功耗与电压域
 
-### 5.1 供电轨对比（E2）
+### 5.1 供电轨对比（纲领 M8 / L9~L10 / O6）
 
 | 协议 | 供电轨与典型值 | 备注 |
 |---|---|---|
@@ -216,7 +276,7 @@
 
 要点：HBM3→HBM4 的电气演进方向是"**把余量下放厂商**"（I/O 电压开放），换取 PHY 工艺自由度（配合逻辑 base die）；LPDDR 的方向相反——**标准把电源轨越拆越细**，换取能效管理精度。
 
-### 5.2 功耗与 pJ/bit（E1）
+### 5.2 功耗与 pJ/bit（纲领 M7 / O10）
 
 | 代际 | 单 stack 功耗（满负载量级）⚠️ 建议以项目实测/厂商 datasheet 替换 | pJ/bit 趋势 |
 |---|---|---|
@@ -227,7 +287,7 @@
 - 规律：**总功耗随带宽近线性上涨，pJ/bit 随代际下降**。速率路线（3→3E）主要花 IO 功耗买带宽，pJ/bit 改善有限；位宽路线（3E→4）用更低 per-pin 速率跑更宽总线，能效更好——这是 HBM4"降速翻宽"的功耗学解释（呼应 1.1）。
 - 控制器视角：HBM 无 DFS，功耗管理收敛为 per-PC 降活 + 热感知节流；与 LPDDR 的精细 DVFS 成两极（见 5.3）。
 
-### 5.3 控制器侧功耗管理机制（E3 / E4）
+### 5.3 控制器侧功耗管理机制（纲领 O3 / O6 / M10）
 
 **LPDDR6 的 VDD2 强制拆分与 DVFS 家族**
 
@@ -250,7 +310,7 @@
 
 ## 6. 可靠性与 RAS
 
-### 6.1 DDR5：片上 ECC vs Side-band ECC（F1）
+### 6.1 DDR5：片上 ECC vs Side-band ECC（纲领 F1~F4 / F6）
 
 | 维度 | On-Die ECC（片上，强制） | Side-band ECC（模组级） |
 |---|---|---|
@@ -262,7 +322,7 @@
 
 - 关键推论：ODECC 透明纠错造成**可靠性遥测盲区**（已纠错不可见，只能从未纠错错误率间接推断）；系统 RAS 必须依赖 side-band 层做 scrub 与日志。两层是**纵深防御**：ODECC 把原始错误率压低 1~2 个量级，side-band 兜底链路与残余阵列错误。
 
-### 6.2 HBM：On-die ECC + SEV 上报 + DRFM（F2）
+### 6.2 HBM：On-die ECC + SEV 上报 + DRFM（纲领 F5 / F7~F10）
 
 - **HBM3（JESD238 §6.9）**：**symbol-based On-die ECC + 读写 meta-data（MD）位 + 错误擦洗（scrubbing）+ 错误透明协议 + 接口传输 parity + 故障隔离限**——片内自治的纵深组合（不是主机 side-band 模式）。
 - **错误上报**：每 PC 的 **SEV[1:0] 引脚**随读突发携带严重度编码（JESD270-4 Table 67/68 Severity Encodings）；ECS（自动纠错擦洗）错误日志寄存器（MR81/82；HBM4 支持多 bit 纠正记录，MR9）。
@@ -271,7 +331,7 @@
 
 【核心速答】HBM 的 ECC 是片内自治（symbol-based on-die + scrub + 接口 parity），纠错严重度经 SEV 引脚随读数据带内上报、ECS 记日志；HBM4 再加 DRFM/BRC 有界定向刷新。控制器读侧直接收 SEV，不用猜。
 
-### 6.3 刷新粒度：REFpb vs REFsb（F3）
+### 6.3 刷新粒度：REFpb vs REFsb（纲领 E2~E5 / E8~E9 / O9）
 
 | 维度 | LPDDR5 REFpb | DDR5 REFsb |
 |---|---|---|
@@ -283,7 +343,7 @@
 - 共同哲学：把刷新从"周期性全局停机"重构为"**可调度的后台工作**"，由控制器 QoS 决定何时还债；REFab 在两者中都保留（深度空闲/进自刷新前最划算）。
 - 粒度差异根源：LPDDR 通道窄、延迟敏感（手机），要单 bank 粒度；DDR5 子通道 bank 多、吞吐敏感，BG 级批量刷新更省命令带宽。LPDDR5 还定义了 Optimized Refresh 组合（示例：8×REFpb 完成一轮 bank 覆盖）。
 
-### 6.4 Row Hammer：RAA/激活计数 + 刷新管理族（F4）
+### 6.4 Row Hammer：RAA/激活计数 + 刷新管理族（纲领 E10~E14 / O7）
 
 | 协议 | 机制 | 要点 |
 |---|---|---|
@@ -300,7 +360,7 @@
 
 ## 7. Memory Controller 设计差异
 
-### 7.1 调度器架构分叉点（G1）
+### 7.1 调度器架构分叉点（纲领 A3 / B6 / D10）
 
 公共抽象：**bank/PC 状态表 + 时序检查器（timing checker）+ 策略层（QoS/仲裁）**；差异在实例规模与策略维度：
 
@@ -314,7 +374,7 @@
 - HBM 调度器是"**横向复制 + 全局 QoS**"：对象多而轻；DDR5/LPDDR 是"**少数深通道**"：单对象内 rank/BG/刷新/翻转策略复杂。
 - 地址映射：HBM 用 channel-first striping（cache line 级打散到 32 通道）；DDR5/LPDDR 在子通道/通道维度的 hash 同样决定热点分布——**映射策略是三协议共享的设计课题，只是维度数不同**。
 
-### 7.2 DFS vs 固定频率（G2）
+### 7.2 DFS vs 固定频率（纲领 O3 / J10 / K5 / I19~I21）
 
 LPDDR DFS/DVFS 对调度器的额外要求：
 
@@ -327,7 +387,7 @@ DDR5 固定频率：初始化训练一次 + 温漂重校（ZQ/Vref 类），调�
 
 【核心速答】调度器公共骨架 = 状态表 + 时序检查 + QoS 策略；HBM 横向复制（对象多而轻），DDR5/LPDDR 纵向加深（rank/BG/刷新策略复杂）。LPDDR 独有的一整块是 DFS：训练集、DFI 手序列、多轨电压、抖动建模。
 
-### 7.3 统一控制器前端：复用与分叉边界（G3）
+### 7.3 统一控制器前端：复用与分叉边界（纲领 O1~O10 / J8~J9）
 
 **可复用（协议无关层）**
 
@@ -345,7 +405,7 @@ DDR5 固定频率：初始化训练一次 + 温漂重校（ZQ/Vref 类），调�
 
 **工程结论**：统一的是**前端（事务/QoS/基础设施）**，分叉的是**协议引擎（编码/训练/刷新/低功耗）**；常见落地形态 = 共享前端 + 每协议独立 MC core + 统一 infra（性能计数/RAS/寄存器）。
 
-### 7.4 高频问题：HBM 带宽这么高，为什么不能替代 DDR5 当主存？（G4）
+### 7.4 高频问题：HBM 带宽这么高，为什么不能替代 DDR5 当主存？（纲领 O5）
 
 1. **容量**：HBM 单封装 ≤64GB 且设计期锁死；服务器主存需要 TB 级横向扩展，只有 DIMM 插槽路线能做到。
 2. **成本**：TSV + 堆叠键合 + 中介层的良率代价，HBM $/GB 远高于 RDIMM。
@@ -354,15 +414,15 @@ DDR5 固定频率：初始化训练一次 + 温漂重校（ZQ/Vref 类），调�
 
 【核心速答】统一控制器分两层：事务/QoS/基础设施可复用；命令编码、训练、刷新管理、低功耗必须分叉——根因是"命令格式、回读通道、刷新哲学、电源架构"四个正交维度全都不同。HBM 替代不了 DDR5 是容量与成本问题，不是带宽问题。
 
-### 7.5 高频对比题（H1~H4）
+### 7.5 高频对比题（对比题 1~4；纲领锚点：题1→O 组综合、题2→Part XII、题3→Part XII 样例一、题4→A6 / A7）
 
-**H1："LPDDR5 是 DDR5 的移动精简版"——对吗？**
+**对比题 1（旧 H1）："LPDDR5 是 DDR5 的移动精简版"——对吗？**
 
 不完全对。**相同点**：SDRAM 阵列语义同源（bank/BG/BL/刷新的底层时序概念）。**独立演进（不是简化）**：时钟架构（LPDDR5 三时钟域 + CKR vs DDR5 单 CK）；命令编码（7-bit DDR CA vs 14-bit 1T/2T）；电源（VDD2H/L 多轨 + DFS/DVFSQ + 更深低功耗态 vs DDR5 无频率切换）；训练（interval oscillator / WCK2CK vs MPC/MRR）；并行度设计（多窄通道 vs 双子通道）。**各有对方没有的东西**：DDR5 有 ODECC 强制、双子通道、PMIC 模组化；LPDDR5 有 DFS、DPD、更细的低功耗态。
 
 【核心速答】阵列语义同源，接口/命令/电源/训练四层各自演进——两者不存在谁是谁的子集；说"精简版"会漏掉 LPDDR 更复杂的多频点电源管理。
 
-**H2：HBM4 向后兼容 HBM3 控制器——混合部署时控制器要做什么？**
+**对比题 2（旧 H2）：HBM4 向后兼容 HBM3 控制器——混合部署时控制器要做什么？**
 
 JEDEC 口径：HBM4 向后兼容 HBM3 控制器（同一主机设计可支持两代 stack）。控制器需要：
 
@@ -375,7 +435,7 @@ JEDEC 口径：HBM4 向后兼容 HBM3 控制器（同一主机设计可支持两
 
 【核心速答】兼容的本质是"协议骨架不变、代际参数可枚举"：探测代际 → 重映射通道与 bank → 选时序档 → 按代际使能特性，PHY 电气取两代公约数。
 
-**H3：DDR4→DDR5，控制器最大的架构变化是什么？**
+**对比题 3（旧 H3）：DDR4→DDR5，控制器最大的架构变化是什么？**
 
 不是速率，是三件结构性的事：
 
@@ -387,7 +447,7 @@ JEDEC 口径：HBM4 向后兼容 HBM3 控制器（同一主机设计可支持两
 
 【核心速答】记住"子通道化 + 片上 ECC + PMIC 上移"三件套——都是架构级迁移，速率只是顺带。
 
-**H4：HBM 伪通道和 DDR5 子通道是一回事吗？**
+**对比题 4（旧 H4）：HBM 伪通道和 DDR5 子通道是一回事吗？**
 
 不是。判据是**有没有独立命令通路**：
 
@@ -397,6 +457,234 @@ JEDEC 口径：HBM4 向后兼容 HBM3 控制器（同一主机设计可支持两
 - 另注意粒度：DDR5 子通道 32-bit 数据；HBM PC 32-bit 数据，但上面还有一层 64-bit 通道。
 
 【核心速答】子通道 = 独立命令流；伪通道 = 共享命令流的电源/刷新/时序分区。看 CA 归属一眼判别。
+
+## 问题路线图（纲领 Part I~XII）
+
+> 每条问题标注覆盖状态：✅ 正文已答 / 🔶 部分覆盖（"是什么"有了，六层框架的物理根因～代价层未答全）/ ⬜ 待展开。补答流程：按纲 0.3 打来源标签 → 正文落锚点小节 → 回写本表状态。正文小节标题中的"纲领 X~Y"题号即本表编号。
+
+### Part I：组织结构——Channel / Bank / Rank / PC / Sub-channel（A1~A12）
+
+| # | 问题 | 状态 | 锚点 / 备注 |
+|---|---|---|---|
+| A1 | Channel、Rank、BG、Bank、Row、Column 分别解决什么扩展问题？ | 🔶 | §2.2 / §2.3（BG、bank 并行度有覆盖；Rank 维度待展开） |
+| A2 | 为什么不能简单无限增加 Bank 提高并行度？ | 🔶 | 根因在 tRRD / tFAW / 电流（D5~D6、M1~M2），正文未显式串起 |
+| A3 | Bank 越多，Scheduler、状态表、刷新、timing checker 增加什么成本？ | ✅ | §7.1 |
+| A4 | DDR5 为什么从 64-bit Channel 走向两个更窄 Sub-channel？ | ✅ | §1.2 / §2.2 |
+| A5 | HBM 为什么需要 Channel + PC 两级结构？ | ✅ | §2.1 |
+| A6 | HBM PC 与 DDR5 Sub-channel 哪里相同、哪里不同？ | ✅ | §2.4 / §7.5 对比题 4 |
+| A7 | 判断"真正独立 Channel"最重要的判据？ | ✅ | §2.4（独立 CA 归属） |
+| A8 | 为什么并行结构越来越"更多、更窄、更独立"？ | 🔶 | §1.1 / §1.2 有功耗学与粒度解释，待按六层成文 |
+| A9 | 这种演进提高的是 peak bandwidth 还是有效利用率？ | 🔶 | §1.2"用位宽换请求数"已点题，待展开 |
+| A10 | 通道继续增加，瓶颈何时从 DRAM 转到 NoC / Controller / PHY？ | ⬜ | 待展开 |
+| A11 | HBM4 增加通道后，Controller 为什么不能仅复制 Scheduler？ | ✅ | §2.1（状态表翻倍 + channel-first 防热点）/ §7.1 |
+| A12 | Bank 数、Channel 数、die 数、容量为什么开始解耦？ | ✅ | §1.2 / §2.1（HBM4）/ §2.3（LPDDR6 Mixed Package） |
+
+### Part II：CA / Row / Column 命令接口（B1~B10）
+
+| # | 问题 | 状态 | 锚点 / 备注 |
+|---|---|---|---|
+| B1 | DDR 为什么长期复用 Command/Address 总线？ | 🔶 | §3.2（引脚预算视角；"长期复用"代际梳理待补） |
+| B2 | CA pin 越少有什么好处？ | ✅ | §3.2 |
+| B3 | pin 减少后为什么经常需要更多 command cycle？ | ✅ | §3.2（1T/2T） |
+| B4 | DDR5 多周期命令本质上在交换什么资源？ | ✅ | §3.2（引脚换拍数） |
+| B5 | HBM 为什么可以采用相对独立的 row / column command path？ | ✅ | §3.1 |
+| B6 | row/column 可重叠后，Scheduler 应如何变化？ | ✅ | §3.1 / §7.1（行列并行窗口） |
+| B7 | 为什么 ACT encoding 往往比 PRE/NOP 复杂？ | 🔶 | §3.1 有 1.5 拍事实；物理根因待补 [PHYSICAL-EXPLANATION] |
+| B8 | Command bandwidth 什么情况下成为真实 bottleneck？ | 🔶 | §3.1（REFRESH 垫 CNOP 例）；成立条件待系统化 |
+| B9 | BL 越短，为什么 command overhead 越重要？ | ✅ | §3.4（HBM 行开销 ≈ 28.6 个 BL8） |
+| B10 | 数据带宽继续增加而 CA bandwidth 不变，会出现什么问题？ | ⬜ | 待展开 |
+
+### Part III：Timing 从哪里来——阵列时序（C1~C12）
+
+| # | 问题 | 状态 | 锚点 / 备注 |
+|---|---|---|---|
+| C1 | tRCD 的物理过程是什么？ | 🔶 | §3.4（wordline 驱动 + sense amp 建立，一句话级） |
+| C2 | 为什么 ACT 之后不能立即 READ？ | 🔶 | 同 C1 |
+| C3 | tRASmin 为什么存在？ | ⬜ | §3.4 仅有数值 |
+| C4 | tRASmax 又为什么存在？ | ⬜ | 待展开 |
+| C5 | tRP 实际上在 DRAM 内部完成了什么？ | 🔶 | §3.4（sense amp 建立/恢复，一句话级） |
+| C6 | tRC 为什么大体由 ACT→PRE→下一次 ACT 完整生命周期决定？ | 🔶 | §3.4 隐含，待显式 |
+| C7 | tWR 为什么是 write 特有的？ | ⬜ | 待展开 |
+| C8 | tRTP 为什么是 read 特有的？ | ⬜ | 待展开 |
+| C9 | 为什么某些协议区分 tRCDRD / tRCDWR？ | ✅ | §3.4（HBM3 即有；写路径 43CK vs 57CK） |
+| C10 | 为什么有些 timing 按 ns 固定、有些按 nCK 固定？ | ✅ | §3.4（max(ns,nCK) vs 纯 CK） |
+| C11 | 频率大幅提高后，tRCD 绝对 ns 为什么不同比下降？ | ✅ | §3.4（阵列物理决定） |
+| C12 | 哪些 timing 受阵列物理限制、哪些受接口限制？ | 🔶 | §3.4 部分（tRCD/tRP/tRAS vs BL/速率），完整清单待补 |
+
+### Part III+：Bank Group / 总线时序（D1~D10）
+
+| # | 问题 | 状态 | 锚点 / 备注 |
+|---|---|---|---|
+| D1 | 为什么出现 Bank Group？ | ⬜ | §2.3 有 BG 事实，无"为什么" |
+| D2 | 为什么同 BG 与跨 BG 的 tCCD 不一样？ | 🔶 | §2.3（BG-aware 排序事实），物理根因待补 |
+| D3 | tRRD_S / tRRD_L 背后的物理原因？ | ⬜ | 待展开 |
+| D4 | tFAW 为什么不能理解为"又一个固定间隔"？ | ⬜ | 待展开 |
+| D5 | tFAW 限制的真正资源是什么？ | ⬜ | 与 M1 / M2 同源 |
+| D6 | 提高 Bank Parallelism 为什么最终撞功耗 / current delivery？ | ⬜ | 与 M1 / M2 同源 |
+| D7 | tWTR / tRTW 为什么存在？ | ⬜ | §2.2 提及 bus turnaround |
+| D8 | Read→Write 与 Write→Read 为什么通常不对称？ | ⬜ | 待展开 |
+| D9 | ODT 切换为什么进入 read/write turnaround 成本？ | ⬜ | 待展开（依赖 Part VI G 组） |
+| D10 | Controller 改不了这些 timing，Scheduler 还能优化什么？ | 🔶 | §7.1（排序 / 错峰 / 映射），待系统化 |
+
+### Part IV：Refresh 为什么越来越复杂（E1~E14）
+
+| # | 问题 | 状态 | 锚点 / 备注 |
+|---|---|---|---|
+| E1 | DRAM 为什么必须 refresh？ | ⬜ | 物理根因（电容存储 / 泄漏）待补 [PHYSICAL-EXPLANATION] |
+| E2 | 为什么最早使用 all-bank refresh？ | 🔶 | §6.3（REFab 保留哲学：深度空闲最划算） |
+| E3 | 为什么出现 per-bank / same-bank / finer-grain refresh？ | ✅ | §6.3 |
+| E4 | 更细粒度 refresh 减少 stall 的同时增加什么 Controller 状态？ | ✅ | §6.3（bank 级刷新债 + per-bank deadline） |
+| E5 | postpone / pull-in 为什么是合法的？ | 🔶 | §6.3（机会式插空）；标准边界待引 [JEDEC] |
+| E6 | 最大 postpone 为什么不能直接全部用满？ | ⬜ | 待展开 |
+| E7 | Temperature 为什么影响 refresh rate？ | 🔶 | §5.3（2x / 4x 倍率事实）；物理根因待补 |
+| E8 | Refresh 与 QoS 为什么天然冲突？ | ✅ | §6.3（可调度的后台工作 + QoS 决定还债时机） |
+| E9 | 为什么 refresh 必须有"不可继续让步"的 critical 状态？ | 🔶 | §6.3（deadline 跟踪隐含），待显式 |
+| E10 | Row Hammer 为什么让 refresh 从周期行为变成 activation-aware？ | ✅ | §6.4 |
+| E11 | RFM / ARFM / DRFM / PRAC 之间的演进逻辑？ | ✅ | §6.4（债粒度变细 + 背压显式化） |
+| E12 | 为什么防护越来越 per-bank、targeted、bounded？ | ✅ | §6.4（HBM4 BRC / tDRFM） |
+| E13 | 更安全的防护为什么一定吃掉一部分 bandwidth？ | ✅ | §6.4（带宽代价最小化命题） |
+| E14 | Controller 如何计算最坏情况 Row Hammer bandwidth tax？ | 🔶 | §6.4（安全场景上限验证提及），方法待展开 |
+
+### Part V：RAS 为什么越来越靠近 Memory（F1~F10）
+
+| # | 问题 | 状态 | 锚点 / 备注 |
+|---|---|---|---|
+| F1 | On-die ECC 解决什么问题？ | ✅ | §6.1（支撑更高密度 die） |
+| F2 | 为什么 On-die ECC 不能完全替代系统 ECC？ | ✅ | §6.1（纵深防御） |
+| F3 | ECC 放在 DRAM 内 / PHY / Controller / System 各覆盖哪些 error domain？ | 🔶 | §6.1（DRAM 内 vs 模组级）；PHY / 链路段待补 |
+| F4 | 透明纠错为什么产生 observability blind spot？ | ✅ | §6.1（遥测盲区） |
+| F5 | Interface parity / CRC 与 array ECC 的责任边界？ | 🔶 | §6.2（接口传输 parity 列举），边界待展开 |
+| F6 | Correctable Error 为什么仍然值得统计？ | 🔶 | §6.1（从未纠错率间接推断），方法论待展开 |
+| F7 | Scrubbing 的作用是什么？ | ✅ | §6.2（ECS / 错误擦洗） |
+| F8 | Error retry 与 ECC 有什么区别？ | ⬜ | 待展开 |
+| F9 | 错误随 data 返回 vs 单独 interrupt 上报，优缺点？ | ✅ | §6.2（SEV 带内 vs 侧带对照） |
+| F10 | HBM 为什么特别重视 fault isolation？ | 🔶 | §6.2（故障隔离限列举），动机待展开 |
+
+### Part VI：PHY 基础——"数字信号"为什么会失败（G1~G15）
+
+> 本组为数字侧与协议侧的分界面，全组待展开（部分依赖：§3.3 时钟域、§4 训练）。**本组验收**：为什么协议速度提高以后不能单纯把 clock 加快，而必须不断加入 training、Vref、equalization、deskew 和更复杂的 package？
+
+| # | 问题 | 状态 | 锚点 / 备注 |
+|---|---|---|---|
+| G1~G3 | ①数字 0/1 在 package trace 上为什么不是理想方波 ②rise/fall time 是什么 ③data rate 提高后有效 timing window 为什么变小 | ⬜ | 待展开 |
+| G4~G5 | ④setup / hold margin ⑤eye diagram（Eye Width 与 Eye Height 各代表什么） | ⬜ | 待展开 |
+| G6~G7 | ⑥jitter（Random vs Deterministic 的直觉区别）⑦skew（DQ-to-DQ 与 DQ-to-DQS 为何都重要） | ⬜ | 待展开 |
+| G8~G11 | ⑧impedance mismatch ⑨信号为什么反射 ⑩termination / ODT ⑪ODT 太强或太弱的后果 | ⬜ | 待展开 |
+| G12~G14 | ⑫crosstalk（高速宽总线为何尤其敏感）⑬simultaneous switching noise ⑭Vref 为什么影响判决 margin | ⬜ | 待展开 |
+| G15 | PVT 为什么会让训练结果漂移？ | 🔶 | §4.1⑥（频变重训）/ §7.2（温漂重校 ZQ / Vref）；机理待展开 |
+
+### Part VII：Clock / Strobe——CK / DQS / WCK / RDQS（H1~H12）
+
+| # | 问题 | 状态 | 锚点 / 备注 |
+|---|---|---|---|
+| H1~H2 | ①data 为什么不能只依赖全局 CK 采样 ②source-synchronous interface 是什么 | 🔶 | §3.3 事实层有（三时钟域）；概念定义待展开 |
+| H3~H4 | ③DQS 的存在解决什么 ④为什么 write strobe 由 Controller/PHY 发、read strobe 由 DRAM 返回 | 🔶 | §3.3（WCK 写 / RDQS 读 per-byte 事实）；"为什么"待答 |
+| H5 | LPDDR 为什么进一步分离 CK 与 WCK？ | ✅ | §3.3 |
+| H6 | 降低 Command Clock、提高 Data Clock 解决什么问题？ | ✅ | §3.3（CKR：命令低速、数据全速） |
+| H7 | CK 与 WCK 不同频为什么需要额外 synchronization？ | ✅ | §3.3（WCK2CK Leveling 锁 FIFO 指针） |
+| H8 | Read DQS gating 的问题是什么？ | ⬜ | 待展开 |
+| H9 | duty-cycle distortion 为什么在高速接口中重要？ | ⬜ | 待展开 |
+| H10 | Clock jitter 最终如何转化为 eye loss？ | ⬜ | 与 G6 / G10 衔接 |
+| H11 | 为什么不同 byte lane 需要独立 delay？ | 🔶 | §4.2（per-byte / per-pin 事实） |
+| H12 | package / routing skew 为什么最终变成 PHY training 的工作？ | 🔶 | §4 组（训练即补偿 package 差异），待显式 |
+
+### Part VIII：Training / Calibration（I1~I21）
+
+> 每种 training 固定四问：**为什么需要？调什么参数？如何找到 pass window / optimal point？训练失败系统表现是什么？** 现状：LPDDR 主链流程已答（§4.1），四问法的后两问普遍未答全。
+
+| # | 问题 | 状态 | 锚点 / 备注 |
+|---|---|---|---|
+| I1~I3 | CA Training：①CA 为什么也要 training ②找 timing 还是 voltage margin ③CA 错一 bit 为什么比 data bit 错误更严重 | 🔶 | §4.1①（调 CA delay + VREF(CA)）；③待展开（关联 §3.1 命令路径专用训练机制） |
+| I4~I6 | Write Leveling：①Controller 为什么不知道 DRAM 实际看到的 CK/DQS 相位 ②补偿哪段 path mismatch ③多 rank / 多 die 为什么更复杂 | 🔶 | §3.3（WCK2CK Leveling = write-leveling 演化）；四问未套 |
+| I7~I9 | Read Training：①eye 中心如何得知 ②read gate training 与 read eye training 是否一回事 ③为什么 per-bit deskew | 🔶 | §4.1③（interval oscillator 读均衡）；②③待展开 |
+| I10~I12 | Vref Training：①只扫 delay 为什么不够 ②2D voltage×timing eye 为什么更完整 ③optimal 为什么不一定是几何中心 | 🔶 | §4.1⑤（Vref(DQ) + per-pin DFE 事实）；2D 方法论待展开 |
+| I13~I15 | Equalization：①CTLE / DFE 各解决什么 channel loss ②DFE 为什么依赖已判决 bit ③越高速越需要 EQ | 🔶 | §4.2（DFE 对照列举）；原理待展开 |
+| I16~I18 | ZQ Calibration：①实际校准什么 ②driver impedance / ODT 为什么随 PVT 漂 ③不做 ZQ 在 eye 上什么表现 | ⬜ | 正文未覆盖 |
+| I19~I21 | Re-training：①开机训练成功为何数小时后失效 ②frequency / temperature / voltage 哪些触发 ③full retrain vs 恢复 training set 的取舍 | 🔶 | §4.1⑥ / §7.2（training set 保存恢复 + 温漂重校）；①待展开 |
+
+### Part IX：DFI——Controller / PHY 责任边界（J1~J10、K1~K10）
+
+> 全组为当前最大空白；附录 C 已备 DFI v5.2 PDF，展开时按 [DFI] 标签引用。
+
+| # | 问题 | 状态 | 锚点 / 备注 |
+|---|---|---|---|
+| J1~J3 | ①为什么需要 DFI 而不是 Controller 直接驱动 pin ②一个 command 从 Controller 到 pin 中间经历什么 ③DFI frequency ratio 的本质 | ⬜ | 待展开；N3 / N4 与之衔接 |
+| J4~J5 | ④同一 command 在不同 ratio 下为什么变成不同 phase placement ⑤PhyRdLat / PhyWrLat 为什么必须告知 Controller | ⬜ | 待展开 |
+| J6~J7 | ⑥write data 为什么必须提前交付 PHY ⑦read data 返回后如何对回 command | ⬜ | 待展开 |
+| J8~J9 | ⑧training interface 到底归 Controller 还是 PHY ⑨algorithm / sequence / delay cell control 各属于谁 | 🔶 | §4.2（三协议回读通道差异 → 训练状态机不可复用）；责任划分待按 [DFI] 展开 |
+| J10 | frequency change 的 DFI / PHY handshake 为什么必须严格排序？ | 🔶 | §7.2（DFI 手序列事实）；排序细节待展开 |
+| K1~K3 | ①self refresh 为什么不能当普通 command 下发 ②low-power sequence 前为什么 drain traffic ③Controller 如何确认 PHY 安全进入新状态 | 🔶 | K2 🔶 §3.1（进低功耗前排空在飞命令）；①③待展开 |
+| K4~K5 | ④PHY 可以自己决定降频吗 ⑤frequency change 时哪些状态必须重新 training | 🔶 | K5 🔶 §3.3 / §7.2（DFS 后 WCK2CK 重对齐 / training set 恢复） |
+| K6~K7 | ⑥DVFS 时 memory controller 为什么希望先进 IDLE ⑦初始化哪些步骤必须 Controller 主导、哪些只能 PHY 执行 | ⬜ | 待展开 |
+| K8~K10 | ⑧DFI stall 时 Scheduler 冻结什么状态 ⑨PHY training failed 如何恢复 / 上报 ⑩协议 timing 与 PHY sequence timing 为什么分治 | ⬜ | 待展开；K9 关联 §6.2 错误上报 |
+
+### Part X：Package / Physical Design（L1~L10、M1~M10、N1~N10）
+
+| # | 问题 | 状态 | 锚点 / 备注 |
+|---|---|---|---|
+| L1~L2 | ①PCB / substrate / interposer / TSV / hybrid bonding 的互连距离量级 ②距离缩短为什么允许更宽、更低速接口 | ⬜ | 待展开（L3 是其推论） |
+| L3 | HBM 为什么适合"超宽、相对低 per-pin rate"？ | ✅ | §1.1（3E→4 翻位宽的功耗学解释） |
+| L4 | DDR 为什么更依赖长距离 channel equalization？ | 🔶 | §1.1（中距离互连提速率的边际成本）；机制待展开 |
+| L5~L8 | ①interposer congestion 如何限制 channel 数 ②bump pitch 变小的收益与挑战 ③TSV 的 R/C 影响 ④hybrid bonding 与 TSV 是否同一问题 | ⬜ | 待展开 |
+| L9~L10 | ①PHY 放 base die / logic die / SoC die 的优缺点 ②HBM4 为什么让 base die 重要性增加 | 🔶 | §1.1（PHY 向 base die / SoC 迁移）/ §5.1（I/O 电压开放配合逻辑 base die） |
+| M1~M2 | ①大量 ACT 为什么造成电流峰值 ②tFAW / tRRD 的 power delivery 解读 | ⬜ | 与 D4~D6 同源，待展开 |
+| M3~M6 | ③IR drop ④voltage droop 如何变成 timing failure ⑤多 DQ 同翻对 supply / ground 的影响 ⑥decap 解决什么 | ⬜ | 待展开 |
+| M7 | 数据速率提高 vs 总线加宽，哪个对 power delivery 压力更大？ | ✅ | §5.2（速率路线花 IO 功耗、位宽路线能效更好） |
+| M8 | HBM stack 的 power delivery 为什么比 DIMM 更困难？ | 🔶 | §1.2（TSV / 键合代价）/ §5.1（多供电轨） |
+| M9 | Thermal gradient 为什么导致不同 die 的 timing margin 不同？ | ⬜ | 待展开 |
+| M10 | Controller throttling 如何与 thermal / power limit 联动？ | 🔶 | §5.3（HBM 热感知节流）；联动机制待展开 |
+| N1~N2 | ①PHY 周围为什么是 timing closure 最难区域 ②Controller→PHY 宽 data bus 的 routing 压力 | ⬜ | 待展开 |
+| N3~N5 | ③DFI ratio 增大为什么能降 controller core frequency ④ratio 增大的代价（latency / bus width / phase logic）⑤multi-cycle / source-synchronous path vs 同步 path | ⬜ | 待展开；N3~N4 与 J3~J4 衔接 |
+| N6~N8 | ⑥CDC 为什么在 memory subsystem 大量存在 ⑦async FIFO metastability 的结构性控制 ⑧clock / power gating 对 DFI / PHY 状态保持的影响 | ⬜ | 待展开 |
+| N9~N10 | ⑨PHY hard macro 对 floorplan 的约束 ⑩HBM PHY 靠近 die edge / bump array 对 NoC 与 Controller placement 的影响 | ⬜ | 待展开 |
+
+### Part XI：横向比较——相同问题，不同答案（O1~O10）
+
+> 以后不要只比较 HBM BL8 / DDR BL16 / LPDDR BLxx，而要问以下十问。
+
+| # | 问题 | 状态 | 锚点 / 备注 |
+|---|---|---|---|
+| O1 | 都需要 bank parallelism，为什么组织方式不同？ | ✅ | §2.4 / §7.1 |
+| O2 | 都需要 training，为什么 training 方法不同？ | ✅ | §4.2（回读通道根差异） |
+| O3 | LPDDR 强调 DVFS，HBM 为什么倾向固定高带宽工作点？ | ✅ | §5.3 / §7.2 |
+| O4 | HBM 可以用非常宽的 interface，DDR 为什么不可以？ | ✅ | §1.1（+L3） |
+| O5 | DDR 重视 capacity / DIMM 生态，HBM 重视 bandwidth density？ | ✅ | §1.3 / §7.4 |
+| O6 | LPDDR 为什么愿意接受更复杂的 clock / power management？ | ✅ | §5.3 |
+| O7 | 同样面对 Row Hammer，为什么采用不同粒度的解法？ | ✅ | §6.4 |
+| O8 | 同样面对 pin 限制，三者如何做 pin↔frequency↔command bandwidth 交换？ | 🔶 | §3.2（DDR5 引脚换拍数）/ §3.3（LPDDR CKR）；HBM 视角待补 |
+| O9 | 同样面对 refresh stall，谁更依赖 fine-grain refresh，为什么？ | ✅ | §6.3（粒度差异根源段） |
+| O10 | 同样翻倍带宽：加 pin / 加 rate / 加 channel，各把问题转移到哪里？ | ✅ | §1.1（3→3E 靠速率、3E→4 靠位宽） |
+
+### Part XII：纵向演进表（模板 + 样例）
+
+每研究一代协议，固定做一张六列表，并回答七问：上一代最大的三个瓶颈是什么？这一代新增哪些 Feature？每个 Feature 对应哪个瓶颈？有没有只为容量 / 功耗 / RAS 服务的 Feature？复杂度转移到了 Controller、PHY 还是反过来？
+
+**模板**
+
+| 项目 | 上一代 | 当前代 | 为什么变 | Controller 代价 | PHY/Package 代价 |
+|---|---|---|---|---|---|
+|  |  |  |  |  |  |
+
+**样例一：DDR4 → DDR5**（素材：§2.2 / §3.2 / §6.1 / §6.4 / §7.5 对比题 3；"为什么变"列属 [PHYSICAL-EXPLANATION] / [INFERENCE]）
+
+| 项目 | DDR4 | DDR5 | 为什么变 | Controller 代价 | PHY/Package 代价 |
+|---|---|---|---|---|---|
+| 通道组织 | 1×64-bit | 2×32-bit 独立子通道 | cache line（64B）完整落入单子通道；命令并发 ×2 | 双实例状态表 / 时序检查 / 刷新错峰 | DFI / 训练双实例 |
+| 命令接口 | 20+ CA 全 1T | 14-bit CA + 1T/2T | 子通道化后引脚预算减半——引脚换拍数 | 编码器区分 1T/2T、2T 原子性 | CA 训练 / 眼图裕量 |
+| RAS | 系统 ECC 为主 | ODECC 强制（128+8 SEC）+ side-band | die 密度↑ → 原始错误率↑ | 透明纠错→遥测盲区，需 side-band 兜底 | DRAM 内校验逻辑 |
+| 电源 | 供电简单 | PMIC 上移模组 + VPP | 服务器电源管理精细化 | 上电时序 / 侧带管理对接模组 | 模组 PMIC、VPP 轨 |
+| 刷新 | 全 bank 为主 | FGR / REFsb + RFM/DRFM/ARFM | 容量↑ → tRFC 变长；Row Hammer | 刷新债 / 信用账本进 QoS | 阵列管理逻辑 |
+
+**样例二：HBM3 → HBM4**（素材：§1.1 / §2.1 / §5.1 / §6.2；"为什么变"列属 [PHYSICAL-EXPLANATION] / [INFERENCE]）
+
+| 项目 | HBM3/3E | HBM4 | 为什么变 | Controller 代价 | PHY/Package 代价 |
+|---|---|---|---|---|---|
+| 接口 | 1024-bit / 16ch | 2048-bit / 32ch | 继续提速率边际成本（均衡、训练、pJ/bit、良率）过高 → 翻位宽 | 32ch / 64PC 状态表翻倍；channel-first 防热点 | bump 密度 / 中介层布线；PHY 迁向 base die |
+| 电气 | I/O 1.1V 固定 | I/O 厂商自定、VDDC 1.05V | 把余量下放厂商，换 PHY 工艺自由度 | 电气取公约数 | PHY 工艺选择自由 |
+| RAS | RAA + ARFM | RFMpb / DRFMpb + BRC、ECS 多 bit | 行锤定向化 + 带宽代价有界 | 风险 bank 跟踪 / 有界刷新编排 | DRAM 内逻辑增加 |
+| 容量 | 通道与容量同步增长 | 4 die 满 32ch；5~16 die 只加容量 / SID / bank | 带宽需求与容量需求不同步 | bank 数可枚举配置（16~64/ch） | die 堆叠高度 / 散热 |
+
+**待补样例三：LPDDR5 → LPDDR6**（素材已备：§1.1 速率阶梯、§2.3 x24/x12 与 BL24/BL48、§5.3 VDD2 强制拆分 + DVFS 族、§6.4 PRAC + ABO），⬜ 待按模板成表。
 
 ## 附录
 
@@ -442,7 +730,7 @@ JEDEC 口径：HBM4 向后兼容 HBM3 控制器（同一主机设计可支持两
 - `DDR\JESD79-5B_v1-2_DDR5_SDRAM.pdf`、`DDR\JESD209-5B.pdf`
 - `LPDDR6\JESD209-6_LPDDR6 Standard.pdf`
 
-（另有 `LPDDR6\eetop.cn_DDR_PHY_Interface_Specification_v5_2.pdf`（DFI）等可后续补充展开 I 组问题：DFI 手序列、刷新开销定量、地址映射、QoS 调度、验证视角。）
+（另有 `LPDDR6\eetop.cn_DDR_PHY_Interface_Specification_v5_2.pdf`（DFI）等可后续补充展开纲领 J/K 组（DFI 手序列 / 初始化 / 低功耗）、E14（刷新开销定量）、D 组（总线时序）与验证视角问题。）
 
 ### D. 数据出处与核实状态
 
@@ -465,7 +753,9 @@ JEDEC 口径：HBM4 向后兼容 HBM3 控制器（同一主机设计可支持两
 
 ---
 
-> **维护说明**：本文档由问题清单（A1~H4 + 分批讨论）整理而成；每节末【核心速答】为高频问题 30 秒口径。修订任何数字时，请同步更新附录 D 的核实状态。
+> **标签映射（纲 0.3）**：附录 D 的 ✅ 条目 = [JEDEC]；厂商/公开资料 = [VENDOR]；⚠️ 条目 = [UNKNOWN]；正文与演进表中的"为什么"叙述（如 §1.1 翻位宽的功耗学解释、§6.3 粒度差异根源）属 [PHYSICAL-EXPLANATION] / [INFERENCE]，引用时注意与标准原文区分。
+
+> **维护说明**：本文档由问题清单（旧编号 A1~H4 + 分批讨论）整理而成，2026-09 并入《研究纲领》：正文题号统一迁移为纲领 Part I~XII 编号（A~O；旧编号与新编号含义不同，勿混用），新增"研究纲领"与"问题路线图"两节。后续补答路线图 🔶 / ⬜ 问题时：按纲 0.3 打标签 → 正文落锚点 → 更新路线图状态；修订任何数字时同步更新附录 D 的核实状态。
 
 
 

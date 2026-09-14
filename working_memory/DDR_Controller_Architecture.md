@@ -3,42 +3,71 @@
 > **文档定位**：面向面试/技术晋升的个人架构知识库。以协议无关的通用架构为骨架，DDR4/5、LPDDR4/5、HBM3/4 的协议差异作为对比注解，核心能力目标是 **tradeoff 论证 + 量化分析**。
 >
 > **方法论**：每章先讨论透（提问 + 回答 + 辩论），达成共识后落笔成文。所有设计细节均来自真实 RTL 设计实战经验。
+>
+> **纲领**：文档目标、核心主线、八问、五层审查、Feature 模板、可信度标签、完成标准统一见第 0 章。
 
 ---
 
-## 0. 全局架构总览
+## 0. 文档纲领与全局架构总览
 
-### 0.1 流水线架构树
+### 0.1 文档目标
+
+本文不是 Memory Controller 教科书，而是基于本人真实 RTL / Architecture 工作经验形成的个人架构知识库。
+
+最终目标不是回答“Memory Controller 有哪些模块”，而是能够回答：
+
+> **为什么需要这个模块？为什么采用现在的实现？还有哪些设计选择？当前方案牺牲了什么？如何证明它是合理的？**
+
+因此本文重点记录：
+
+* 实际设计中的模块划分与数据通路；
+* RTL 中真实存在的状态、队列、buffer、counter 和 arbitration；
+* Feature 产生的背景与解决的问题；
+* Architecture tradeoff；
+* 协议约束如何转化为 RTL 结构；
+* 性能、面积、功耗、时序之间的取舍；
+* 项目实测、仿真和性能模型得到的定量结论；
+* 失败方案、历史方案和为什么最终没有采用；
+* 面试中能够继续向下追问的问题。
+
+本文不追求覆盖所有可能的 Memory Controller 架构，也不为了“完整”补写本人没有真正理解或没有验证过的实现。
+
+### 0.2 核心主线：一条 request 的生命周期
+
+全文始终沿着一条 request 的生命周期展开：
 
 ```
 Host / NoC
      ↓
-AXI / CHI
+AXI / CHI                          ← 第 1 章
      ↓
-Transaction Layer
+Transaction / XMU                  ← 第 1 章
      ↓
-Address Mapping
+Address Mapping                    ← 第 2 章
      ↓
-Request Queue
+Port Arbitration / Request Queue   ← 第 3 章
      ↓
-Command Scheduler  ← CQ：第 1 章 / CS：第 3 章
+CAM / Command Queue                ← 第 4 章
      ↓
-Command Generator
+Command Scheduler                  ← 第 5 章
      ↓
-Timing Enforcement
+Timing Enforcement                 ← 第 6 章
      ↓
-DFI
+DFI                                ← 第 7 章
      ↓
-PHY
+PHY                                ← 第 8 章（搁置）
      ↓
 DRAM
 ```
 
-> **模块边界注记（RTL 真实模块名）**：流水线中的 "Scheduler + Command Generator" 在 RTL 里对应顶层 **Command Scheduler** 模块，内部划分：
-> - **CQ**（Command Queue）：CAM + 三层 filter（第 1 章内容）
-> - **CS**：BSC（bank 状态机 + AC timing）/ GSC（读写切换）/ FSC（最终仲裁）（第 3 章内容）
+> **模块边界注记（RTL 真实模块名）**：链上 "Port Arbitration / Request Queue" 对应 PA + CAM 入队通路（第 3 章）；"CAM / Command Queue → Command Scheduler" 在 RTL 里对应顶层 **Command Scheduler** 模块，内部划分：
+> - **CQ**（Command Queue）：CAM + 三层 filter（第 4 章）；
+> - **CS**：BSC（bank 状态机 + AC timing）/ GSC（读写切换）/ FSC（最终仲裁）（第 5 章）；
+> - **Command Generator**（命令编码与下发）在 RTL 中同属顶层 Command Scheduler 模块，位于 FSC → DFI 通路（0.3 叙事第 ⑤ 步、4.2 CCT 特性）。
 
-### 0.2 一条命令的一生（开场叙事）
+**纲领规则**：对任何 Feature，都必须能指出它位于这条链的哪个位置，以及它影响上下游什么状态。
+
+### 0.3 一条命令的一生（开场叙事）
 
 以 **LPDDR5 一个 512B 写事务**为例，走一遍全流水线：
 
@@ -62,7 +91,7 @@ AXI AW/W → XMU AFIFO（跨时钟域 + outstanding，一物两用）
 2. **命令流与数据流在 WDP/RDP 分合**：命令走窄通路（地址+属性），数据走宽通路（SRAM+DBI/ECC），仅以 ptr 关联；
 3. **地址形态转换点在 CAM 入口**：上游全程 system/UIF 地址，物理地址只在 CAM entry 中存在。
 
-### 0.3 时钟域与 CDC
+### 0.4 时钟域与 CDC
 
 | 时钟域 | 覆盖范围 |
 |---|---|
@@ -76,7 +105,7 @@ AXI AW/W → XMU AFIFO（跨时钟域 + outstanding，一物两用）
 - 变体场景（AXI 高频低位宽）：**写数据先在 AXI 域完成合并，再跨域**——此时 CDC 点移到 XMU-PA 之间；
 - APB 为慢时钟配置域，寄存器写入用标准同步手段。
 
-### 0.4 章节导航（阅读顺序与依赖）
+### 0.5 章节导航（阅读顺序与依赖）
 
 | 章 | 一句话摘要 | 阅读依赖 |
 |---|---|---|
@@ -88,26 +117,206 @@ AXI AW/W → XMU AFIFO（跨时钟域 + outstanding，一物两用）
 | **6** Timing Enforcement | 五级 counter 体系：零违反保证 | 5 |
 | **7** DFI | 控制器-PHY 交接面：ratio / 低功耗 / 协议差异 | 5, 6 |
 | 8 / 9 / 附A | PHY（搁置）/ DRAM 颗粒 / 协议对比 | 待写 |
+| RAS / DevMgmt·LP·Init / PerfObs / Verif·Debug | 纲领 0.11 四大补齐方向（问题清单见 0.11） | 待写·优先 |
 
-### 0.5 全局设计哲学（跨章反复出现的四个模式）
+### 0.6 全局设计哲学（跨章反复出现的四个模式）
 
 1. **批处理摊薄切换**：读写 batch（5.4）、refresh 见缝插针（4.6）、rank/SID 多命令再切（2.5）——切换代价是常量，batch 是唯一摊薄手段；
 2. **迟滞防乒乓**：SidSwitch 空闲阈值（2.5）、水线 set/clr（3.4）、渐进式读写切换（5.4.2）——用时间迟滞换切换稳定性；
 3. **结构性规避**：DVFS 保证 IDLE（6.4）、零旁路 counter 检查（6.1）、DEVMGR 退出顺序（7.3）——用系统级约束消解模块级难题；
 4. **粒度统一 64B**：cache line = col command = CHI 包 = sub-command（1.2）——一条 64B 线贯穿全流水线。
 
-### 0.6 每章统一模板（八问）
+### 0.7 每章八问基础问题
 
-每一层必须能够回答：
+每一章必须能够回答以下八个基础问题（各章末尾的“八问速答表”是其落笔形式；既有 7 张表按旧版结构写成，映射见下，迁移已登记于 7.7）：
 
-1. 功能是什么？
-2. 输入/输出是什么？
-3. 状态是什么？
-4. 性能瓶颈是什么？
-5. 影响 bandwidth 的参数是什么？
-6. 影响 latency 的参数是什么？
-7. 和上下层怎么 backpressure？
-8. 异常情况下怎么恢复？
+1. 这个模块为什么存在？
+2. 输入和输出是什么？
+3. 内部保存哪些状态？
+4. 正常数据流如何运行？
+5. 性能瓶颈在哪里？
+6. 哪些参数影响 Bandwidth，哪些参数影响 Latency？
+7. 如何与上下游 Backpressure？
+8. 异常、刷新、低功耗、错误等非正常流量下如何收敛？
+
+八问解决“模块是什么”。
+
+但核心章节还必须继续回答 0.8 的五层问题。
+
+**与既有“八问速答表”的映射**：
+
+| 旧版速答表行 | 新版八问 |
+|---|---|
+| 功能 | Q1 为什么存在（长答在各章“职责与边界 / 设计哲学”小节） |
+| 输入/输出 | Q2 |
+| 状态 | Q3 |
+| （旧版无对应行） | Q4 正常数据流（各章数据通路小节 + 0.3 叙事覆盖） |
+| 性能瓶颈 | Q5 |
+| BW 参数 + Latency 参数 | Q6（新版合并为一问，作答时仍分开回答） |
+| Backpressure | Q7 |
+| 异常恢复 | Q8（新版扩展为“异常、刷新、低功耗、错误如何收敛”） |
+
+### 0.8 核心章节五层审查
+
+#### 第一层：协议正确性
+
+* 这个行为由哪个协议约束产生？
+* 是协议 MUST，还是本设计自己的选择？
+* 如果不这样实现，会违反协议还是只损失性能？
+* 不同 DDR / LPDDR / HBM 协议是否要求不同？
+
+#### 第二层：内部自洽
+
+* 上下章节对同一概念的定义是否一致？
+* 状态何时产生、何时释放？
+* Credit / pointer / response / ordering 生命周期是否闭环？
+* 异常情况下是否存在资源泄漏、死锁、状态无法恢复？
+
+#### 第三层：Architecture Tradeoff
+
+任何重要设计都不能只写“我们这样做”，至少需要讨论：
+
+```
+Problem
+  ↓
+Candidate A / B / C
+  ↓
+为什么选择当前方案
+  ↓
+获得什么
+  ↓
+付出什么
+```
+
+例如：
+
+```
+CAM 加深
+→ Scheduler visibility ↑
+→ BLP / row-hit opportunity ↑
+
+但同时
+→ CAM compare ↑
+→ timing / area / power ↑
+→ queueing latency ↑
+```
+
+#### 第四层：面试追问
+
+对于任何重要结论继续追问：
+
+* 为什么？
+* 如果把参数扩大一倍会怎样？
+* 如果 workload 改变呢？
+* 如果换成 HBM / LPDDR 呢？
+* 极限在哪里？
+* 有没有反例？
+* 有没有更简单的实现？
+* 如果重新设计一版，会改什么？
+
+#### 第五层：量化
+
+重要结论尽量落到数字：
+
+* CAM depth；
+* outstanding；
+* queue occupancy；
+* row-hit rate；
+* bus utilization；
+* blocked cycles；
+* read/write turnaround；
+* refresh loss；
+* P50/P99 latency；
+* area；
+* Fmax；
+* bandwidth efficiency。
+
+无法量化的地方明确标记为待补充，而不是用模糊形容词替代。
+
+### 0.9 Feature 的统一记录模板
+
+每个重要 Feature 使用如下模板：
+
+```
+Feature：
+
+1. Problem
+   为什么会出现这个问题？
+
+2. Constraint
+   协议 / RTL / PPA / system 有什么限制？
+
+3. Mechanism
+   当前 RTL 是怎么实现的？
+
+4. Alternatives
+   还有哪些可能方案？
+
+5. Tradeoff
+   当前方案获得什么、牺牲什么？
+
+6. Corner Case
+   极端情况和异常情况是什么？
+
+7. Quantification
+   如何用 counter / simulation / performance model 证明？
+
+8. Interview Question
+   面试官还能继续追问什么？
+```
+
+### 0.10 信息可信度标签
+
+为了避免 AI 自动补全出本人并不理解的内容，正文的重要结论建议标记来源：
+
+* **[RTL]**：来自实际 RTL / architecture；
+* **[SPEC]**：明确来自协议；
+* **[MEASURED]**：项目综合、仿真或性能实测；
+* **[MODEL]**：性能模型推导；
+* **[INFERENCE]**：基于机制做出的架构推论；
+* **[TODO]**：当前还不能完整解释。
+
+AI 不允许把 `[INFERENCE]` 自动改写成 `[SPEC]`，也不允许替本人填掉 `[TODO]`。
+
+### 0.11 后续重点补齐方向
+
+现有 AXI/XMU、Address Mapping、Queue、CQ、CS、Timing、DFI 已形成主体，后续优先补齐：
+
+#### RAS
+
+* retry 的触发、隔离和恢复边界是什么？
+* ECC / parity / CRC error 分别在哪一级发现？
+* retry 时 scheduler、bank state、read return 如何恢复？
+* poison / UE / CE 如何向上游传播？
+
+#### Device Management / Low Power / Initialization
+
+* init、training、frequency change、power-down、自刷新各由谁主导？
+* 为什么 sequence timing 更适合由 DEVMGR / DFI 管，而不是普通 scheduler？
+* 进入特殊状态前为什么必须 drain？
+* 如何证明所有状态最终可以收敛到 IDLE？
+
+#### Performance Observability
+
+* 如何知道带宽损失到底发生在哪？
+* 什么叫“协议本来不能发”和“实际上可以发但 scheduler 没发”？
+* blocked reason 如何互斥归因？
+* 如何建立从 workload → command → blocked cycle → BW loss 的因果链？
+
+#### Verification / Debug Architecture
+
+* 哪些 assertion 能证明协议正确？
+* 哪些 performance counter 能证明架构有效？
+* 遇到 BW 下降时 debug 顺序是什么？
+* 如何区分 mapping、queue、scheduler、timing、DFI、PHY 问题？
+
+### 0.12 文档完成标准
+
+一个章节只有达到下面标准才算真正完成：
+
+> **我可以不看文档，在白板上画出结构；解释每个状态为什么存在；说出至少一个替代设计及 tradeoff；面对一个 workload 能预测它的性能表现；最后能说出用什么 counter 或实验验证我的判断。**
+
+没有达到这个标准的内容保留为“问题”，不急于写成结论。
 
 ---
 
@@ -1487,11 +1696,14 @@ ratio4 下 DFI:CK = 1:2（DFI 半频于 CK）：
 | # | 事项 | 来源章节 | 状态 |
 |---|---|---|---|
 | 1 | init/training 序列细节与失败重试路径 | 7.2 | 待讨论 |
+| 2 | 各章“八问速答表”由旧版结构迁移到 0.7 新版八问（第 1~7 章共 7 张） | 0.7 | 待讨论 |
 
 **已关闭**：
 - ✅ stride 极端（2.2）：UIF 低位 = col/ba、txn 地址连续递增，不存在同 bank 换 row 形态；
 - ✅ 面积数字（6.2.3）：LPDDR6 / HBM4 双表已录入（含 CAM depth 与 link node 配置）；
 - ✅ CS prefetch window（7.8）：HBM4 16GHz 专题已成文。
+
+> 全局 roadmap（RAS / Device Management / Performance Observability / Verification·Debug）见 0.11，本表只登记章节级待处理项。
 
 
 ---

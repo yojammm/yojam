@@ -1,27 +1,444 @@
 # Transformer 到 HBM：面向 IC / HBM 控制器工程师的基础复习笔记
 
-## 0. 总体目标
+# 0. 文档纲领
 
-从 HBM / Memory Controller 工程师的视角理解 Transformer，不需要一开始深入算法推导，而是建立如下映射关系：
+> **文档定位**：面向 Memory / HBM Controller 工程师的 Transformer 认知链笔记。不追求算法完整性，只建立 `Model → Tensor → Byte → Traffic → HBM` 的工程语言，最终服务于 HBM Capacity / Bandwidth / Controller 行为分析。
 
-$$
-\text{Transformer 算法}
-\rightarrow
-\text{Tensor Shape}
-\rightarrow
-\text{Compute}
-\rightarrow
-\text{Memory Traffic}
-\rightarrow
-\text{HBM Bandwidth / Capacity}
-$$
+## 0.1 文档目标
 
-学习过程中始终问四个问题：
+本文不是 Transformer 算法教材，也不以成为算法工程师为目标。
+
+本文的目标是建立一条属于 Memory / HBM Controller 工程师的完整认知链：
+
+```text
+Model
+ ↓
+Operator
+ ↓
+Tensor
+ ↓
+Shape / Precision
+ ↓
+Compute
+ ↓
+Data Movement
+ ↓
+Memory Traffic
+ ↓
+HBM Transaction
+ ↓
+Memory Controller
+ ↓
+DRAM Efficiency
+ ↓
+Application Performance
+```
+
+最终需要能够从一个 AI workload 出发回答：
+
+> **它为什么需要这么多 HBM Capacity / Bandwidth？这些 Byte 以什么模式访问 HBM？Controller 哪些机制决定这些 Byte 最终能以多高效率被服务？**
+
+## 0.2 学习边界
+
+算法知识学习到"能够解释 Memory Behavior"为止。
+
+例如 Attention，需要理解：
+
+```text
+Q/K/V 是什么
+Tensor shape 是什么
+Prefill / Decode 如何计算
+MHA / GQA / MQA 如何改变 KV
+KV Cache 为什么存在
+```
+
+但暂时不要求深入：
+
+* Transformer 收敛理论；
+* optimizer 数学；
+* loss function 推导；
+* 大量训练算法细节。
+
+判断某个 AI 知识是否值得写进本文只有一个标准：
+
+> **它是否最终会改变 Tensor、Compute、Capacity、Traffic、Locality 或 Parallelism？**
+
+如果不会，当前阶段可以不展开。
+
+## 0.3 第一阶段：建立 Tensor 语言
+
+任何 Operator 都先回答：
+
+1. 输入 Tensor 是什么？
+2. Shape 是什么？
+3. 输出 Tensor 是什么？
+4. Weight 是什么？
+5. Activation 是什么？
+6. 哪些数据需要跨 layer 保存？
+7. Precision 是 FP16 / BF16 / FP8 / INT8 时 Byte 数如何变化？
+
+必须做到看到：
+
+```text
+[B, S, H]
+```
+
+就能立即理解三个维度分别代表什么。
+
+## 0.4 第二阶段：建立 Compute 语言
+
+逐步理解：
+
+* GEMM；
+* Batched GEMM；
+* QKV Projection；
+* QKᵀ；
+* Softmax × V；
+* Output Projection；
+* MLP；
+* Norm；
+* Embedding；
+* LM Head；
+* MoE。
+
+每个 Operator 统一回答：
+
+```text
+Tensor shape
+FLOPs / MACs
+Weight bytes
+Activation bytes
+Read bytes
+Write bytes
+Reuse opportunity
+Arithmetic Intensity
+```
+
+目标不是记 FLOPs，而是理解：
+
+> **同样的 Tensor Compute 为什么有的 Compute-Bound，有的 Memory-Bound。**
+
+## 0.5 第三阶段：从 Transformer 进入 Memory Hierarchy
+
+需要区分：
+
+```text
+Register
+SRAM / RF
+L1 / Local Buffer
+L2 / LLC
+HBM
+Host Memory
+```
+
+并不断追问：
+
+* 哪些 Activation 可以留片上？
+* 为什么 Weight 通常需要从 HBM streaming？
+* KV 为什么长期占 HBM？
+* Tensor tile 如何决定 SRAM reuse？
+* SRAM 不够时，哪部分 traffic 会 spill 到 HBM？
+* Kernel fusion 为什么可能减少 HBM traffic？
+
+这一阶段开始建立：
+
+```text
+Compute ≠ HBM Traffic
+```
+
+的意识。
+
+## 0.6 第四阶段：Prefill / Decode 的 Memory Model
+
+### Prefill
+
+重点问题：
+
+* 为什么 Weight reuse 高？
+* QKᵀ 为什么是矩阵计算？
+* Attention score 是否真的需要完整写 HBM？
+* FlashAttention 为什么能改变 memory traffic？
+* Sequence length 增加时 compute 和 traffic 如何增长？
+
+### Decode
+
+重点问题：
+
+* 为什么 batch=1 时 Weight traffic 特别严重？
+* 为什么每个 token 都要读取历史 KV？
+* context 增长为什么持续增加 KV traffic？
+* batch 为什么可以摊薄 Weight bytes/token？
+* GQA / MQA 为什么主要降低 KV，而不是所有 Weight？
+* Continuous Batching 改变了什么 reuse？
+
+目标是能够建立：
+
+```text
+Prefill → compute/reuse 问题
+Decode  → weight + KV movement 问题
+```
+
+但不能停留在这句定性结论，要进一步算 Byte。
+
+## 0.7 第五阶段：从 Byte 进入 Traffic Pattern
+
+这是本文未来最重要的扩展。
+
+不能只知道：
+
+```text
+14 GiB/token
+```
+
+还必须回答这 14 GiB 是怎么访问的。
+
+对 Weight / KV / Activation 分别分析：
+
+### Weight
+
+* 请求大小多大？
+* 是否连续？
+* 是否纯读？
+* reuse 发生在哪一层？
+* 多 channel 如何 striping？
+* tile 顺序是否影响 locality？
+
+### KV Cache
+
+* K/V 的物理 layout 是什么？
+* `layer / batch / head / token / head_dim` 谁是连续维？
+* 当前 token 读取历史 token 时地址 stride 是多少？
+* GQA 后不同 query head 是否共享 KV？
+* KV page / block 管理会形成什么访问粒度？
+* Paged Attention 如何改变地址连续性？
+
+### Activation
+
+* 哪些只在 SRAM 中存在？
+* 哪些因为容量不足 spill 到 HBM？
+* tensor parallel 后 activation 是否需要重新写入 HBM？
+
+最终从：
+
+```text
+Tensor
+```
+
+推导到：
+
+```text
+address stream
+read/write ratio
+request size
+stride
+locality
+concurrency
+```
+
+## 0.8 第六阶段：Traffic → HBM
+
+每种 workload 必须继续向下追：
+
+```text
+Logical Tensor Address
+ ↓
+Physical Address
+ ↓
+Stack
+ ↓
+Channel
+ ↓
+Pseudo Channel
+ ↓
+Bank Group / Bank
+ ↓
+Row / Column
+```
+
+核心问题：
+
+* Weight streaming 如何映射才能把 Channel / PC 吃满？
+* KV layout 与 address mapping 是否匹配？
+* 连续 token 是否集中到同一 bank？
+* Batch 增大后是增加 locality，还是只增加并发？
+* 不同 layer 同时运行时是否产生 channel hotspot？
+* Tensor layout 与 memory address mapping 是否存在共同设计空间？
+
+这一层是 AI 与 HBM Controller 真正发生连接的位置。
+
+## 0.9 第七阶段：HBM Traffic → Controller Behavior
+
+对每一种 AI traffic 都继续问：
+
+### Outstanding
+
+请求并行度是否足以填满所有 PC / bank？
+
+### CAM / Queue
+
+Scheduler 能看到多少未来请求？
+
+### Page Hit
+
+AI tensor 的地址模式到底天然产生 hit 还是 miss？
+
+### Bank Parallelism
+
+请求是否真的分布到足够多的 bank？
+
+### Read / Write Turnaround
+
+Weight read、KV read、KV write 如何混合？
+
+### QoS
+
+Weight 与 KV 谁更 latency-sensitive？
+
+### Refresh / RAS
+
+长时间满带宽 AI workload 下 refresh loss 有多少？
+
+最终建立：
+
+```text
+AI Workload Feature
+       ↓
+Traffic Feature
+       ↓
+Controller State
+       ↓
+Blocked Reason
+       ↓
+Bandwidth / Latency
+       ↓
+Tokens/s
+```
+
+## 0.10 第八阶段：必须补齐的 AI 主题
+
+按照与 HBM 的相关性逐步学习：
+
+1. **MHA → GQA → MQA**
+
+   * 为什么出现？
+   * KV capacity / traffic 怎么变化？
+
+2. **FlashAttention**
+
+   * 它主要减少什么 HBM traffic？
+   * 为什么不是简单"算法算得更少"？
+
+3. **Paged Attention / KV Paging**
+
+   * 为什么 serving 中需要 page？
+   * 连续逻辑 KV 为什么可能成为离散物理地址？
+
+4. **Continuous Batching**
+
+   * 为什么改善 Weight reuse？
+   * 为什么 batch 增大又会增加 KV capacity？
+
+5. **Quantization**
+
+   * FP16 → FP8 / INT8 后 Weight / KV / bandwidth 分别怎么变化？
+   * dequant 是否产生新的 compute / metadata traffic？
+
+6. **MoE**
+
+   * Expert Weight 如何放置？
+   * token routing 为什么会破坏规则连续访问？
+   * hot expert 会不会形成 HBM hotspot？
+
+7. **Tensor / Pipeline / Expert Parallel**
+
+   * 单卡 HBM traffic 与芯片间 communication 如何互相替代？
+   * 什么情况下瓶颈从 HBM 转到 scale-up fabric？
+
+## 0.11 每个 AI 主题的统一问题模板
+
+以后遇到任何新 AI 名词，不直接写定义，先问十问：
+
+```text
+1. 它解决什么算法问题？
+2. 输入输出 Tensor shape 是什么？
+3. FLOPs 怎么变化？
+4. Weight capacity 怎么变化？
+5. Activation capacity 怎么变化？
+6. KV capacity 怎么变化？
+7. HBM read/write bytes 怎么变化？
+8. Access pattern 怎么变化？
+9. Controller 会看到什么不同？
+10. 最终影响的是 latency、bandwidth、capacity 还是 compute？
+```
+
+回答不了第 7～10 问的内容，暂时还没有真正进入本文主题。
+
+与"十问"互补，日常做 Byte 推导时始终问四个问题：
 
 1. 当前正在计算什么 Tensor？
 2. Tensor 的 shape 是什么？
 3. Weight / Activation / KV Cache 分别存在哪里？
 4. 这一步需要从 HBM 搬多少 Byte？
+
+## 0.12 量化纪律
+
+所有公式明确写出 Assumption，例如：
+
+```text
+[ASSUMPTION]
+Decoder-only
+MHA
+MLP expansion = 4
+FP16
+Batch = 1
+Weights cannot remain on-chip
+No kernel fusion traffic reduction
+```
+
+模型不同必须重新推导，不能把简化模型公式当成 Llama、Qwen、DeepSeek 等所有模型的通用事实。
+
+来源标签：
+
+* **[ALGO]**：算法定义；
+* **[FORMULA]**：本人推导；
+* **[ASSUMPTION]**：简化假设；
+* **[MODEL-SPECIFIC]**：某模型特有；
+* **[SYSTEM]**：runtime / accelerator 行为；
+* **[TODO]**：目前没有理解。
+
+## 0.13 最终验收题
+
+本文最终应使自己能够独立完成：
+
+> 给定一个 LLM 的 Layer 数、Hidden Size、Head 配置、Context、Batch、Precision 和目标 Tokens/s，估算其 Weight / KV Capacity 与 HBM Traffic；判断 Prefill / Decode 的主要瓶颈；进一步推断这些 traffic 对 HBM Channel / PC / Bank、Address Mapping、Outstanding、Scheduler 和 Read/Write Switching 的压力，并给出可以验证的优化方案。
+
+这条链跑通，才算真正完成：
+
+```text
+Transformer → HBM
+```
+
+## 0.14 章节导航与完成度
+
+纲领八阶段与现有正文章节的映射（状态：已写 / 雏形 / 待写）：
+
+| 纲领阶段 | 对应章节 | 状态 |
+|---|---|---|
+| 第一阶段 Tensor 语言 | 2, 3, 15 | 已写 |
+| 第二阶段 Compute 语言 | 4–9, 12, 13 | 部分：缺 FLOPs / Arithmetic Intensity 七问模板 |
+| 第三阶段 Memory Hierarchy | 29（仅脑图示意） | 待写 |
+| 第四阶段 Prefill / Decode Memory Model | 10, 11, 14, 16–23, 25, 28 | 已写（当前主体） |
+| 第五阶段 Traffic Pattern | 24 | 雏形 |
+| 第六阶段 Traffic → HBM | — | 待写 |
+| 第七阶段 Controller Behavior | 交叉引用《HBM模型描述.md》《HBM读写切换策略.md》 | 待写（素材已备） |
+| 第八阶段 AI 主题补齐 | — | 待写 |
+| 0.13 最终验收题 | 27, 28, 29 | 部分：缺 Channel / PC / Bank 压力推断环节 |
+
+**纲领规则**：
+
+* 后续新增章节必须在 0.14 表中登记所属阶段；
+* 所有公式推导必须携带 0.12 定义的来源标签；
+* 第七阶段写作时直接衔接仓库内 `HBM模型描述.md` 与 `HBM读写切换策略.md`，不重复展开 Controller 内部机制。
 
 ---
 
