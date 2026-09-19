@@ -1,20 +1,34 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
-HBM3 命令调度性能模型——v20 中文候选版
+HBM4 命令调度性能模型——v1.2 (基于 HBM3 v21.1)
 ================================================================
 
 版本信息
 --------
-版本          : v20.0
-发布状态      : 新增 write_requires_data_ready 可选项 (默认 True, 保持 v19.3 行为)
-              + 继承 v19.3 / v19.2 全部特性
+版本          : HBM4 v1.2 (基于 HBM3 v21.1 改造)
+发布状态      : v1.2 AC timing 对齐 HBM4_12000.xlsx (12 Gbps 档)。表中
+                能找到的 AC timing 默认值全部替换为表值 (单位 CK); 原以 ns
+                为单位输入的参数 (tRCDRD/tRCDWR/tRP/tRC/tRAS/tWR/tRFCpb/
+                tRREFD) 新增 CK 路输入 = 表值, ns 路默认置 0, 两路换算成
+                dfi_phase_slot 后取 max; data_rate_gbps 12.8 → 12.0
+                (表 CK=3 GHz, tCK=0.333 ns);
+                演进: v0.2 结构性改造 (时钟 1:4:8 / 双时间域 /
+                双 slot / 8bank-BG / 新地址映射) → v0.3 两级 Prefetch Window
+                → v0.3.1 窗口 entry 级即时释放 → v1.0 双单位 timing 约束
+                (nCK/ns 两路取 max) + 颗粒参数归拢
+                → v1.1 头部修改日志补全
+                → v1.2 AC timing 对齐 HBM4_12000.xlsx 12G 档 (本版);
+                继承 HBM3 v16.3 → v21.1 全部调度 feature (见下 v1.1 修改日志)。
 注释语言      : 中文
-行为兼容性    : 默认 write_requires_data_ready=True 与 v19.3 一致;
-              设 False 可恢复 v19.1 baseline (无 buffer 模型).
+行为兼容性    : 调度策略继承 HBM3 (默认 batch_scheduling=True + rw_4state_mode=True
+               走 RW 4 态机; rw_4state_mode=False 走原 batch/preparation;
+               batch_scheduling=False 强制 Alternating, 此时 rw_4state_mode 被忽略.
+               默认 write_requires_data_ready=True; 两级 prefetch window 默认开启: cs=8/dfi=4 banks).
 地址单位      : 1 个逻辑地址单位对应 32 字节 ColumnCommand
-时间单位      : 1 个模型 cycle = 1 个 DFI cycle = 2 个 HBM CK
+时间单位      : 双时间域 — AC 域 dfi_phase_slot (1 slot = 0.5 DFI = 2 nCK, 命令发射/AC timing);
+               CTL 域 DFI cycle (= 4 HBM CK, 准入/link node/WDB/refresh debt/tRL/性能统计)
 
 模型用途
 --------
@@ -39,361 +53,181 @@ ACT、PRE、RD、WR 与 REFpb 等命令的调度过程。模型可用于调度�
 
 
 
-v20.0 关键特性 (本期新增, 重点)
----------------------------------
-1. **新增 `write_requires_data_ready` 参数** (默认 True)
-     - 目的: 让用户可选择"写命令是否需要等 data ready 才能被调度模块看见",
-       覆盖从"严格写数据 FIFO 同步"到"WR 优先/数据后到"的不同 HBM 行为模型.
-     - True  (默认, v19.3 行为): WRITE 入 CAM 后 data_ready_cycle 保持
-       INITIAL_CYCLE_SENTINEL, 必须等 _commit_pending_write_data 把 data
-       搬进 write_data_buffer (满足 delay + buffer 有空间) 后, 调度模块
-       才能看见, 才能发 ACT/WR/WRA. 严格 FIFO 同步模型.
-     - False (v20 新增): WRITE 入 CAM 立即 ready (data_ready_cycle = current_cycle),
-       跳过 _commit_pending_write_data 整段逻辑, _complete_dispatch 也不做
-       buffer 释放 (buffer 永远 0). 模拟旧版"无 buffer 模型" -- WR 命令先发,
-       data 通过 DQS/DQ 独立路径延迟到达.
-     - 用法: HBMCommandScheduler(..., write_requires_data_ready=False)
-     - 适用场景:
-       * 旧 v19.1 baseline 用户升级 v20 时, 设 False 即可恢复原行为, 无需重写 workload.
-       * 对比有无 buffer 模型对 perf 的影响时, 一键切换.
-       * 内存/CPU 受限时, 关掉 buffer 模型可降低模拟复杂度.
-2. **`_commit_pending_write_data` 在 False 模式时整段跳过**
-     - 函数开头加 `if not self._config.write_requires_data_ready: return`,
-       避免无意义的 FIFO 遍历.
-3. **`_complete_dispatch` 释放逻辑适配**
-     - True  模式: 保持 v19.3 行为, 仅 burst 全部 dispatch 完且
-       data_ready_cycle != SENTINEL 时释放 buffer (commit +N, release -N 净 0).
-     - False 模式: 跳过释放逻辑 (buffer 永远 0, 无需归还).
-4. **WRITE admit 端根据开关决定 data_ready_cycle**
-     - True  模式: 保持 INITIAL_CYCLE_SENTINEL (默认).
-     - False 模式: 立即设为 current_cycle (模拟 WR 命令先发).
-5. **校验**: 无新增 (bool 类型无需校验).
+v1.2 修改日志 (AC timing 对齐 HBM4_12000.xlsx, 12 Gbps 档)
+============================================================
+[来源] univista/ctl_spec/HBM4/HBM4_12000.xlsx (Sheet1):
+       CK=3000 MHz / tCK=0.333 ns, 全表 AC timing 值单位 CK。
+A. 默认时钟: data_rate_gbps 12.8 → 12.0 (HBM CK 3 GHz, 与表一致)。
+B. 直接替换 (原 nCK 输入, 表值同单位 CK):
+   WL 18→14, tRTP 17→12, tCCDL 8→5, tWTRL 14→16, tWTRS 22→14;
+   tCCDS=2 / tCCDR=2 与表恰好一致, 不变。
+C. 新增 CK 路输入 (原仅 ns 输入的 8 项; 新增 *_hbmck 参数 = 表值,
+   对应 ns 参数默认置 0, 两路各自换算成 dfi_phase_slot 后取 max):
+   tRCDRD 18.0ns→57 CK, tRCDWR 9.0ns→43 CK, tRP 16.0ns→45 CK,
+   tRC 45.0ns→135 CK, tRAS 29.0ns→90 CK, tWR 21.0ns→60 CK
+   (write_ap=WL+2+tWR 公式改用 CK 路结果),
+   tRFCpb 280.0ns→720 CK (表注 240ns/LC-200ns), tRREFD 8.0ns→24 CK。
+D. 双单位对 CK 路填表值 / ns 路清 0:
+   tRRD_S 0/2ns→6/0, tRRD_L 0/3ns→6/0, tFAW 0/15ns→24/0。
+E. 表中无值或模型无对应输入的不动:
+   tRTW 表为 "-" (保留 65 CK); RL/tREFI/tDAL/tRFCab/电源管理/MRS 类
+   (模型无直接对应输入, 经确认跳过)。
+F. TimingParameters.from_inputs / SimulationConfig / summary 输出同步
+   扩展 (新增 *_hbmck 字段与双单位 max 显示)。
 
 
-v19.3 关键特性 (上版本, 保留作为历史)
----------------------------------
-1. **write_data_buffer 释放逻辑 bug 修复**
-     - 修复 _complete_dispatch 中 over-release 逻辑:
-       原代码每派发 1 个 write col 释放 1 个 buffer entry, 完成时再释放 len(commands),
-       4 col burst 总释放 = 1+1+1+4 = 7 (commit +4), 净溢出 -3 per burst,
-       导致 state["used"] 变成负数, buffer 永远"不满", 约束失效.
-     - 修复: 仅在 burst 全部 dispatch 完时一次性释放 len(burst_entry.commands),
-       commit +N, release -N, 净 0.
-2. **WRITE admit 端加 buffer 约束 [已撤回]**
-     - 撤回原因: WDB (write_data_buffer) 与 WRITE_CAM 是两个独立资源,
-       admit 端耦合 WDB 会导致 WDB 满时连命令都不让进队, 错把
-       "数据 FIFO 满" 当成 "命令队列门", 与真实 HBM 写流程不符
-       (实际 HBM 中 WR 命令先发, data 通过 DQS/DQ 独立路径到达).
-     - 当前行为: admit 端只检查 WRITE_CAM 深度; WDB 满由
-       _commit_pending_write_data 的 FIFO head-block 承担
-       (head 未到 delay / head buffer 满 -> break, 后续等下 cycle);
-       未 commit 的 entry 留在 CAM 中, 通过
-       data_ready_cycle == INITIAL_CYCLE_SENTINEL + _is_entry_data_ready
-       统一入口在 12+ 处调度过滤中保持对调度模块不可见, 不会被发 ACT/WR/WRA.
-3. **默认 `write_data_buffer_depth` 改为 8192**
-     - 原默认 128 在 100 burst workload (400 cols) 下也会约束,
-       perf 退化 2-4x, 与 v19.1 baseline 不兼容.
-     - 新默认 8192 远大于 write_cam_depth × BURST_GROUP_SIZE = 128,
-       默认 workload (10000 txn) 下 buffer 永远不满, baseline perf 完全一致.
-     - 用户主动设小值 (如 32, 8, 4) 即可测试 buffer 约束.
-4. **`_is_entry_data_ready` 统一入口不变** (v19.2 已正确实现, v19.3 无需改动)
-5. **校验**: `_validate_inputs` 新增 `write_data_buffer_depth >= 1` 校验 (v19.3 沿用)
+v1.1 修改日志 (vs version_hbm4/hbm4_model_v0.2.py)
+================================================
+[说明] 本节列出 v0.2 → v1.0 的主要结构性变更, 便于从 v0.2 直接 review 到当前版本.
+       v1.1 相对 v1.0 仅头部文档补全 (本节), 无代码逻辑改动.
+
+A. 两级 Prefetch Window 替换 Col Lock Window (核心, v0.3 / v0.3.1 / v7 系列)
+   - 删除 HBM3 v21.1 继承的 Col Lock Window (按 burst 跟踪, size=4 容量).
+   - 引入两级 bank 窗口:
+     • cs 窗口 (默认 8): col 命令 (R+W) 只能派发窗口内 bank 上的命令;
+     • dfi 写子窗口 (默认 4): 写额外只能派发 cs 窗口内准入最早的前 N 个 bank.
+   - 新参数 (SimulationConfig / HBMCommandScheduler 暴露, ColScheduler 构造接收):
+     cs_prefetch_window_enable/cs_prefetch_window,
+     dfi_prefetch_window_enable/dfi_prefetch_window,
+     cs_prefetch_active_admit (v7 严格主动准入 vs v0.3.1 被动准入).
+   - 准入机制重写:
+     • v7 严格主动准入 (默认): bank ACT 当拍入 已 ACT 大池子, 由 BG 多样性
+       筛选晋升入窗 (见 _on_bank_activated / _promote_from_act_pool);
+     • v0.3.1 被动准入 (兼容): bank 首条 col 派发时占位 (FIFO).
+   - 释放改为 entry 级即时 (v0.3.1): entry 全部 col 派发完当拍立即移出;
+     refresh force-PRE 关闭 bank 同样立即释放. 同 bank 其他在途 entry
+     下次派发时按准入条件重新排队, 不默认继承窗口位.
+   - 防御性补丁:
+     • v7.1 窗口陈旧项清扫 (防僵尸 bank 钉死窗口);
+     • v7.2 模式对齐优先 (4 态机 + batch 下读/写态偏好对应 serving bank);
+     • v7.3 切态不再触发窗口逐出 (反向 serving bank 由纯态 drain 兜底).
+   - 统计与格式化函数重命名: get_col_lock_stats → get_prefetch_window_stats;
+     _format_col_lock_stats → _format_prefetch_window_stats; 字段集随之扩展
+     (cs_enabled/cs_size/cs_used_end/cs_peak_used/cs_avg_used/cs_full_block_count
+      /cs_total_admits/cs_total_releases/cs_entry_complete_releases/cs_force_pre_releases
+      /cs_stale_evict_releases/cs_mode_evict_releases/cs_active_admit/dfi_*).
+   - 日志新增 CSW 列: 窗口关闭 → --, 启用 → 当前窗口 bank 列表.
+
+D. 4 态机调度修复 (v7.3)
+   - 背景 (linear_RW50_batch 复盘): 4 态机纯态只扫单侧 CAM 且无 drain.
+     linear RW50 下 R/W txn 打在同一批 bank 上, 进入 WR 态时若全部写
+     entry 都堵在读占用的 bank 上 (读未派完 → bank 不释放 → 写无 bank
+     可 ACT), WR 态零派发, 只能等 800-cycle 定时器切态, 形成周期性长 stall.
+   - 对策: 新增 _try_issue_4state_with_drain = 本侧优先 + drain 兜底
+     (与 legacy batch 的 _issue_current_else_drain 同语义). drain 天然
+     受 txn 匹配 + cs/dfi 窗口约束, 不会乱序派发; 也自动治愈 dfi 子窗口
+     被对向 serving bank 占据的污染 (drain 派完即腾位).
+   - begin_cycle 每 cycle 重建 dispatch_id → is_write 映射 (≤1 cycle
+     陈旧), 供 _bank_serving_is_write 查询, 用于晋升的模式对齐优先.
+   - 4 态机切换 (RD↔WR) 不再触发窗口逐出 (v7.2 → v7.3 修复).
+
+F. 地址映射调整 (BG 1 bit, v0.2 后)
+   - HBM4 每 SID 仅 2 个 BG → bg 1 bit (只读 bg0pos, 无 bg1pos,
+     与 HBM3 的 2 bit BG 不同). 位 26/27 仍为扩展虚拟位 (供 sid1 虚拟用).
+   - 默认 LEGACY-HBM4 8H 地址映射重定义:
+     • col: {0,1,2,8,9} → {0,1,2,9,10}
+     • bg: bg0pos 3 → 4 (无 bg1pos)
+     • ba: {6,7,10} → {3,7,8}
+     • sid: {5, v26} 不变; row: {11..25} 不变
+   - 影响: 地址解码 _extract_field(bg, 2) → _extract_field(bg, 1);
+     DEFAULT_ADDRESS_MAPPING_PARAMS 同步更新.
+
+E. 默认参数调整 (v1.0)
+   - 数据率 / 结构: data_rate_gbps 16.0 → 12.8; num_banks 32 → 48.
+   - Bank timing (ns): t_rcdwr 12 → 9, t_rp 18 → 16, t_rc 52 → 45,
+                       t_ras 34 → 29; t_rtp_hbmck 5 → 17; wl_hbmck 16 → 18.
+   - 通道 timing (nCK): t_ccd_l 6 → 8; t_ccdr_hbmck 4 → 2.
+   - tRRD_S / tRRD_L / tFAW 改为双单位 (nCK/ns 各换算成 slot 后取 max):
+     旧 v0.2 = 6 nCK / 6 nCK / 24 nCK;
+     现 v1.0 = 0 nCK + 2 ns / 0 nCK + 3 ns / 0 nCK + 15 ns.
+   - tRTW 改为双单位: 旧 v0.2 = 23.0 ns; 现 v1.0 = 65 nCK + 0 ns.
+   - tWTRL / tWTRS (nCK): 4 → 14 / 2 → 22.
+   - die refresh: t_rfc_pb_ns 200 → 280.
+   - 其他: DEFAULT_LINK_NODE_COUNT 192 → 160.
 
 
-v19.2 关键特性 (继承, 上上版本)
------------------------------
-1. **新增 `write_data_buffer_depth` 参数** (默认 8192)
-     - 写数据 buffer 深度 (entry 数), 模拟 HBM 的 write data FIFO
-     - 默认 8192 远大于 write_cam_depth × BURST_GROUP_SIZE = 32 × 4 = 128,
-       默认 workload (10000 txn) 下 buffer 永远不满, 即不约束调度,
-       与无 buffer 模型行为一致.
-     - 想测试 buffer 约束时, 设小值 (如 32, 8, 4).
-     - 每个 burst entry 占用 N 个 entry (N = burst 内 col 数, 通常 1-4)
-     - 当 buffer 剩余空间 < N 时, 即使经过 write_data_ready_delay, data 也不能 commit
-     - 调度模块看不到未 commit 的 entry, 不发 ACT/WR/WRA
-     - 严格 FIFO 纪律: 数据入 buffer 顺序 = WRITE 入 CAM 顺序, head 阻塞后续
-2. **新增 `write_data_ready_delay` 参数** (默认 0)
-     - 写命令从入 CAM 到 data ready 之间的延迟 (单位: DFI cycle)
-     - 语义: 只有 data ready 的写命令才被调度模块"看见", 才能发 ACT/WR/WRA
-     - READ 不受影响, 永远 ready (默认 data_ready_cycle = 0, current_cycle >= 0 恒真)
-     - 默认 0 时与原行为完全一致 (向后兼容)
-     - 用法: `HBMCommandScheduler(..., write_data_ready_delay=10)` 表示写命令
-       入 CAM 后需等 10 cycles 才被调度器"看见"
-3. **BurstCommandGroup 新增 `data_ready_cycle` 字段**
-     - READ 默认 `INITIAL_CYCLE_SENTINEL` (read 时显式设 0)
-     - WRITE 入 CAM 时默认 `INITIAL_CYCLE_SENTINEL` (标记"未 commit")
-     - WRITE commit 后由 `_commit_pending_write_data` 设为 current_cycle
-     - 调度模块每 cycle 通过 `_is_entry_data_ready` 检查 `current_cycle >= entry.data_ready_cycle`
-4. **commit 机制**:
-     - `_commit_pending_write_data(current_cycle)` 每 cycle 开头调用一次
-     - 遍历 `self._write_cam`, 找 `data_ready_cycle == INITIAL_CYCLE_SENTINEL`
-       且 `current_cycle >= entry.entry_cycle + write_data_ready_delay` 的 entry
-     - 若 buffer 剩余空间 >= N (N = burst 内 col 数): commit 成功.
-       设 `entry.data_ready_cycle = current_cycle`, `buffer_used += N`.
-     - 严格 FIFO 纪律 (break 强制 head 阻塞): 保证数据入 buffer 顺序 = 入 CAM 顺序
-5. **释放机制**:
-     - 每派发 1 个 write col, 释放 1 个 buffer entry (`_complete_dispatch` 中)
-     - entry 全部 col 派发完时, 一次性释放所有 buffer entry
-     - 防御: 仅当 `data_ready_cycle != INITIAL_CYCLE_SENTINEL` (已 commit) 时才释放
-6. **12 处调度过滤统一改为 `_is_entry_data_ready(entry, current_cycle)` 入口**
-   (替代散落的 `current_cycle < entry.data_ready_cycle` 检查)
-7. **校验**: `_validate_inputs` 新增 `write_data_ready_delay >= 0` 与 `write_data_buffer_depth >= 1`
-8. **新增统计**:
-     - `_write_data_buffer_peak_usage` (历史峰值)
-     - `_write_data_buffer_commit_count` / `_write_data_buffer_wait_count` (累计 commit / 等待次数)
+HBM3 继承特性汇总 (v16.3 → v21.1)
+==================================
+以下 feature 由 HBM3 模型继承而来,代码逻辑保持不变,仅文档重写:
+
+• 地址转换 / CAM 调度 / RDA·WRA / READ tRL / txn_id 链表资源模型   (HBM3 v15 基础)
+• 时钟关系换算 + REFpb nominal 按 tREFIpb=ceil(tREFI/总 bank 数) 在
+  Channel 级产生                                                    (HBM3 v16.3)
+• REFpb Refresh Refine — per-SID rolling-set + Channel refresh debt
+  (nominal - 实际) + tRREFD 闸约束                                   (HBM3 v16.3)
+• RW 4 态调度状态机 (RD/WR/RD_WR/WR_RD) 替换原 batch+prep 模型;
+  按 state 通道化 row 视野 + col 派发;默认 rw_4state_mode=True,
+  设 False 走原 batch (向后兼容)                                     (HBM3 v16.4)
+• ACT 调度 BG 交织优先级 — 同 SID 不同 BG 优先 + RR fallback;
+  默认 bg_interleave_priority=True,设 False 退回纯 RR                (HBM3 v17)
+• ACT 调度 Age 优先级 — 当前 bank 最老未派发 burst entry 等待 cycle;
+  排序链 age > BG 交织 > RR;默认 age_priority=True                   (HBM3 v18)
+• Refresh cross-SID 串行 — 同一时刻只有 1 个 SID 进 candidates,
+  刷完 16 banks 推进下一 SID,减少 SID 间 tRREFD/tFAW/tRRD 串扰       (HBM3 v19)
+• Refresh mandatory latch 迟滞 — mandatory 进入后至少刷 N 个 REFpb
+  才解除;默认 max_postpone_credits=8, postpone_low_thr=2             (HBM3 v19.1)
+• 写数据 buffer 模型 — write_data_buffer_depth=8192,
+  write_data_ready_delay=0, data_ready_cycle 字段,严格 FIFO 纪律,
+  调度模块只看见 data-ready 的 entry                                  (HBM3 v19.2)
+• write_data_buffer 释放逻辑 bug 修复 (over-release) +
+  默认深度改 8192 (远大于 CAM,默认 workload 不约束)                    (HBM3 v19.3)
+• write_requires_data_ready 参数 — 默认 True 走严格 FIFO 同步,
+  False 走"无 buffer 模型" (WR 命令先发, data 独立路径到达)           (HBM3 v20.0)
+• batch_scheduling 提升为大类开关 + 调度分支拼写/路径顺序修正 +
+  CAM 可见性顺序调整 + _check_preparation_exit 判空修复;
+  默认 batch_scheduling=True + rw_4state_mode=True                   (HBM3 v20.1)
+• Col Lock Window 特性 (HBM3 v21.1) — 已在 HBM4 v0.3 中被两级
+  Prefetch Window (cs_prefetch_window=8 / dfi_prefetch_window=4,
+  按 bank 计量) 替代删除, 详见下 HBM4 新增特性。
+• Bank 打开时长统计 — ACT 至 bank 真正 IDLE 的 cycle 数,自动收集
+  始终输出,不影响 perf                                              (HBM3 v21.1)
 
 
-v19.1 关键特性 (继承, 上上版本)
------------------------------
-1. **mandatory 触发引入 latch 迟滞机制** (`mandatory_latch` + `postpone_low_thr`)
-     - 新增 `_mandatory_latch: bool` 字段 (默认 False): 当前是否处于 mandatory 状态
-     - 新增 `_mandatory_refresh_count: int` 字段 (默认 0): latch 内已刷的 REFpb 数
-     - 新增 `postpone_low_thr: int = 2` 参数: mandatory 进入后至少刷几个 REFpb
-       才解除 latch (迟滞, 避免 debt 附近 on/off 抖动); 默认 2
-2. **latch 状态机**:
-     - 入口: `_update_mandatory_latch()` 在 `try_issue` 与 `is_mandatory_needed`
-       入口都调, 仅在 `debt ≥ max_postpone_credits` 且 `_mandatory_latch == False`
-       时触发 False→True 跳变, 同时 reset count, `_debt_prevention_trigger_count += 1`
-     - 出口: `_issue_mandatory_refpb()` 每发一个 mandatory REFpb, count + 1;
-       刷满 `postpone_low_thr` 个后 `_mandatory_latch = False`
-     - 幂等: 多次调用不会重复触发
-3. **拆开 mandatory 触发阈值 vs 协议硬上限** (从 v19 抽过来):
-     - `max_postpone_credits = 8` (REFpb 个数): debt≥该值进入 `mandatory_latch`
-       与 `_debt_at_limit_cycles` 等“软预警”路径; 默认 8
-     - `postpone_low_thr = 2`: mandatory 进入后至少刷几个 REFpb 才解除 latch
-       (迟滞, 避免 debt 附近 on/off 抖动); 默认 2
-     - `max_postpone_refab_debt = max_postpone_refab_rounds × num_banks`
-       (默认 9×N): 协议硬上限, 仅用于 fail-fast 与 debt 合法范围校验
-     - v18 之前两者共用 `max_postpone_credits`, 同时承担“软预警 + 硬上限”,
-       数值混淆；v19 解耦后语义更清晰
-4. **`is_mandatory` 判定简化**:
-     - v19: `is_mandatory = (critical_next_opportunity or prepare_due or _drain_target_bank == target)`
-     - v19.1: `is_mandatory = (self._mandatory_latch or prepare_due)`
-     - 去掉 `critical_next_opportunity` (由 `_mandatory_latch` 替代, 更稳定)
-     - 去掉 `_drain_target_bank == target` (mandatory 不再锁 drain target, 每 cycle 重选)
-5. **mandatory 路径改为三段式 tier 选 bank**:
-     - tier 1: IDLE + CAM 不命中 + AC timing OK → 直接 REFpb (零干扰)
-     - tier 2: IDLE + CAM 命中 + AC timing OK → 直接 REFpb (row 已关, CAM 命令延迟 re-ACT)
-     - tier 3: ACTING → force-PRE `candidates[0]` (最紧急); 非 ACTING 或时序不满足则本 cycle 让位
-     - 不再像 v19 那样锁 drain target, 避免目标抖动
-6. **non-mandatory 路径修复 (遍历)**:
-     - 旧实现只试 `candidates[0]` 的 AC timing, 第一个被挡即 return None
-     - v19.1 改为遍历整组候选 (rolling-set 剩余 ∩ CAM 未占用), 找第一个 IDLE +
-       timing OK 的 bank 发出; 全部不满足才放弃, 避免漏发
-7. **新增 `is_mandatory_needed()` 探测方法**:
-     - 只判断当前 cycle 是否需要 mandatory REFpb, 不发出命令
-     - 编排器用它在 row_scheduler 之前预判, 决定 mandatory REFpb 是否抢占 row bus
-     - 内部仍调 `_update_mandatory_latch()` (确保 latch 状态同步)
-8. **行为兼容性**:
-     - v19 设 `postpone_low_thr = 1` 可等价于 v19 行为 (立即解除 latch, 无迟滞)
-     - v18 之前 mandatory 触发路径无迟滞, v19.1 默认 2 个 REFpb 窗口期是新增语义
-     - mandatory tier 1/2 优先于 tier 3 force-PRE, 保持对 ACT/PRE 的最小干扰
-
-v19 关键特性 (本期新增, 重点)
------------------------------
-1. **REFpb 调度新增 cross-SID 串行策略**
-     - 同一时刻只有一个 SID 的 bank 进入 candidates (rolling-set 选优域)
-     - 当前活动 SID 的 rolling-set 全部刷完一次 (16 banks) 后,
-       推进到下一个 SID (`_active_sid = (_active_sid + 1) % _num_sid`)
-     - 目的: 减少 SID 之间 tRREFD / tFAW / tRRD 闸串扰, 让一个 SID
-       在“清静”的 channel 窗口内集中完成一个 set 的 16 个 REFpb,
-       避免 12H 多 SID 下不同 SID 的候选彼此拖延
-2. 新增字段: `RefreshScheduler._num_sid / _active_sid / _advance_pending`
-     - `_active_sid`: 当前活动的 SID
-     - `_advance_pending`: 活动 SID 的 set 刚刷完时置 True,
-       下次 `_collect_candidates()` 时推进到下一 SID
-3. 新增参数: `RefreshScheduler(max_postpone_refab_rounds: int = 9)`
-     - 协议 fail-fast 硬上限轮数 (默认 9 ↔ per-bank 间隔 ≤ 9×tREFI,
-       对应 JEDEC "refresh postpone all bank" 上限)
-4. `_prepare_deadline_cycle` 初值改为 `_hard_deadline_cycle`
-     (首个 cycle 即被 `_update_prepare_deadlines` 重算, 初值仅占位)
-5. **8-run 性能对比表逻辑提取**: 从 `main()` 抽出 `_write_comparison(runs, log_fp)`,
-   让 `main()` 只负责流程编排
-6. **行为兼容性**:
-     - 单 SID 配置 (8H 2 SID / 4H 1 SID) cross-SID 串行语义退化为“逐 SID 串行刷”,
-       与 v18 等价 (仅按 SID 顺序);
-     - 4H (1 SID) 配置: `_num_sid=1`, `_active_sid` 始终为 0, 与 v18 完全等价;
-     - mandatory 触发路径行为不变, 仅阈值与上限语义解耦.
-
-v18 关键特性 (本期新增, 重点)
------------------------------
-1. **ACT 调度新增 Age 优先级** (`age_priority`, 默认 True)
-2. 优先规则: 在所有 eligible bank 中, 优先选**ACT 等待最久**的 bank
-     - 目的: 防止个别 bank 因调度偏向而长期得不到 ACT, 保证公平性
-3. Age 定义: `current_cycle - min(entry.entry_cycle for entry in cams
-   if entry.bank_id == bank.bank_id and not all dispatched)`
-     - 即该 bank 上**最老的未派发 burst entry** 的等待 cycle 数
-4. 优先级链: age (desc) > BG 交织 (tiebreaker) > RR (last tiebreaker)
-5. 新增 `age_priority: bool = True` 参数; 设 False 退回 v17 行为 (无 age 优先级)
-6. 新增统计:
-     - `age_priority_used` — 实际应用 age 优先级的次数 (即选出的 bank 是 age 最大的)
-     - 各 bank ACT 等待时间分布 (sanity, summary 显示)
-7. **与 BG 交织优先级组合**: age 选 max 时, 多个并列 age 才看 BG 交织; 不强制 BG
-8. **与 RW 4 态机正交**: age 只影响 ACT 选择, 不影响 ColScheduler 状态机
-
-v17 关键特性 (继承, 上版本)
------------------------------
-1. **ACT 调度新增 BG 交织优先级** (`bg_interleave_priority`, 默认 True)
-2. 优先规则: 在所有 eligible bank 中, 优先选**同 SID 但不同 BG** 的 bank 进行 ACT
-     - 目的: 把 ACT 分散到 SID 内的多个 BG, 提升 BG 级并行, 减少 tRRDL 集中
-3. 实现机制:
-     - 维护 `self._last_act_bg_per_sid: List[int]` — 每个 SID 上次 ACT 的 BG (初始 -1)
-     - 每次 ACT 后更新: `_last_act_bg_per_sid[bank.sid_id] = bank.bank_group_id`
-     - 选 bank 时: 优先 `_last_act_bg_per_sid[bank.sid_id] != bank.bank_group_id` 的;
-       无候选时 fallback 到"同 BG 或其他 SID"
-4. RR 仲裁顺序保持不变, 仅在 RR 之前做 BG 优先级过滤
-5. 新增 `num_sid` 参数透传到 RowScheduler (用于初始化 per-SID 跟踪)
-6. 统计:
-     - `bg_interleave_hits` — 选中 BG 不同的 bank 的次数
-     - `bg_interleave_fallback` — 无 BG 不同的候选, 退回同 BG 的次数
-7. **向后兼容**: 设 `bg_interleave_priority=False` 恢复 v16.4 行为 (无 BG 优先级, 纯 RR)
-8. **与 4 态机正交**: BG 交织优先级只影响 ACT 选择, 不影响 ColScheduler 状态机
-9. **与 RW 切换正交**: 切态不重置 BG 跟踪, 跨态切回仍保持 BG 交替节奏
-
-v16.4 关键特性 (继承, 上版本)
--------------------------------
-1. **新增 RW 4 态调度状态机** 替换原 batch (stick-to-one-side + preparation phase)
-   与 alternating 的"两态 + 隐式 prep"模型。
-2. 4 态机状态:
-     - RD      : 正常 RD 模式 — 只发 RD CAM 的 ACT + RD
-     - WR      : 正常 WR 模式 — 只发 WR CAM 的 ACT + WR
-     - RD_WR   : 过渡态 RD→WR — drain RD CAM RD, 同时开 WR CAM 的 ACT
-     - WR_RD   : 过渡态 WR→RD — drain WR CAM WR, 同时开 RD CAM 的 ACT
-3. 状态转移 (用户规约):
-     - RD → WR     : RD CAM 空 且 WR CAM 有活 (直切, 不走过渡)
-     - RD → RD_WR  : 当前在 RD, WR CAM 有活, 倒计时 batch_timeout_cycles → 0
-     - RD_WR → WR  : WR CAM 有可派发命令 (bank ACT + col ready) 或 RD CAM 已空
-                     或 **WR 已开 ≥ preparation_min_banks 个 ACT 且至少 1 个 col ready** (v18.1+)
-     - WR → RD     : WR CAM 空 且 RD CAM 有活
-     - WR → WR_RD  : 当前在 WR, RD CAM 有活, 倒计时到 0
-     - WR_RD → RD  : RD CAM 有可派发命令 或 WR CAM 已空
-                     或 **RD 已开 ≥ preparation_min_banks 个 ACT 且至少 1 个 col ready** (v18.1+)
-4. **row 视野按 state 通道化**:
-     - RD / WR : row 只看对应 mode 的 CAM (不开对向)
-     - RD_WR    : row 只看 WR CAM (不开新 RD bank, 让 source RD banks drain)
-     - WR_RD    : row 只看 RD CAM (不开新 WR bank, 让 source WR banks drain)
-5. **col 派发按 state 限制**:
-     - RD / RD_WR : 只发 RD col 命令 (后者是 drain)
-     - WR / WR_RD : 只发 WR col 命令 (后者是 drain)
-     - 过渡态不开 source 侧新 ACT, 让现有 bank 自然通过 autoprecharge (RDA/WRA) 关闭
-6. 初始 state 固定 RD; 纯 R / 纯 W workload 时, 4 态机自然停在单一 state (无影响)。
-7. 新增 `rw_4state_mode: bool = True` 参数; 设 False 走原 batch/alternating 行为 (向后兼容)。
-8. 新增 `[RW 4 态机统计 (v16.3+)]` summary 段: 直切次数 / 进入过渡次数 / 退出过渡次数 / 各 state 驻留 cycle 数 / 百分比。
-9. **性能影响** (num_transactions=2000, 12H 配置):
-     - 单边 workload (纯 R / 纯 W) : ±0%
-     - 50/50 batch linear : +19.8% (旧 0.74 → 新 0.88)
-     - 50/50 batch random : +30.6% (旧 0.64 → 新 0.84)
-     - 50/50 alt linear/random: 与 batch 同 (4 态机下 batch_scheduling 标志被忽略)
-
-v16.3 关键特性 (继承自 v16.3 Refresh Refine)
--------------------------------------------
-1. 继承 v15 的地址转换、CAM 调度、RDA/WRA、READ tRL 与 txn_id 链表资源模型。
-2. 时钟关系按 data rate → DQS → HBM CK → DFI CLK 统一换算；模型内部使用 DFI cycle。
-3. REFpb nominal opportunity 按 tREFIpb=ceil(tREFI/总 bank 数) 在 Channel 级产生。
-4. Channel refresh debt 定义为 nominal REFpb 数减去实际 REFpb 数，不再按等待 cycle 累加 postpone。
-5. 第一版不主动 pull-in；实际 REFpb 数不超前于 nominal opportunity。
-6. 每个 SID 独立维护 16-bank rolling-set bitmap，当前 set 内禁止重复刷新同一 bank。
-7. 一个 SID 的 16 个 bank 全部完成后标记 set complete；下一 set 首条 REFpb 等待 tRFCpb boundary。
-8. 每个 bank 维护 last refresh、normal due 与 9×tREFI hard deadline。
-9. REFpb 候选使用无副作用的 rolling-set 查询，并按 prepare/hard deadline、age 与 bank 状态排序。
-10. 拆分 normal due、动态 prepare deadline 与 9×tREFI hard deadline；RDA/WRA guard 使用 prepare deadline。
-11. tRREFD 按 Channel 全局约束，不因 SID 不同而解除。
-12. ACT→REFpb 按同 BG=tRRDL、异 BG=tRRDS 检查。
-13. ACT 与 REFpb 共享 Channel 级 tFAW rolling window，窗口内合计最多 4 条。
-14. REFpb、debt、force-PRE、tFAW/tRRD/tRREFD block、rolling-set 和 deadline 均提供统计。
-15. debt 触发 mandatory 的阈值 = max_postpone_credits (默认 8, REFpb 个数)；协议硬上限 = 9×N (N=num_banks; "refresh postpone all bank" 9 轮 ↔ per-bank 间隔 ≤ 9×tREFI), 超过即 fail-fast。采用"per-bank hard_deadline 提前排空 + channel debt fail-fast"双保险；根据 bank 剩余 tRAS/col-to-PRE/tRP 与 Channel timing 预算启动 mandatory drain。
-16. READ/WRITE 分别直接检查 tRCDRD/tRCDWR，不再限制二者大小关系。
-17. rolling-set block 统计为 bank-cycle，set-boundary 统计为 SID-cycle，查询函数不再修改 set 状态。
-18. Deadline violation 拆分为事件数、违规 cycle 数、唯一违规 bank 数和最大连续违规周期。
-19. 当前版本暂未实现主动 pull-in、REFab、RFM 和 self-refresh。
-20. Non-mandatory REFpb 候选 bank 过滤: 当 REFpb 不属于 mandatory 时, REFpb 候选 bank 集合剔除 R/W CAM 中仍有未派发命令的 bank; 若剔除后候选为空, REFpb 本 cycle 不发, 等下一 cycle 重试。
-
-v17 改动点 (代码级清单)
----------------------------
-新增:
-  + `RWState` 枚举 (RD / WR / RD_WR / WR_RD) — 在 RWType 之后
-  + `ColScheduler._rw_state: RWState` 字段 (初始 RD)
-  + `ColScheduler._rw_switch_timer: int` 字段
-  + `ColScheduler._rw_4state_mode: bool` 字段
-  + 5 个统计字段 (_direct_switch / _enter_transition / _exit_transition / _cycles_in_state)
-  + `ColScheduler._update_rw_state()` 方法 (状态转移)
-  + `ColScheduler._try_issue_4state()` 方法 (4 态机主入口)
-  + `ColScheduler.get_rw_4state_stats()` getter
-  + `_format_rw_4state_stats()` summary 格式化函数
-  + `HBMCommandScheduler.rw_4state_mode` 参数 + 透传到 ColScheduler
-  + `SimulationConfig.rw_4state_mode` 字段
-
-修改:
-  ~ `ColScheduler.try_issue()` 增加 rw_4state_mode 分支
-  ~ `ColScheduler.get_row_candidate_cams()` 4 态机路径: 按 state 过滤可见 CAM
-  ~ 调度策略 summary 行增加 "4 态机" 选项显示
-  ~ 新增 `[RW 4 态机统计 (v16.3+)]` summary 段
-
-兼容:
-  ✓ 旧 batch/alternating 行为 (rw_4state_mode=False) 完整保留
-  ✓ v15 run_len 约束 (不影响, 在 batch/alternating 路径下生效)
-  ✓ v15 链表资源 (与 4 态机正交, 互不影响)
-
-v17 (BG 交织) 改动点 (代码级清单)
-----------------------------------
-新增:
-  + `RowScheduler._last_act_bg_per_sid: List[int]` 字段 (per-SID 上次 ACT 的 BG, 初始 -1)
-  + `RowScheduler._bg_interleave_hits: int` 统计 (选中 BG 不同的次数)
-  + `RowScheduler._bg_interleave_fallback: int` 统计 (无可用 BG 不同, 退回同 BG 的次数)
-  + `RowScheduler._select_act_with_bg_priority()` 方法 (BG 优先 + RR fallback)
-  + `RowScheduler.get_bg_interleave_stats()` getter
-  + `_format_bg_interleave_stats()` summary 格式化函数
-  + `RowScheduler` 新参数 `num_sid: int` 和 `bg_interleave_priority: bool = True`
-  + `HBMCommandScheduler.bg_interleave_priority` 参数 + 透传到 RowScheduler
-
-修改:
-  ~ `RowScheduler._try_activate()` 选 ACT 改走 `_select_act_with_bg_priority()`
-  ~ `try_issue()` 后置统计: ACT 后更新 `_last_act_bg_per_sid[bank.sid_id]`
-  ~ 新增 `[BG 交织 ACT 统计 (v17+)]` summary 段
-  ~ 调度策略 summary 行增加 "BG 交织" 选项显示 (HBMCommandScheduler._build_summary_lines)
-
-兼容:
-  ✓ 旧 RR 行为 (bg_interleave_priority=False) 完整保留
-  ✓ v16.4 RW 4 态机不受影响 (BG 交织只影响 ACT 选择, 跟 ColScheduler 状态机正交)
-  ✓ RefreshScheduler / ColScheduler 内部状态完全不动
-  ✓ per-SID BG 跟踪天然处理 SID 维度, 不需 SID 索引参数外暴露
-
-v18 改动点 (代码级清单)
-------------------------
-新增:
-  + `RowScheduler._age_priority: bool` 字段
-  + `RowScheduler._age_priority_used: int` 统计 (age 实际生效的次数)
-  + `RowScheduler._max_age_seen: int` 统计 (见过的最大 age)
-  + `RowScheduler._compute_bank_act_age()` 方法 (算 bank 的 ACT 等待年龄)
-  + `RowScheduler._select_act_with_age_priority()` 方法 (age 优先 + BG 交织 + RR 三级排序)
-  + `RowScheduler.get_age_priority_stats()` getter
-  + `_format_age_priority_stats()` summary 格式化函数
-  + `RowScheduler` 新参数 `age_priority: bool = True`
-  + `HBMCommandScheduler.age_priority` 参数 + 透传到 RowScheduler
-
-修改:
-  ~ `RowScheduler._try_activate()` 选 ACT 改走 `_select_act_with_age_priority()`
-    (age_priority=True 时), 否则走 v17 的 `_select_act_with_bg_priority()`
-  ~ 新增 `[Age 优先级 ACT 统计 (v18+)]` summary 段
-  ~ 调度策略 summary 行增加 "Age" 选项显示 (ON / OFF)
-
-兼容:
-  ✓ v17 BG 交织行为完整保留 (age_priority=False)
-  ✓ v16.4 RW 4 态机不受影响
-  ✓ 与 refresh / col scheduler 内部状态完全正交
-
-12H Type0 地址映射
-------------------
-COL[2:0]  = LA[2:0]
-BG[1:0]   = LA[4:3]
-SID[1:0]  = LA[6:5]
-BA[1:0]   = LA[8:7]
-ROW[14:0] = LA[23:9]
-LA[25:24] 保留为 Type0 SID 重映射顶部交换位。
-
-地址处理顺序
-------------
-系统地址范围检查 → 12H SID 重映射 → 地址字段解码 → page segment 生成。
+HBM4 新增特性
+=============
+• 时钟结构 dfi:ck:wck = 1:4:8 (HBM3 为 1:2:4):
+  data rate 12 Gbps (默认, HBM4_12000.xlsx) → WCK 6 GHz / HBM CK 3 GHz
+  (tCK=0.333 ns) / DFI CLK 0.75 GHz (tDFI=1.333 ns)。
+• dfi_phase_slot 双时间域: AC timing 与命令发射按 dfi_phase_slot
+  (1 slot = 0.5 DFI = 2 nCK); CTL 内部资源 (准入/link node/WDB/4 态机/
+  refresh debt/tRL/性能统计) 仍按 DFI cycle。
+• 每 DFI cycle 2 个发射 slot (MC0 phase0→HBM P0, phase1→HBM P2;
+  MC1 phase0→P1, phase1→P3, 单 MC 模型仅文档): 每 slot ≤1 col + ≤1 row,
+  满带宽 = 2 col cmd / DFI cycle (tCCDS=2 CK=1 slot 允许同 cycle 双 slot
+  发不同 BG 的 col; tRRD_S/L=6 CK→3 slots, ACT@cyc0 slot0 → 下一同 BG
+  ACT 最早 cyc1 slot1 = 1.5 DFI)。
+• AC timing 集中规制: TimingParameters.from_inputs 输入保持原始
+  CK/ns 值, 统一换算为 dfi_phase_slot (CK→slot = ceil(CK/2));
+  v1.2 默认 = HBM4_12000.xlsx (12 Gbps 档, 表值单位 CK):
+  tCCDS=2 CK, tCCDL=5 CK, tCCDR=2 CK。
+• 双单位 timing 约束: tRCDRD/tRCDWR/tRP/tRC/tRAS/tWR/tRFCpb/tRREFD/
+  tRRD_S/tRRD_L/tFAW/tRTW 均提供 CK 与 ns 两路输入, 两路各自换算成
+  slot 后取 max 作为最终约束 (0 = 该路不约束)。v1.2 默认全走 CK 路
+  (ns 路为 0): tRCDRD=57 / tRCDWR=43 / tRP=45 / tRC=135 / tRAS=90 /
+  tWR=60 / tRFCpb=720 / tRREFD=24 / tRRD_S=tRRD_L=6 / tFAW=24 CK;
+  tRTW 表中无值 ("-"), 保留 65 CK。
+• 颗粒参数归拢: DRAM die 相关参数 (结构 / Bank timing / 通道+turnaround
+  / die refresh) 集中于 HBMCommandScheduler 构造参数一个连续段
+  ("---- DRAM 颗粒 (die) 参数 ----"), SimulationConfig 字段同序对应。
+• Bank 结构: 8 bank/BG (HBM3 为 4), 每 16 bank 一个 SID; 32 bank (默认)
+  = 2 SID × 2 BG × 8 bank; 4H/8H/12H/16H (16/32/48/64 bank) 全支持;
+  BA 扩为 3 bit, 默认地址映射 LEGACY-HBM4 (col={0,1,2,9,10}, bg={4},
+  sid0={5}, ba={6,7,10}, row={11..25}, sid1={26})。
+• 两级 Prefetch Window (替代 HBM3 v21.1 Col Lock Window, 按 bank 计量):
+  cs 窗口 (默认 8): col 命令 (R+W) 只能派发窗口内 bank, 首条 col 派发时
+  占位 (FIFO); dfi 写子窗口 (默认 4): 写额外只能派发 cs 窗口内准入最早
+  前 N 个 bank。释放为 entry 级即时: entry 全部 col 派发完当拍 / refresh
+  force-PRE 关闭 bank 当拍立即移出; 同 bank 其他在途 entry 下次派发时
+  重新过准入。任一级 enable=False 或 size=None 即关闭该级。
+• 读数据链路: 每 DFI cycle 释放 2 个 link node (HBM3 为 1), 与满带宽 2
+  cmd/cycle 对齐; grant 4/cycle 等其他原则不变。
+• 写上游节流: 累加器每 DFI cycle 收 2 col (HBM3 为 1), 4-col burst 每
+  2 cycle 发一个。
+• 刷新: tREFI per-bank 默认 3900 DFI cycles (~3.9 μs @ 1 GHz);
+  tRFCpb/tRREFD 按 slot 换算 (tRFCpb=200 ns → 400 slots)。
+• 性能口径: 只输出 efficiency = (Col命令数 / DFI cycles) / 2 (满分 1.0)。
+• 日志: 每 cycle 行显示 slot0 / slot1 (dfi_phase_slot) 各自的 row/col
+  命令明细, 便于 phase 级 debug。
 
 维护约束
 --------
@@ -402,47 +236,18 @@ LA[25:24] 保留为 Type0 SID 重映射顶部交换位。
 * REFpb postpone debt、per-SID rolling-set、per-bank hard deadline 与 timing block 必须保持独立语义。
 * rolling-set 仅决定下一条 REFpb 可选择的 bank；tFAW、tRRD、tRREFD 仍是 Channel 级约束。
 * 当前无主动 pull-in，若后续加入，应单独维护 refresh balance，并检查相应窗口限制。
-* v15 链表/RL 资源仍要求每 cycle 最多申请 4 个节点、释放 1 个头节点。
+* v15 链表/RL 资源: 每 DFI cycle 最多申请 4 个节点 (grant)、释放 2 个头节点 (HBM4)。
 * v17 RW 4 态机是 ColScheduler 的可选模式（默认开），不影响 RowScheduler 和 RefreshScheduler 内部状态。
-* v17 4 态机下，batch_scheduling 标志被忽略；切回原行为需显式设 rw_4state_mode=False。
+* v17+ R/W 调度模式由 batch_scheduling 控大类 (alternating vs batch),
+  rw_4state_mode 是 batch 类下的子选项 (4 态机 vs 原 batch+preparation).
+  batch_scheduling=False 强制走 alternating, 此时 rw_4state_mode 被忽略.
 * v17 BG 交织优先级是 RowScheduler 的可选 ACT 选优 (默认开), 切回原行为需设 bg_interleave_priority=False。
 * v17 BG 跟踪仅按 SID 索引, 切态 (R/W 4 态机) 不重置, 跨态保持 BG 交替节奏。
 * v18 Age 优先级是 RowScheduler 的可选 ACT 选优 (默认开), 切回 v17 需设 age_priority=False。
 * v18 Age 跟踪基于 CAM 中 burst entry 的 entry_cycle, 切态不重置 (与 BG 跟踪一致).
-
-版本演进摘要
-------------
-v1-v4 : 基础调度、时序与刷新框架。
-v5    : 可读性重构，拆分时钟、时序、bank、行/列调度与报告模块。
-v6    : 上游准入、读写独立节流与 HBM SID 布局修正。
-v7-v8 : 配置、密度与多堆叠高度支持逐步完善。
-v9    : page segment、dispatch_id 与 12H SID remap 集成。
-v10   : 更新 12H Type0 地址映射并完成 8H/12H 128B 回归。
-v11   : 将 tRREFD 从 per-SID 修正为 Channel 全局约束。
-v12   : CAM 内同 page Write 连续派发；最后一个 page-hit 使用 WRA。
-v13   : CAM 内同 page Read 连续派发；最后一个 page-hit 使用 RDA。
-v14   : 同类型 CAM 中无相同 page 请求时，segment 最后一条直接使用 RDA/WRA。
-v15   : 引入 READ tRL、txn_id 链表资源池与头节点释放规则；统一 HBM CK/DFI 换算。
-v16   : 重构 REFpb：Channel opportunity/debt、per-SID rolling-set、tRFCpb set boundary、
-        per-bank 9×tREFI deadline、deadline-aware 调度，以及 ACT+REFpb tFAW/ACT→REFpb tRRD。
-v16.1 : debt≤8 改为 fail-fast 硬约束；deadline violation 统计拆分。
-v16.2 : 修复独立 tRCDRD/tRCDWR eligibility；以最坏准备时延驱动 debt 预防；
-        rolling-set 查询去副作用并修正统计语义；拆分 normal/prepare/hard deadline；
-        完成标准 16 组、多 seed 与 refresh 压力回归。
-v16.3 : Non-mandatory REFpb 选 bank 时过滤 CAM 占用 bank (cam_busy_banks filter)；
-        完成 8H/12H 16-case 32-run 性能对比 (几何平均 +0.49%)。
-v17   : 新增 RW 4 态调度状态机 (RD/WR/RD_WR/WR_RD)，替换原 batch + prep 的隐式 2 态；
-        50/50 batch perf +20%~+30%；保持向后兼容 (rw_4state_mode=False)。
-v17.1 : 注释级 patch, 仅重定义性能统计区间。READ 区间延伸到最后一个 link node
-        释放, WRITE 区间保持末条命令发出, 混合 workload 取两类区间长度最大值。
-        调度策略、时序参数、refresher 逻辑、LinkListManager 均无变动。
-v17+  : (合并入 v18) ACT 调度新增 BG 交织优先级 (同 SID 不同 BG 优先 ACT),
-        把 ACT 分散到多 BG 提升 BG 级并行, 减少 tRRDL 集中; 与 4 态机正交;
-        默认开, 可关 (bg_interleave_priority=False)。
-v18   : ACT 调度新增 Age 优先级 (ACT 等待最久的 bank 优先), 防止调度偏向;
-        优先级链: age (desc) > BG 交织 (tiebreaker) > RR; 默认开, 可关 (age_priority=False).
-v19   : REFpb 调度新增 cross-SID 串行 (同一时刻只一个 SID 进 candidates, 刷完推进到下一 SID); 拆开 mandatory 触发阈值与协议硬上限 (max_postpone_credits=8 / max_postpone_refab_rounds=9×N); 8-run 性能对比表逻辑提取为 _write_comparison(runs, log_fp)。
-v19.1 : REFpb mandatory 引入 latch 迟滞机制 (`mandatory_latch` + `postpone_low_thr`, 默认 2); `is_mandatory` 判定简化为 `_mandatory_latch or prepare_due`; mandatory 路径改三段式 tier 选 bank (tier1 IDLE+CAM空闲 / tier2 IDLE+CAM命中 / tier3 force-PRE); non-mandatory 路径修复整组候选遍历, 避免漏发.
+* 双单位约束对 (t_rrd_s↔t_rrd_s_ns, t_rrd_l↔t_rrd_l_ns, t_faw_hbmck↔t_faw_ns,
+  t_rtw_hbmck↔t_rtw_ns) 成对存在, 两路各自换算成 slot 后取 max; 修改时须成对
+  检查 (0 = 该路不约束)。
 """
 
 import math
@@ -467,26 +272,32 @@ COMMAND_SIZE_BYTES: int = 32             #: 一个 ColumnCommand 对应的连续
 MAX_CYCLES_FACTOR: int = 100           #: max_cycles = total_cmds × 此值
 # v15: 链表/RL 默认配置
 DEFAULT_T_RL_NS: float = 53.0             #: READ 读返回时延默认 53 ns
-DEFAULT_LINK_NODE_COUNT: int = 192        #: 总链路节点数上限
-DEFAULT_LINK_LIST_COUNT: int = 31         #: 链表条数上限
-LINK_NODE_GRANT_PER_CYCLE: int = 4        #: 每 cycle 最多申请的 link node 数 (= burst 长度)
-LINK_NODE_FREE_PER_CYCLE: int = 1         #: 每 cycle 最多释放的 link node 数 (= 每 cycle 读返回数)
+# HBM4: 读带宽 2 col/cycle → 稳态 in-flight node = 2×tRL(53) ≈ 106, 加 CAM 排队
+# (32 entry × 4) = 128, 峰值 ≈ 234 > HBM3 的 192。池/链表数翻倍, 保证 node 池
+# 不成为假瓶颈 (与"每 cycle 释放 2 node"的读返回速率匹配)。
+DEFAULT_LINK_NODE_COUNT: int = 160        #: 总链路节点数上限
+DEFAULT_LINK_LIST_COUNT: int = 32         #: 链表条数上限
+LINK_NODE_GRANT_PER_CYCLE: int = 4        #: 每 DFI cycle 最多申请的 link node 数 (= burst 长度)
+# HBM4: 每 DFI cycle 2 个 col command slot (满带宽 2 cmd/cycle),
+# 读返回速率同步翻倍: 每 DFI cycle 释放 2 个 link node (= 2 × 32B 读数据回流).
+LINK_NODE_FREE_PER_CYCLE: int = 2         #: 每 DFI cycle 最多释放的 link node 数 (= 每 cycle 读返回数)
+#: HBM4 写上游速率: 每 DFI cycle 收 2 条 W col (HBM3 为 1), 4-col burst 每 2 cycle 发一个
+W_COL_ACCUMULATE_PER_CYCLE: int = 2
 
 
 # ============================================================
-#  HBM3 SID 组织结构（依据 JESD238B.01 Table 5 与 Note 7）
+#  HBM4 SID 组织结构 (每 16 个 bank 为 1 个 SID)
 # ============================================================
-#   4H (16 banks)  : 1 SID × 4 groups × 4 banks
-#   8H (32 banks)  : 2 SID × 4 groups × 4 banks
-#   12H (48 banks) : 3 SID × 4 groups × 4 banks  (NOTE 7: SID[1:0]=11 invalid → 3 SID)
-#   16H (64 banks) : 4 SID × 4 groups × 4 banks
-# 4 banks per bank group, N SID × groups_per_sid bank groups × 4 banks
-# (12H 实际只有 3 SID, 不是 4 SID — v6.4 改错了, v6.5 修正)
+# HBM4: 每个 bank group 含 8 个 bank (HBM3 为 4), 每 16 bank = 1 SID:
+#   4H (16 banks)  : 1 SID × 2 groups × 8 banks
+#   8H (32 banks)  : 2 SID × 2 groups × 8 banks   (默认)
+#   12H (48 banks) : 3 SID × 2 groups × 8 banks
+#   16H (64 banks) : 4 SID × 2 groups × 8 banks
 SID_LAYOUT_TABLE = {
-    16: (1, 4),    # (num_sid, groups_per_sid)
-    32: (2, 4),
-    48: (3, 4),    # v6.5 修正: per JESD238B.01 Table 5 NOTE 7, 48 banks SID[1:0]=11 invalid
-    64: (4, 4),
+    16: (1, 2),    # (num_sid, groups_per_sid)
+    32: (2, 2),
+    48: (3, 2),
+    64: (4, 2),
 }
 
 
@@ -512,37 +323,68 @@ DENSITY_CONFIG_TABLE = {
     ("16H", None):  {"effective_bits": 26, "max_system_la": 1 << 26, "sid_remap_type": None},
 }
 
-# 未启用 SID 重映射的配置继续使用兼容旧版本的地址映射。
+# 未启用 SID 重映射的配置使用 HBM4 默认地址映射 (LEGACY 风格的 HBM4 扩展)。
+# HBM4: BA 扩为 3 bit (8 banks/BG), 每 SID 只有 2 BG → bg 1 bit (只读 bg0pos,
+# 无 bg1pos, 与 HBM3 的 2 bit BG 不同)。位 26/27 仍为扩展虚拟位 (供 sid1 虚拟用)。
+# 8H (默认): COL{0,1,2,9,10}, BG=LA{4}, SID{5,v26}, BA={3,7,8}, ROW{11..25}
 LEGACY_DEFAULT_ADDR_MAP = {
-    "col0pos": 0, "col1pos": 1, "col2pos": 2, "col3pos": 8, "col4pos": 9,
-    "ba0pos": 6, "ba1pos": 7,
-    "bg0pos": 3, "bg1pos": 4,
-    "sid0pos": 5, "sid1pos": 25,
+    "col0pos": 0, "col1pos": 1, "col2pos": 2, "col3pos": 9, "col4pos": 10,
+    "ba0pos": 7, "ba1pos": 8, "ba2pos": 3,
+    "bg0pos": 4,
+    "sid0pos": 5, "sid1pos": 26,
 }
 for _i in range(15):
-    LEGACY_DEFAULT_ADDR_MAP[f"row{_i}pos"] = 10 + _i
+    LEGACY_DEFAULT_ADDR_MAP[f"row{_i}pos"] = 11 + _i
 
-# 12H Type0 地址映射（v10 统一定义）。
-# COL[2:0]=LA[2:0], BG[1:0]=LA[4:3], SID[1:0]=LA[6:5],
-# BA[1:0]=LA[8:7], ROW[14:0]=LA[23:9].
-# LA[25:24] 保留为 Type0 重映射使用的顶部两位。
+# 16H (64 banks, 4 SID x 2 BG x 8 BA): SID 用 {5,6} 两个实位 (sid 0-3);
+# bg 1 bit (HBM4 2 BG); ROW{11..24} 14 个实位 + row14 虚拟位 26。
+DEFAULT_ADDR_MAP_16H = {
+    "col0pos": 0, "col1pos": 1, "col2pos": 2, "col3pos": 9, "col4pos": 10,
+    "ba0pos": 7, "ba1pos": 8, "ba2pos": 3,
+    "bg0pos": 4, 
+    "sid0pos": 5, "sid1pos": 6,
+}
+for _i in range(14):
+    DEFAULT_ADDR_MAP_16H[f"row{_i}pos"] = 11 + _i
+DEFAULT_ADDR_MAP_16H["row14pos"] = 26
+
+# 4H (16 banks, 1 SID x 2 BG x 8 BA): SID 放 {24,25} (24-bit 地址空间内 sid=0,
+# sid1 虚拟); bg 1 bit (HBM4 2 BG); row0-12=LA[11:23] + row13=LA{4}, row14=LA{26}。
+DEFAULT_ADDR_MAP_4H = {
+    "col0pos": 0, "col1pos": 1, "col2pos": 2, "col3pos": 8, "col4pos": 9,
+    "ba0pos": 6, "ba1pos": 7, "ba2pos": 10,
+    "bg0pos": 5,
+    "sid0pos": 24, "sid1pos": 25,
+}
+for _i in range(13):
+    DEFAULT_ADDR_MAP_4H[f"row{_i}pos"] = 11 + _i
+DEFAULT_ADDR_MAP_4H["row13pos"] = 4
+DEFAULT_ADDR_MAP_4H["row14pos"] = 26
+
+# 12H Type0 地址映射 (HBM4 版)。
+# HBM4: 每 SID 只有 2 BG → bg 1 bit (只读 bg0pos, 无虚拟 v27)。顶部两位
+# (LA[25:24]) 保留给 Type0 重映射 (sid==3 时与 top 交换), 不放任何常规字段。
+# COL[2:0]=LA{0,1,2}, BG=LA{4}, SID[1:0]=LA{5,6}, BA[2:0]=LA{3,7,8},
+# ROW[14:0]=LA[9:23]。
 DEFAULT_ADDR_MAP_12H_TYPE0 = {
     "col_bits": 3,
     **{f"col{i}pos": i for i in range(3)},
-    "bg0pos": 3, "bg1pos": 4,
+    "ba0pos": 7, "ba1pos": 8, "ba2pos": 3,
+    "bg0pos": 4,
     "sid0pos": 5, "sid1pos": 6,
-    "ba0pos": 7, "ba1pos": 8,
 }
 for _i in range(15):
     DEFAULT_ADDR_MAP_12H_TYPE0[f"row{_i}pos"] = 9 + _i
 
-# 12H Type1 默认映射，依据 sid_remap.docx。
-# ROW[14:13] at UIF[25:24], auxiliary ROW[10:9] at UIF[23:22], SID at UIF[8:7].
+# 12H Type1 默认映射 (HBM4 版, 依据 sid_remap.docx 风格)。
+# HBM4 BA 3 bit + 15 row bit > 26 bit, 因此 col 缩为 4 bit; bg 1 bit (HBM4 2 BG)。
+# ROW[14:13] at UIF[25:24], auxiliary ROW[10:9] at UIF[23:22], SID at UIF{7,8}。
 DEFAULT_ADDR_MAP_12H_TYPE1 = {
-    **{f"col{i}pos": i for i in range(5)},
-    "ba0pos": 5, "ba1pos": 6,
+    "col_bits": 4,
+    **{f"col{i}pos": i for i in range(4)},
+    "ba0pos": 4, "ba1pos": 5, "ba2pos": 6,
     "sid0pos": 7, "sid1pos": 8,
-    "bg0pos": 9, "bg1pos": 10,
+    "bg0pos": 9, 
 }
 for _i in range(9):
     DEFAULT_ADDR_MAP_12H_TYPE1[f"row{_i}pos"] = 11 + _i
@@ -556,8 +398,8 @@ DEFAULT_ADDR_MAP_12H_TYPE1.update({
 DEFAULT_ADDR_MAP = LEGACY_DEFAULT_ADDR_MAP
 
 
-def _compute_sid_layout(num_banks: int, banks_per_bank_group: int = 4) -> Tuple[int, int]:
-    """根据总 bank 数计算 SID 数量以及每个 SID 的 bank group 数。"""
+def _compute_sid_layout(num_banks: int, banks_per_bank_group: int = 8) -> Tuple[int, int]:
+    """根据总 bank 数计算 SID 数量以及每个 SID 的 bank group 数 (HBM4: 8 bank/BG, 16 bank/SID)。"""
     if num_banks not in SID_LAYOUT_TABLE:
         raise ValueError(f"unsupported num_banks={num_banks} (expect 16/32/48/64)")
     num_sid, groups_per_sid = SID_LAYOUT_TABLE[num_banks]
@@ -601,22 +443,28 @@ def _normalize_configuration(num_banks: int, configuration: Optional[str],
     return config, density_code, dict(DENSITY_CONFIG_TABLE[key])
 
 
-def _default_addr_map_for(remap_type: Optional[int]) -> dict:
-    """根据 SID 重映射类型返回默认地址映射副本。"""
+def _default_addr_map_for(remap_type: Optional[int],
+                          configuration: Optional[str] = None) -> dict:
+    """根据 SID 重映射类型与配置返回默认地址映射副本 (HBM4: 按配置选择)。"""
     if remap_type == 0:
         return dict(DEFAULT_ADDR_MAP_12H_TYPE0)
     if remap_type == 1:
         return dict(DEFAULT_ADDR_MAP_12H_TYPE1)
+    if configuration == "4H":
+        return dict(DEFAULT_ADDR_MAP_4H)
+    if configuration == "16H":
+        return dict(DEFAULT_ADDR_MAP_16H)
     return dict(LEGACY_DEFAULT_ADDR_MAP)
 
 
 def _validate_addr_map(addr_map: dict, remap_type: Optional[int], effective_bits: int) -> None:
-    """检查地址映射字段完整性、位位置唯一性以及重映射约束。"""
+    """检查地址映射字段完整性、位位置唯一性以及重映射约束 (HBM4: BG 1 bit + BA 3 bit)。"""
     col_bits = int(addr_map.get("col_bits", 5))
     if col_bits <= 0:
         raise ValueError("addr_map col_bits must be positive")
-    names = ([f"col{i}pos" for i in range(col_bits)] + [f"ba{i}pos" for i in range(2)] +
-             [f"bg{i}pos" for i in range(2)] + [f"sid{i}pos" for i in range(2)] +
+    # HBM4 每 SID 仅 2 BG → bg 1 bit (bg1pos 不存在, 与 HBM3 2 bit BG 区别)
+    names = ([f"col{i}pos" for i in range(col_bits)] + [f"ba{i}pos" for i in range(3)] +
+             [f"bg{i}pos" for i in range(1)] + [f"sid{i}pos" for i in range(2)] +
              [f"row{i}pos" for i in range(15)])
     missing = [n for n in names if n not in addr_map]
     if missing:
@@ -624,8 +472,10 @@ def _validate_addr_map(addr_map: dict, remap_type: Optional[int], effective_bits
     positions = [addr_map[n] for n in names]
     if len(set(positions)) != len(positions):
         raise ValueError("addr_map bit positions must be unique")
-    if min(positions) < 0 or max(positions) >= 26:
-        raise ValueError("addr_map positions must be within the 26-bit UIF address")
+    # HBM4: 允许到扩展虚拟位 26/27 (这些位在 LA < max_system_la 下恒为 0,
+    # 供 BA 3bit 扩展后放不下的高位 row/sid/bg 字段使用)
+    if min(positions) < 0 or max(positions) >= 28:
+        raise ValueError("addr_map positions must be within the 26-bit UIF address (+virtual bits 26/27)")
     if remap_type is not None:
         top = {effective_bits - 2, effective_bits - 1}
         sid = {addr_map["sid0pos"], addr_map["sid1pos"]}
@@ -640,15 +490,16 @@ def _validate_addr_map(addr_map: dict, remap_type: Optional[int], effective_bits
 
 
 def _extract_addr_fields(la: int, addr_map: dict) -> Tuple[int, int, int, int, int]:
-    """按照地址映射从 UIF 地址提取 COL、BA、BG、SID 与 ROW。"""
+    """按照地址映射从 UIF 地址提取 COL、BA(3bit)、BG(1bit)、SID(2bit) 与 ROW(15bit)。"""
     def _extract_field(base_name: str, num_bits: int) -> int:
         value = 0
         for i in range(num_bits):
             value |= ((la >> addr_map[f"{base_name}{i}pos"]) & 1) << i
         return value
     col_bits = int(addr_map.get("col_bits", 5))
-    return (_extract_field("col", col_bits), _extract_field("ba", 2),
-            _extract_field("bg", 2), _extract_field("sid", 2),
+    # HBM4 每 SID 仅 2 BG, bg 1 bit (只读 bg0pos, 无 bg1pos)
+    return (_extract_field("col", col_bits), _extract_field("ba", 3),
+            _extract_field("bg", 1), _extract_field("sid", 2),
             _extract_field("row", 15))
 
 
@@ -996,6 +847,88 @@ def _format_age_priority_stats(stats: dict) -> List[str]:
     ]
 
 
+def _format_prefetch_window_stats(stats: dict) -> List[str]:
+    """把 ColScheduler.get_prefetch_window_stats() 格式化成 summary 行.
+
+    字段:
+      cs_enabled           — cs 窗口 (col R+W 可调度 bank 范围) 是否启用
+      cs_size              — cs 窗口容量 (bank 数)
+      cs_used_end          — 仿真结束时窗口内 bank 数
+      cs_peak_used         — 窗口峰值占用 (bank 数)
+      cs_avg_used          — 每 cycle 平均占用 (bank 数)
+      cs_full_block_count  — cs 窗口满导致窗口外候选被跳过的次数 (派发路径)
+      cs_total_admits      — bank 占入窗口总次数
+      cs_total_releases    — bank 移出窗口总次数 (entry 完成 + force-PRE)
+      cs_entry_complete_releases — entry 全部 col 派发完触发的释放次数
+      cs_force_pre_releases — refresh force-PRE 关闭 bank 触发的释放次数
+      dfi_enabled          — dfi 写子窗口是否启用
+      dfi_size             — dfi 子窗口容量 (cs 窗口内准入最早前 N 个 bank)
+      dfi_write_wait_count — 写候选因子窗口限制原地等待的次数 (派发路径)
+    """
+    if not stats['cs_enabled']:
+        return ["    cs_prefetch_window : 禁用 (无窗口限制)"]
+    lines = [
+        f"    [cs_prefetch_window] enable=True, size={stats['cs_size']}  "
+        f"(col R+W 只调度窗口内 bank)",
+        f"    仿真末窗口 bank 数   : {stats['cs_used_end']}  "
+        f"(通常 0; >0 表示还有未派发完的 bank)",
+        f"    峰值/平均占用        : {stats['cs_peak_used']} / {stats['cs_avg_used']:.2f} banks",
+        f"    满阻塞次数           : {stats['cs_full_block_count']}  "
+        f"(窗口满时窗口外候选被跳过)",
+        f"    bank admits/releases : {stats['cs_total_admits']} / {stats['cs_total_releases']}",
+        f"      释放来源 breakdown  : entry 完成 {stats['cs_entry_complete_releases']}"
+        f" + force-PRE {stats['cs_force_pre_releases']}"
+        f" + 陈旧逐出 {stats.get('cs_stale_evict_releases', 0)}"
+        f" + 切态逐出 {stats.get('cs_mode_evict_releases', 0)}",
+    ]
+    if stats.get('cs_active_admit'):
+        lines += [
+            f"    [active_admit] 大池子严格准入 (v7): 主动晋升 {stats['cs_active_admit_count']} 次",
+            f"      BG 多样性筛选      : 不同BG命中 {stats['cs_bg_diversity_hits']}"
+            f" + 同BG回退 {stats['cs_bg_fallback_count']}",
+            f"      ACT 入池总数        : {stats['cs_pool_total_activations']}  "
+            f"(等待池峰值/平均 {stats['cs_pool_peak_used']} / {stats['cs_pool_avg_used']:.2f} banks)",
+        ]
+    else:
+        lines.append("    [active_admit] 禁用 (v0.3.1 被动准入: 首条 col 派发时占位)")
+    if stats['dfi_enabled']:
+        lines.append(
+            f"    [dfi_prefetch_window] enable=True, size={stats['dfi_size']}  "
+            f"(写只调度 cs 窗口内最早准入的前 N 个 bank)")
+        lines.append(
+            f"    写等待次数           : {stats['dfi_write_wait_count']}  "
+            f"(写 bank 排在子窗口后原地等待)")
+    else:
+        lines.append("    [dfi_prefetch_window] 禁用 (写不受额外限制)")
+    return lines
+
+def _format_bank_open_duration_stats(stats: dict) -> List[str]:
+    """v21+: 把 HBMCommandScheduler.get_bank_open_duration_stats() 格式化成 summary 行.
+
+    字段:
+      count  — 完成的 bank 打开周期样本数 (每次 ACT 到 bank 真正回 IDLE 记 1 个)
+      avg    — 平均打开时长 (cycles)
+      min    — 最短打开时长 (cycles)
+      max    — 最长打开时长 (cycles)
+      p50    — 中位数 (cycles)
+      p95    — 95 分位数 (cycles)
+      sum    — 累计打开时长 (cycles, 反映 bank 处于 ACT+PRE 状态的总 cycle)
+    """
+    if stats['count'] == 0:
+        return ["    样本数           : 0  (无完整 ACT 关闭周期, 未计入)"]
+    return [
+        f"    样本数           : {stats['count']}  "
+        f"(每次 ACT 至 bank 真正回 IDLE 记 1 个样本)",
+        f"    平均时长         : {stats['avg']:.2f} DFI cycles",
+        f"    最小时长         : {stats['min']:.1f} DFI cycles",
+        f"    最大时长         : {stats['max']:.1f} DFI cycles",
+        f"    中位 P50         : {stats['p50']:.1f} DFI cycles",
+        f"    高分位 P95       : {stats['p95']:.1f} DFI cycles",
+        f"    累计打开时长     : {stats['sum']:.1f} DFI cycles  "
+        f"(整个测试中 bank 处于打开状态的总 cycle)",
+    ]
+
+
 def _format_link_node_stats(stats: dict) -> List[str]:
     """格式化 V15 链表资源统计."""
     if not stats.get("enabled", False):
@@ -1008,7 +941,7 @@ def _format_link_node_stats(stats: dict) -> List[str]:
         f"    每 cycle 申请上限     : {stats['grant_per_cycle']}  "
         f"(与一个 burst 的 4 条命令对齐)",
         f"    每 cycle 释放上限     : {stats['free_per_cycle']}  "
-        f"(与每 cycle 最多 1 个读返回对齐)",
+        f"(HBM4: 与每 cycle 最多 2 个读返回对齐, = 满 bandwidth 2 col/cycle)",
         f"    READ 总申请节点数     : {stats['total_nodes_requested']}",
         f"    READ 因节点不足被拒次数 : {stats['admit_blocked_count']}  "
         f"(burst 长度 > 当前可用节点)",
@@ -1110,19 +1043,22 @@ class RowCommand:
 
 @dataclass
 class _ColBusState:
-    """Col 通道的派发历史 (tCCDs/tCCDl/tCCDR/turnaround 检查用), 由 ColScheduler 持有并更新"""
+    """Col 通道的派发历史 (tCCDs/tCCDl/tCCDR/turnaround 检查用), 由 ColScheduler 持有并更新。
+
+    所有时间戳均为绝对 dfi_phase_slot (AC 域, 1 slot = 0.5 DFI = 2 nCK)。
+    """
     num_bank_groups: int
-    num_sid: int           #: HBM3 SID 数 (per JESD238B.01 Table 5), 用于 tCCDR
-    last_dispatch_cycle: int = INITIAL_CYCLE_SENTINEL
+    num_sid: int           #: HBM4 SID 数 (每 16 bank 一个 SID), 用于 tCCDR
+    last_dispatch_slot: int = INITIAL_CYCLE_SENTINEL
     last_rw_type: RWType = RWType.NONE
     last_bank_group: int = -1
     last_dispatch_sid: int = -1
 
     def __post_init__(self):
         """完成 dataclass 构造后的完整性检查与派生字段初始化。"""
-        self.last_dispatch_cycle_per_bg = [INITIAL_CYCLE_SENTINEL] * self.num_bank_groups
-        # HBM3 inter-SID tCCDR 检查: 每个 SID 上次派发 cycle
-        self.last_dispatch_cycle_per_sid = [INITIAL_CYCLE_SENTINEL] * self.num_sid
+        self.last_dispatch_slot_per_bg = [INITIAL_CYCLE_SENTINEL] * self.num_bank_groups
+        # inter-SID tCCDR 检查: 每个 SID 上次派发 slot
+        self.last_dispatch_slot_per_sid = [INITIAL_CYCLE_SENTINEL] * self.num_sid
 
 
 @dataclass
@@ -1552,25 +1488,44 @@ class LinkListManager:
 class SimulationConfig:
     """原始构造参数 + 派生常量 (只读, 供 summary 显示与各部件查询)"""
     data_rate_gbps: float
+    # ---- DRAM 颗粒 (die) 参数 (结构 + AC timing + die refresh, 集中一处) ----
+    # 结构
     num_banks: int
     banks_per_bank_group: int
     num_bank_groups: int
+    # Bank timing (CK / ns 双单位原始输入; 两路各换算成 slot 后取 max, 0 = 该路不约束)
     t_rcdrd_ns: float
+    t_rcdrd_hbmck: int
     t_rcdwr_ns: float
+    t_rcdwr_hbmck: int
     t_rp_ns: float
+    t_rp_hbmck: int
     t_rc_ns: float
+    t_rc_hbmck: int
     t_ras_ns: float
+    t_ras_hbmck: int
     t_rtp_hbmck: int
     t_wr_ns: float
+    t_wr_hbmck: int
     wl_hbmck: int
+    # 通道 timing + R/W Turnaround (双单位对: nCK/ns 各换算成 slot 后取 max)
     t_ccd_s: int
     t_ccd_l: int
+    t_ccdr_hbmck: int
     t_rrd_s: int
+    t_rrd_s_ns: float
     t_rrd_l: int
+    t_rrd_l_ns: float
     t_faw_hbmck: int
+    t_faw_ns: float
+    t_rtw_hbmck: int
     t_rtw_ns: float
     t_wtrl_hbmck: int
     t_wtrs_hbmck: int
+    # die refresh (颗粒级, bank 阻塞时间; CK/ns 双单位)
+    t_rfc_pb_ns: float
+    t_rfc_pb_hbmck: int
+    # ---- 控制器 / CAM ----
     read_cam_depth: int
     write_cam_depth: int
     #: 写命令入 CAM 后, 多久 data ready. 只有 data ready 的写命令才能被
@@ -1614,13 +1569,18 @@ class SimulationConfig:
     rda_refresh_guard_cycles: int     #: RDA 路径在 refresh deadline 前停止串接的提前量
     wra_only_after_page_hit: bool      #: 兼容开关；False 表示同类型 CAM 无 page-hit 时直接 WRA
     rda_only_after_page_hit: bool      #: 兼容开关；False 表示同类型 CAM 无 page-hit 时直接 RDA
+    # ---- Prefetch Window 配置 (两级 bank 窗口, 替代 v21.1 Col Lock Window) ----
+    cs_prefetch_window_enable: bool        #: True 时 col 命令 (R+W) 只能调度 cs 窗口内 bank 上的命令
+    cs_prefetch_window: Optional[int]      #: cs 窗口容量 (bank 数, 默认 8); None 或 enable=False 关闭该级
+    dfi_prefetch_window_enable: bool       #: True 时写命令额外只能调度 dfi 子窗口 (cs 窗口内准入最早前 N 个 bank)
+    dfi_prefetch_window: Optional[int]     #: dfi 写子窗口容量 (默认 4, <= cs 窗口); None 或 enable=False 关闭该级
+    cs_prefetch_active_admit: bool         #: v7+: True=cs 窗口严格主动准入 (ACT 入大池子→BG 多样性筛选晋升); False=v0.3.1 被动准入
     # Refresh 配置 (HBM3 per-bank refresh, 错峰 stagger)
     # ⚠️ 注意: 此处的"per-bank 间隔"≠ spec 的 tREFIpb (channel-level 平均 rate = tREFI/N).
     # 真正的 spec tREFIpb = tREFI/32 = 122ns (channel 每 122ns 发一个 REFpb 的平均 rate).
     # 但每个具体 bank 实际被刷新的间隔 = tREFI = 3.9μs (N=32 个 bank 一个 tREFI 窗口内刷完).
     # 所以本参数 = per-bank 实际刷新间隔 = tREFI (设备级, 8-High = 3.9μs = 4680 cycles).
     t_refi_per_bank_cycles: int                 #: 每个 bank 相邻两次 refresh 的间隔 (per-bank interval, = tREFI)
-    t_rfc_pb_ns: float                    #: per-bank refresh 命令耗时 (bank 阻塞时间, HBM3 ~200ns)
     # ---- V15 新增 ----
     t_rl_ns: float
     link_node_count: int
@@ -1638,32 +1598,48 @@ class SimulationConfig:
 # ============================================================
 
 class ClockModel:
-    """HBM3 时钟与模型 cycle 的统一换算。
+    """HBM4 时钟与模型时间的统一换算 (dfi : ck : wck = 1 : 4 : 8)。
 
     本模型采用以下固定 PHY/MC 结构：
 
-      * ``data_rate_gbps`` 是每个 DQ pin 的 DDR data rate。
-      * DQS 频率 = data rate / 2。
-      * HBM CK 与 DQS 的频率比为 1:2，因此 HBM CK = data rate / 4。
-      * PHY/DFI clock 与 HBM CK 的频率比为 1:2，因此 DFI CLK = HBM CK / 2。
-      * 1 个模型 cycle = 1 个 DFI clock cycle = 2 个 HBM CK = 4 个 DQS cycle。
-      * 两个 pseudo channel 分别由两个 MC 控制，并交替占用 HBM CK phase：
-          - MC0 固定使用 DFI cycle 内的 HBM phase 0；
-          - MC1 固定使用 DFI cycle 内的 HBM phase 1。
+      * ``data_rate_gbps`` 是每个 DQ pin 的 DDR data rate (HBM4 默认 12 Gbps,
+        对齐 HBM4_12000.xlsx 12G 档)。
+      * WCK/DQS 频率 = data rate / 2 = 8 GHz。
+      * HBM CK 与 WCK 的频率比为 1:2，因此 HBM CK = 4 GHz (tCK = 0.25 ns)。
+      * DFI CLK 与 HBM CK 的频率比为 1:4，因此 DFI CLK = HBM CK / 4 = 1 GHz
+        (tDFI = 1 ns)。1 个 DFI cycle = 4 个 HBM CK = 8 个 WCK cycle。
 
-    以 9.6 Gbps 为例：DQS=4.8 GHz，HBM CK=2.4 GHz，DFI CLK=1.2 GHz，
-    tDQS=0.20833 ns，tCK=0.41667 ns，tDFI=0.83333 ns。
+    ---- dfi_phase_slot (AC 域最小时间粒度) ----
 
-    当前调度器以完整 DFI cycle 为最小时间粒度。所有以 nCK 给出的 timing
-    均保守向上取整为 ``ceil(nCK / 2)`` 个模型 cycle。phase 0/1 只用于描述
-    两个 MC 在一个 DFI cycle 内的固定命令位置；如果后续需要精确检查跨 MC 的
-    亚 cycle 间隔，应使用 ``dfi_phase_to_hbmck()`` 转成绝对 HBM CK 时间戳。
+      * 每个 DFI cycle 内有 2 个 ``dfi_phase_slot`` (1 slot = 0.5 DFI cycle
+        = 2 HBM CK)，对应一个 MC 在一个 DFI cycle 内的两个命令发射位置：
+          - MC0 DFI cycle phase0 固定使用 HBM 内 phase 0 (即 slot0)
+          - MC0 DFI cycle phase1 固定使用 HBM 内 phase 2 (即 slot1)
+          - MC1 DFI cycle phase0 固定使用 HBM 内 phase 1
+          - MC1 DFI cycle phase1 固定使用 HBM 内 phase 3
+        本模型为单 MC (MC0) 视角: slot0 → HBM phase0, slot1 → HBM phase2。
+      * AC timing (tCCD/tRRD/tFAW/tRCD/tRP/...) 全部以 dfi_phase_slot 为单位:
+        nCK → dfi_phase_slot = ceil(nCK / 2)。例: tCCDS=2nCK → 1 slot (同一
+        DFI cycle 的 slot0/slot1 可各发一条不同 BG 的 col); tRRD=6nCK →
+        3 slots (ACT@cyc0 slot0 → 下一个 ACT 最早 cyc1 slot1 = 1.5 DFI)。
+
+    ---- 双时间域 ----
+
+      * AC 域 (dfi_phase_slot, 绝对 slot 序号 = 2×DFI cycle + phase_index):
+        命令发射与全部 AC timing 检查。满带宽 = 每 DFI cycle 2 条 col 命令。
+      * CTL 域 (DFI cycle): 准入节流 / link node / WDB commit / 4 态机 /
+        refresh debt / tRL / 性能统计等控制器内部资源分配仍按 DFI cycle 计。
+
+    以 12 Gbps 为例 (HBM4_12000.xlsx 档)：WCK=6 GHz, HBM CK=3 GHz
+    (tCK=0.333 ns), DFI CLK=0.75 GHz (tDFI=1.333 ns, tSlot=0.667 ns)。
     """
 
-    DQS_PER_HBM_CK: int = 2
-    HBM_CK_PER_DFI_CYCLE: int = 2
-    MC0_PHASE: int = 0
-    MC1_PHASE: int = 1
+    DQS_PER_HBM_CK: int = 2              #: WCK = 2 × CK (DDR)
+    HBM_CK_PER_DFI_CYCLE: int = 4         #: dfi : ck = 1 : 4
+    DFI_PHASE_SLOTS_PER_CYCLE: int = 2    #: 每 DFI cycle 2 个发射 slot (MC phase0/phase1)
+    NCK_PER_DFI_PHASE_SLOT: int = 2       #: 1 slot = 2 nCK = 0.5 DFI cycle
+    MC0_HBM_PHASES = (0, 2)               #: MC0 phase0/phase1 → HBM phase 0/2
+    MC1_HBM_PHASES = (1, 3)               #: MC1 phase0/phase1 → HBM phase 1/3 (仅文档, 单 MC 模型)
 
     def __init__(self, data_rate_gbps: float):
         """初始化时钟模型；data_rate_gbps 表示 DDR pin data rate。"""
@@ -1673,22 +1649,22 @@ class ClockModel:
 
     @property
     def dqs_freq_ghz(self) -> float:
-        """DQS 频率，单位 GHz；DDR data rate = 2 × DQS。"""
+        """WCK/DQS 频率，单位 GHz；DDR data rate = 2 × WCK。"""
         return self.data_rate_gbps / 2.0
 
     @property
     def hbm_ck_freq_ghz(self) -> float:
-        """HBM CK 频率，单位 GHz；DQS = 2 × HBM CK。"""
+        """HBM CK 频率，单位 GHz；WCK = 2 × HBM CK。"""
         return self.dqs_freq_ghz / self.DQS_PER_HBM_CK
 
     @property
     def dfi_clk_freq_ghz(self) -> float:
-        """PHY/DFI clock 频率，单位 GHz；DFI CLK = HBM CK / 2。"""
+        """PHY/DFI clock 频率，单位 GHz；DFI CLK = HBM CK / 4。"""
         return self.hbm_ck_freq_ghz / self.HBM_CK_PER_DFI_CYCLE
 
     @property
     def tdqs_ns(self) -> float:
-        """一个 DQS 周期的时间，单位 ns。"""
+        """一个 WCK/DQS 周期的时间，单位 ns。"""
         return 1.0 / self.dqs_freq_ghz
 
     @property
@@ -1698,8 +1674,15 @@ class ClockModel:
 
     @property
     def tdfi_ns(self) -> float:
-        """一个 DFI/model cycle 的时间，单位 ns。"""
+        """一个 DFI cycle 的时间，单位 ns (= 4 × tCK)。"""
         return self.HBM_CK_PER_DFI_CYCLE * self.tck_hbm_ns
+
+    @property
+    def t_dfi_phase_slot_ns(self) -> float:
+        """一个 dfi_phase_slot 的时间，单位 ns (= 0.5 × tDFI = tCK)。"""
+        return self.tdfi_ns / self.DFI_PHASE_SLOTS_PER_CYCLE
+
+    # ---- AC 域: dfi_phase_slot 换算 ----
 
     def ns_to_hbmck(self, ns_val: float) -> int:
         """ns → HBM CK，按整数 nCK 语义向上取整。"""
@@ -1707,28 +1690,45 @@ class ClockModel:
             raise ValueError(f"ns timing 必须 >= 0, 当前 {ns_val}")
         return math.ceil(ns_val / self.tck_hbm_ns)
 
+    def hbmck_to_dfi_phase_slots(self, n: int) -> int:
+        """HBM CK → dfi_phase_slot: ceil(nCK / 2)。AC timing 换算统一入口。"""
+        if n < 0:
+            raise ValueError(f"HBM CK timing 必须 >= 0, 当前 {n}")
+        return (n + self.NCK_PER_DFI_PHASE_SLOT - 1) // self.NCK_PER_DFI_PHASE_SLOT
+
+    def ns_to_dfi_phase_slots(self, ns_val: float) -> int:
+        """ns → dfi_phase_slot: ceil(ceil(ns/tCK) / 2) = ceil(ns / tCK)。"""
+        return self.hbmck_to_dfi_phase_slots(self.ns_to_hbmck(ns_val))
+
+    def abs_dfi_phase_slot(self, dfi_cycle: int, phase_index: int) -> int:
+        """(DFI cycle, phase_index∈{0,1}) → 绝对 dfi_phase_slot 序号。"""
+        if dfi_cycle < 0:
+            raise ValueError(f"dfi_cycle 必须 >= 0, 当前 {dfi_cycle}")
+        if phase_index not in range(self.DFI_PHASE_SLOTS_PER_CYCLE):
+            raise ValueError(f"phase_index 必须为 0 或 1, 当前 {phase_index}")
+        return dfi_cycle * self.DFI_PHASE_SLOTS_PER_CYCLE + phase_index
+
+    def slot_to_dfi_cycle(self, abs_slot: int) -> int:
+        """绝对 dfi_phase_slot → DFI cycle 序号 (CTL 域)。"""
+        return abs_slot // self.DFI_PHASE_SLOTS_PER_CYCLE
+
+    def dfi_phase_slot_to_hbmck(self, dfi_cycle: int, mc_phase: int) -> int:
+        """(DFI cycle, MC phase0/1) → MC0 视角的绝对 HBM CK 序号 (phase0→0, phase1→2)。"""
+        hbm_phases = self.MC0_HBM_PHASES if mc_phase == 0 else self.MC1_HBM_PHASES
+        return dfi_cycle * self.HBM_CK_PER_DFI_CYCLE + hbm_phases[mc_phase]
+
+    # ---- CTL 域: DFI cycle 换算 ----
+
     def ns_to_cycles(self, ns_val: float) -> int:
-        """ns → DFI/model cycles；等价于 ceil(ceil(ns/tCK) / 2)。"""
+        """ns → DFI cycles (CTL 域)；等价于 ceil(ceil(ns/tCK) / 4)。"""
         return self.hbmck_to_cycles(self.ns_to_hbmck(ns_val))
 
     def hbmck_to_cycles(self, n: int) -> int:
-        """HBM CK → DFI/model cycles：ceil(n / 2)。"""
+        """HBM CK → DFI cycles (CTL 域): ceil(n / 4)。"""
         if n < 0:
             raise ValueError(f"HBM CK timing 必须 >= 0, 当前 {n}")
         ratio = self.HBM_CK_PER_DFI_CYCLE
         return (n + ratio - 1) // ratio
-
-    def dfi_phase_to_hbmck(self, dfi_cycle: int, mc_phase: int) -> int:
-        """将 ``(DFI cycle, MC phase)`` 转换为绝对 HBM CK 序号。
-
-        MC0 只能使用 phase 0，MC1 只能使用 phase 1。返回值可用于未来实现
-        跨 MC 的精确 nCK timing 检查，而不丢失一个 DFI cycle 内的 phase 信息。
-        """
-        if dfi_cycle < 0:
-            raise ValueError(f"dfi_cycle 必须 >= 0, 当前 {dfi_cycle}")
-        if mc_phase not in (self.MC0_PHASE, self.MC1_PHASE):
-            raise ValueError(f"mc_phase 必须为 0 或 1, 当前 {mc_phase}")
-        return dfi_cycle * self.HBM_CK_PER_DFI_CYCLE + mc_phase
 
 
 # ============================================================
@@ -1737,32 +1737,46 @@ class ClockModel:
 
 @dataclass(frozen=True)
 class TimingParameters:
-    """所有 DRAM timing 值, 单位 DFI cycles (model 内部单位)"""
+    """所有 DRAM AC timing 值, 单位 dfi_phase_slot (AC 域; 1 slot = 0.5 DFI = 2 nCK)。
+
+    HBM4 AC timing 集中规制: ``from_inputs`` 的输入保持原始 CK/ns 值,
+    由 ClockModel 统一换算成 dfi_phase_slot:
+      * CK  → slot = ceil(CK / 2)
+      * ns  → CK → slot
+    双单位约束对 (tRCDRD/tRCDWR/tRP/tRC/tRAS/tWR/tRFCpb/tRREFD/
+    tRRD_S/L, tFAW, tRTW): CK 路与 ns 路各自换算成 slot 后取 max 作为
+    最终约束 (0 = 该路不约束)。v1.2 默认值 = HBM4_12000.xlsx (12 Gbps
+    档) 表值, 走 CK 路 (ns 路为 0)。
+    后续如需替换 HBM4 专属参数, 只改 ``from_inputs`` 输入默认值与
+    HBMCommandScheduler 构造参数默认值 (一处定义)。
+    """
     # ---- Bank timing ----
-    t_rcdrd_cycles: int
-    t_rcdwr_cycles: int
-    t_rp_cycles: int
-    t_rc_cycles: int
-    t_ras_cycles: int
-    t_rtp_cycles: int
-    write_ap_cycles: int
+    t_rcdrd_slots: int
+    t_rcdwr_slots: int
+    t_rp_slots: int
+    t_rc_slots: int
+    t_ras_slots: int
+    t_rtp_slots: int
+    write_ap_slots: int
     # ---- 通道 timing ----
-    t_ccd_s_cycles: int
-    t_ccd_l_cycles: int
-    t_ccdr_cycles: int         #: HBM3 inter-SID tCCDR (READ only)，输入单位为 DFI/model cycle
-    t_rrd_s_cycles: int
-    t_rrd_l_cycles: int
-    t_faw_cycles: int
+    t_ccd_s_slots: int
+    t_ccd_l_slots: int
+    t_ccdr_slots: int         #: inter-SID tCCDR (READ only), 输入单位 nCK (HBM4: 4 nCK = 2 slots)
+    t_rrd_s_slots: int
+    t_rrd_l_slots: int
+    t_faw_slots: int
     # ---- R/W Turnaround ----
-    t_rtw_cycles: int
-    write_to_read_same_bg_cycles: int
-    write_to_read_diff_bg_cycles: int
-    # ---- Refresh (HBM3 REFpb) ----
-    t_rfc_pb_cycles: int   #: per-bank refresh cycle time (bank 阻塞时间)
-    t_rrefd_cycles: int    #: REFpb → REFpb (不同 bank, 跨 SID 生效) / REFpb → ACT (不同 bank, 跨 SID 生效) 最小间隔
-                          #: per JESD238B.01 §6.3.2.6 Table 35 NOTE 3 + Table 84
-                          #: tRREFD = 8 ns (spec) → ceil(8/tCK)=20 HBM CK → 10 DFI cycles @ 9.6 Gbps
-    # (t_refi_ab_cycles / t_refi_per_bank_cycles / t_rfc_ab_cycles 留作 future use, 暂未参与逻辑)
+    t_rtw_slots: int
+    write_to_read_same_bg_slots: int
+    write_to_read_diff_bg_slots: int
+    # ---- Refresh (HBM per-bank REFpb) ----
+    t_rfc_pb_slots: int   #: per-bank refresh cycle time (bank 阻塞时间)
+    t_rrefd_slots: int    #: REFpb → REFpb (不同 bank, 跨 SID 生效) / REFpb → ACT 最小间隔 (8 ns)
+
+    @property
+    def t_rfc_pb_dfi_cycles(self) -> int:
+        """tRFCpb 的 DFI cycle 数 (CTL 域 bookkeeping 用, 如 rolling-set boundary)。"""
+        return max(1, self.t_rfc_pb_slots // 2)
 
     @classmethod
     def from_inputs(cls,
@@ -1770,37 +1784,83 @@ class TimingParameters:
                     t_rcdrd_ns: float, t_rcdwr_ns: float, t_rp_ns: float,
                     t_rc_ns: float, t_ras_ns: float, t_rtp_hbmck: int,
                     t_wr_ns: float, wl_hbmck: int,
-                    t_ccd_s: int, t_ccd_l: int,
-                    t_rrd_s: int, t_rrd_l: int, t_faw_hbmck: int,
+                    t_ccd_s: int, t_ccd_l: int,       # CK
+                    t_rrd_s: int, t_rrd_l: int,       # CK
+                    t_faw_hbmck: int,
                     t_rtw_ns: float, t_wtrl_hbmck: int, t_wtrs_hbmck: int,
-                    t_rfc_pb_ns: float = 200.0,
-                    t_ccdr_cycles: int = 2   # HBM3 inter-SID tCCDR；此参数已是 DFI/model cycle，不再做 nCK 换算
+                    t_rfc_pb_ns: float = 0.0,         # ns 路: tRFCpb (0 = 不约束)
+                    t_ccdr_hbmck: int = 2,            # CK: inter-SID tCCDR (HBM4_12000: 2 CK = 1 slot)
+                    t_rrefd_ns: float = 0.0,          # ns 路: tRREFD (0 = 不约束)
+                    # ---- 双单位约束对的 CK 路 (v1.2: = HBM4_12000.xlsx 表值; 与对应 ns 路各自换算成 slot 后取 max; 0 = 不约束) ----
+                    t_rcdrd_hbmck: int = 0,           # CK 路: tRCDRD (表 57 CK)
+                    t_rcdwr_hbmck: int = 0,           # CK 路: tRCDWR (表 43 CK)
+                    t_rp_hbmck: int = 0,              # CK 路: tRP (表 45 CK)
+                    t_rc_hbmck: int = 0,              # CK 路: tRC (表 135 CK)
+                    t_ras_hbmck: int = 0,             # CK 路: tRAS (表 90 CK)
+                    t_wr_hbmck: int = 0,              # CK 路: tWR (表 60 CK, write_ap 公式用)
+                    t_rfc_pb_hbmck: int = 0,          # CK 路: tRFCpb (表 720 CK)
+                    t_rrefd_hbmck: int = 0,           # CK 路: tRREFD (表 24 CK)
+                    # ---- 双单位约束对的 ns 路 (与对应 CK 路各自换算成 slot 后取 max; 0 = 不约束) ----
+                    t_rrd_s_ns: float = 0.0,          # ns 路: 跨 BG ACT→ACT (短)
+                    t_rrd_l_ns: float = 0.0,          # ns 路: 同 BG ACT→ACT (长)
+                    t_faw_ns: float = 0.0,            # ns 路: tFAW rolling window (4 ACT)
+                    t_rtw_hbmck: int = 0,             # CK 路: R→W turnaround
                     ) -> "TimingParameters":
-        """从原始 ns / HBM CK 输入派生所有 cycles 值"""
-        t_wr_hbmck = math.ceil(t_wr_ns / clock.tck_hbm_ns)
+        """从原始 ns / HBM CK 输入派生所有 dfi_phase_slot 值 (CK→slot = ceil(CK/2)).
+
+        双单位约束对 (tRCDRD/tRCDWR/tRP/tRC/tRAS/tWR/tRFCpb/tRREFD/
+        tRRD_S/L, tFAW, tRTW): CK 路与 ns 路各自换算成 dfi_phase_slot 后
+        取 max 作为最终约束 (0 = 该路不约束)。v1.2 默认值取自
+        HBM4_12000.xlsx (12 Gbps 档, CK=3 GHz), ns 路默认全部为 0。
+        """
+        # 双单位约束对: 各自换算成 dfi_phase_slot 后取 max (0 = 该路不约束)
+        t_rcdrd_final = max(clock.hbmck_to_dfi_phase_slots(t_rcdrd_hbmck),
+                            clock.ns_to_dfi_phase_slots(t_rcdrd_ns))
+        t_rcdwr_final = max(clock.hbmck_to_dfi_phase_slots(t_rcdwr_hbmck),
+                            clock.ns_to_dfi_phase_slots(t_rcdwr_ns))
+        t_rp_final = max(clock.hbmck_to_dfi_phase_slots(t_rp_hbmck),
+                         clock.ns_to_dfi_phase_slots(t_rp_ns))
+        t_rc_final = max(clock.hbmck_to_dfi_phase_slots(t_rc_hbmck),
+                         clock.ns_to_dfi_phase_slots(t_rc_ns))
+        t_ras_final = max(clock.hbmck_to_dfi_phase_slots(t_ras_hbmck),
+                          clock.ns_to_dfi_phase_slots(t_ras_ns))
+        # tWR 参与写侧 AP 公式 write_ap = WL+2+tWR 的 nCK 域求和, max 在 nCK 域取
+        t_wr_final_nck = max(t_wr_hbmck, clock.ns_to_hbmck(t_wr_ns))
+        t_rrd_s_final = max(clock.hbmck_to_dfi_phase_slots(t_rrd_s),
+                            clock.ns_to_dfi_phase_slots(t_rrd_s_ns))
+        t_rrd_l_final = max(clock.hbmck_to_dfi_phase_slots(t_rrd_l),
+                            clock.ns_to_dfi_phase_slots(t_rrd_l_ns))
+        t_faw_final = max(clock.hbmck_to_dfi_phase_slots(t_faw_hbmck),
+                          clock.ns_to_dfi_phase_slots(t_faw_ns))
+        t_rtw_final = max(clock.hbmck_to_dfi_phase_slots(t_rtw_hbmck),
+                          clock.ns_to_dfi_phase_slots(t_rtw_ns))
+        t_rfc_pb_final = max(clock.hbmck_to_dfi_phase_slots(t_rfc_pb_hbmck),
+                             clock.ns_to_dfi_phase_slots(t_rfc_pb_ns))
+        t_rrefd_final = max(clock.hbmck_to_dfi_phase_slots(t_rrefd_hbmck),
+                            clock.ns_to_dfi_phase_slots(t_rrefd_ns))
 
         return cls(
-            t_rcdrd_cycles=clock.ns_to_cycles(t_rcdrd_ns),
-            t_rcdwr_cycles=clock.ns_to_cycles(t_rcdwr_ns),
-            t_rp_cycles=clock.ns_to_cycles(t_rp_ns),
-            t_rc_cycles=clock.ns_to_cycles(t_rc_ns),
-            t_ras_cycles=clock.ns_to_cycles(t_ras_ns),
-            t_rtp_cycles=clock.hbmck_to_cycles(t_rtp_hbmck),
-            write_ap_cycles=clock.hbmck_to_cycles(
-                wl_hbmck + WL_TWTR_OFFSET + t_wr_hbmck),
-            t_ccd_s_cycles=t_ccd_s,
-            t_ccd_l_cycles=t_ccd_l,
-            t_ccdr_cycles=t_ccdr_cycles,
-            t_rrd_s_cycles=t_rrd_s,
-            t_rrd_l_cycles=t_rrd_l,
-            t_faw_cycles=clock.hbmck_to_cycles(t_faw_hbmck),
-            t_rtw_cycles=clock.ns_to_cycles(t_rtw_ns),
-            write_to_read_same_bg_cycles=clock.hbmck_to_cycles(
+            t_rcdrd_slots=t_rcdrd_final,
+            t_rcdwr_slots=t_rcdwr_final,
+            t_rp_slots=t_rp_final,
+            t_rc_slots=t_rc_final,
+            t_ras_slots=t_ras_final,
+            t_rtp_slots=clock.hbmck_to_dfi_phase_slots(t_rtp_hbmck),
+            write_ap_slots=clock.hbmck_to_dfi_phase_slots(
+                wl_hbmck + WL_TWTR_OFFSET + t_wr_final_nck),
+            t_ccd_s_slots=clock.hbmck_to_dfi_phase_slots(t_ccd_s),
+            t_ccd_l_slots=clock.hbmck_to_dfi_phase_slots(t_ccd_l),
+            t_ccdr_slots=clock.hbmck_to_dfi_phase_slots(t_ccdr_hbmck),
+            t_rrd_s_slots=t_rrd_s_final,
+            t_rrd_l_slots=t_rrd_l_final,
+            t_faw_slots=t_faw_final,
+            t_rtw_slots=t_rtw_final,
+            write_to_read_same_bg_slots=clock.hbmck_to_dfi_phase_slots(
                 wl_hbmck + WL_TWTR_OFFSET + t_wtrl_hbmck),
-            write_to_read_diff_bg_cycles=clock.hbmck_to_cycles(
+            write_to_read_diff_bg_slots=clock.hbmck_to_dfi_phase_slots(
                 wl_hbmck + WL_TWTR_OFFSET + t_wtrs_hbmck),
-            t_rfc_pb_cycles=clock.ns_to_cycles(t_rfc_pb_ns),
-            t_rrefd_cycles=clock.ns_to_cycles(8.0),  # JESD238B.01 Table 84: tRREFD = 8 ns
+            t_rfc_pb_slots=t_rfc_pb_final,
+            t_rrefd_slots=t_rrefd_final,
         )
 
     def validate(self) -> None:
@@ -1821,7 +1881,7 @@ class TimingParameters:
 class DRAMBank:
     """单个 DRAM bank 的运行时状态 + 状态机.
 
-    状态转移:
+    状态转移 (时间戳单位: dfi_phase_slot, 1 slot = 0.5 DFI cycle = 2 nCK):
         IDLE --ACT--> ACT_WAIT --[t_rcdwr]--> (write_timing_satisfied=True)
                                --[t_rcdrd]--> ACTING --PRE--> PRE_WAIT --[t_rp]--> IDLE
         ACTING --(force PRE)--> PRE_WAIT --[t_rp]--> IDLE (force-pre for refresh, state preserved)
@@ -1837,9 +1897,9 @@ class DRAMBank:
         self.bank_id = bank_id
         self.bank_group_id = bank_group_id
         self.state = BankState.IDLE
-        self.last_act_at = INITIAL_CYCLE_SENTINEL   # 不随状态重置, t_rc 检查用
-        self.last_col_at = INITIAL_CYCLE_SENTINEL
-        self.last_pre_at = INITIAL_CYCLE_SENTINEL
+        self.last_act_at = INITIAL_CYCLE_SENTINEL   # dfi_phase_slot, 不随状态重置, t_rc 检查用
+        self.last_col_at = INITIAL_CYCLE_SENTINEL   # dfi_phase_slot
+        self.last_pre_at = INITIAL_CYCLE_SENTINEL   # dfi_phase_slot
         self.serving_dispatch_id = -1
         self.cols_dispatched = 0
         self.precharge_pending = False
@@ -1847,20 +1907,24 @@ class DRAMBank:
         self.open_row = -1
         self.last_col_rw_type = RWType.NONE   # 不随状态重置, PRE 时机检查用
         self.write_timing_satisfied = False
-        self._refresh_start_cycle: int = INITIAL_CYCLE_SENTINEL
-        self._auto_precharge_complete_cycle: int = INITIAL_CYCLE_SENTINEL
+        self._refresh_start_cycle: int = INITIAL_CYCLE_SENTINEL   # dfi_phase_slot
+        self._auto_precharge_complete_cycle: int = INITIAL_CYCLE_SENTINEL  # dfi_phase_slot
         self._force_pre_for_refresh: bool = False   # 标记: PRE_WAIT→IDLE 时不要 reset
+        # v21+: bank 打开时长统计 (从 ACT 到 bank 真正回 IDLE 的 dfi_phase_slot 数)
+        self._open_start_cycle: int = INITIAL_CYCLE_SENTINEL  # 当前打开周期起点 (slot)
+        self._open_in_progress: bool = False                  # bank 是否处于打开周期
+        self._open_durations: List[int] = []                  # 已完成打开周期时长 (slots)
 
-    def tick(self, current_cycle: int, timing: TimingParameters) -> None:
-        """每个 cycle 推进一次状态机 (Row/Col 调度之前调用, 结果当 cycle 对调度可见)"""
+    def tick(self, current_slot: int, timing: TimingParameters) -> None:
+        """每个 dfi_phase_slot 推进一次状态机 (Row/Col 调度之前调用, 结果当 slot 对调度可见)"""
         if self.state == BankState.ACT_WAIT:
             if (not self.write_timing_satisfied
-                    and current_cycle >= self.last_act_at + timing.t_rcdwr_cycles):
+                    and current_slot >= self.last_act_at + timing.t_rcdwr_slots):
                 self.write_timing_satisfied = True
-            if current_cycle >= self.last_act_at + timing.t_rcdrd_cycles:
+            if current_slot >= self.last_act_at + timing.t_rcdrd_slots:
                 self.state = BankState.ACTING
         elif self.state == BankState.PRE_WAIT:
-            if current_cycle >= self.last_pre_at + timing.t_rp_cycles:
+            if current_slot >= self.last_pre_at + timing.t_rp_slots:
                 if self._force_pre_for_refresh:
                     # Force PRE for refresh: PRE_WAIT→IDLE 但不 reset in-flight 状态
                     # (cols_dispatched/serving_dispatch_id/open_row), 让 in-flight entry 续派.
@@ -1869,21 +1933,47 @@ class DRAMBank:
                     # 清除"stale" 标记 (autoprecharge/timing-satisfied): bank 现在是空的,
                     # 这些 flag 描述的是上一轮 row 的状态, 必须清. 但 in-flight 信息保留.
                     self._clear_stale_flags_on_idle()
+                    # v21+: bank 打开周期结束 (force-pre for refresh 路径)
+                    self._record_open_close(current_slot)
                 else:
                     self._reset_to_idle()
+                    # v21+: bank 打开周期结束 (显式 PRE 完成)
+                    self._record_open_close(current_slot)
         elif self.state == BankState.AUTO_PRE_WAIT:
-            if current_cycle >= self._auto_precharge_complete_cycle:
+            if current_slot >= self._auto_precharge_complete_cycle:
                 # WRA/RDA 内部 precharge 完成。该路径等价于显式 PRE 完成后回到 IDLE，
                 # 但没有占用独立 Row command slot。
                 self._reset_to_idle()
+                # v21+: bank 打开周期结束 (WRA/RDA 自动 precharge 完成)
+                self._record_open_close(current_slot)
         elif self.state == BankState.REFRESHING:
-            if current_cycle >= self._refresh_start_cycle + timing.t_rfc_pb_cycles:
+            if current_slot >= self._refresh_start_cycle + timing.t_rfc_pb_slots:
                 # Refresh 完成, 回到 IDLE. 同样保留 in-flight 状态.
                 self.state = BankState.IDLE
                 # 清除 stale 标记 (同 force-PRE): bank 是空的, precharge_pending 等
                 # 必须清, 否则 row scheduler 找不到 ACT/PRE 候选会卡住.
                 self._clear_stale_flags_on_idle()
                 # 不调 _reset_to_idle, 保留 cols_dispatched/serving_dispatch_id/open_row
+                # v21+: REFRESHING→IDLE 不重复计 bank 打开 (PRE_WAIT→IDLE 已经计过一次)
+                self._record_open_close(current_slot)
+
+    def _record_open_close(self, current_slot: int) -> None:
+        """v21+: bank 真正回到 IDLE 时, 记录本次打开周期时长 (dfi_phase_slot).
+
+        起点: _open_start_cycle (在 RowScheduler._try_activate 派发 ACT 时设置).
+        终点: current_slot (bank 真正变 IDLE 的 slot, 含 tRP/tRFCpb 完成).
+
+        多个 IDLE 转换路径 (PRE_WAIT 强制 IDLE force-pre, PRE_WAIT 强制 IDLE normal,
+        AUTO_PRE_WAIT 强制 IDLE, REFRESHING 强制 IDLE) 都会调本方法. 但只有第一次
+        (PRE_WAIT 强制 IDLE 或 AUTO_PRE_WAIT 强制 IDLE) 时 _open_in_progress 仍为 True,
+        此时记录 duration 并置 False. REFRESHING 强制 IDLE 时 _open_in_progress
+        已 False (PRE_WAIT 强制 IDLE 已先结算过), 不重复计入.
+        """
+        if self._open_in_progress:
+            duration = current_slot - self._open_start_cycle
+            if duration > 0:
+                self._open_durations.append(duration)
+            self._open_in_progress = False
 
     def _clear_stale_flags_on_idle(self) -> None:
         """Bank 经过 force-PRE/REFRESHING → IDLE 时, 清理"描述上一轮 row 状态"的 stale 标记.
@@ -1922,7 +2012,7 @@ class DRAMBank:
 
     # ---- 自动预充电相关 ----
 
-    def start_write_auto_precharge(self, current_cycle: int,
+    def start_write_auto_precharge(self, current_slot: int,
                                    timing: TimingParameters) -> None:
         """发送 WRA 后启动 bank 内部自动预充电。
 
@@ -1931,14 +2021,14 @@ class DRAMBank:
         最后一条 WRITE 上，因此不占 Row bus，但 bank 仍必须等待同样的内部时序。
         """
         precharge_start = max(
-            current_cycle + timing.write_ap_cycles,
-            self.last_act_at + timing.t_ras_cycles,
+            current_slot + timing.write_ap_slots,
+            self.last_act_at + timing.t_ras_slots,
         )
-        self._auto_precharge_complete_cycle = precharge_start + timing.t_rp_cycles
+        self._auto_precharge_complete_cycle = precharge_start + timing.t_rp_slots
         self.precharge_pending = False
         self.state = BankState.AUTO_PRE_WAIT
 
-    def start_read_auto_precharge(self, current_cycle: int,
+    def start_read_auto_precharge(self, current_slot: int,
                                   timing: TimingParameters) -> None:
         """发送 RDA 后启动 bank 内部自动预充电。
 
@@ -1947,23 +2037,23 @@ class DRAMBank:
         最后一条 READ 上，因此不占 Row bus，但 bank 仍必须等待同样的内部时序。
         """
         precharge_start = max(
-            current_cycle + timing.t_rtp_cycles,
-            self.last_act_at + timing.t_ras_cycles,
+            current_slot + timing.t_rtp_slots,
+            self.last_act_at + timing.t_ras_slots,
         )
-        self._auto_precharge_complete_cycle = precharge_start + timing.t_rp_cycles
+        self._auto_precharge_complete_cycle = precharge_start + timing.t_rp_slots
         self.precharge_pending = False
         self.state = BankState.AUTO_PRE_WAIT
 
     # ---- refresh 相关 ----
 
-    def start_refresh(self, current_cycle: int) -> None:
-        """启动 REFpb. 假设 bank 已 IDLE (或调用方保证)."""
+    def start_refresh(self, current_slot: int) -> None:
+        """启动 REFpb. 假设 bank 已 IDLE (或调用方保证). 时间戳单位 dfi_phase_slot."""
         self.state = BankState.REFRESHING
-        self._refresh_start_cycle = current_cycle
+        self._refresh_start_cycle = current_slot
         # 注意: 不 reset cols_dispatched/serving_dispatch_id/open_row,
         # in-flight entry 在 refresh 后会 re-ACT 续派.
 
-    def force_precharge_for_refresh(self, current_cycle: int) -> bool:
+    def force_precharge_for_refresh(self, current_slot: int) -> bool:
         """为 refresh 强制 PRE bank. 返回 True 表示已发起 PRE (或已在 PRE_WAIT 路上),
         False 表示无需 force (IDLE/REFRESHING) 或不允许 (ACT_WAIT, tRAS 必不满足).
 
@@ -1979,7 +2069,7 @@ class DRAMBank:
             return False
         if self.state == BankState.ACTING:
             self.state = BankState.PRE_WAIT
-            self.last_pre_at = current_cycle
+            self.last_pre_at = current_slot
             self._force_pre_for_refresh = True
             return True
         if self.state == BankState.PRE_WAIT:
@@ -2044,7 +2134,8 @@ class WorkloadGenerator:
         self.max_system_la = geometry["max_system_la"]
         self.effective_bits = geometry["effective_bits"]
         self._addr_map = (dict(addr_map) if addr_map is not None
-                          else _default_addr_map_for(self.sid_remap_type))
+                          else _default_addr_map_for(self.sid_remap_type,
+                                                     self.configuration))
         _validate_addr_map(self._addr_map, self.sid_remap_type, self.effective_bits)
 
     def generate(self) -> Tuple[List[BurstCommandGroup],
@@ -2170,9 +2261,9 @@ class WorkloadGenerator:
 # ============================================================
 
 class ColEligibilityChecker:
-    """检查 ColumnCommand 是否可在当前 cycle 派发 (纯查询, 无副作用).
+    """检查 ColumnCommand 是否可在当前 dfi_phase_slot 派发 (纯查询, 无副作用).
 
-    5 条约束:
+    5 条约束 (AC 域, 时间单位 dfi_phase_slot):
       1. bank 状态 (R/W 分流: READ 要求 ACTING; WRITE 允许 ACT_WAIT + write_timing_satisfied)
       2. txn 匹配 (cmd.dispatch_id == bank.serving_dispatch_id)
       3. col 按序 (cmd.segment_col_index == bank.cols_dispatched)
@@ -2185,15 +2276,15 @@ class ColEligibilityChecker:
         self._banks = banks
         self._timing = timing
 
-    def check(self, col_cmd: ColumnCommand, current_cycle: int,
+    def check(self, col_cmd: ColumnCommand, current_slot: int,
               bus: _ColBusState) -> bool:
         """检查候选 ColumnCommand 是否满足全部派发约束。"""
-        return (self._bank_state_ok(col_cmd, current_cycle)
+        return (self._bank_state_ok(col_cmd, current_slot)
                 and self._txn_and_order_ok(col_cmd)
-                and self._tccd_ok(col_cmd, current_cycle, bus)
-                and self._turnaround_ok(col_cmd, current_cycle, bus))
+                and self._tccd_ok(col_cmd, current_slot, bus)
+                and self._turnaround_ok(col_cmd, current_slot, bus))
 
-    def _bank_state_ok(self, col_cmd: ColumnCommand, current_cycle: int) -> bool:
+    def _bank_state_ok(self, col_cmd: ColumnCommand, current_slot: int) -> bool:
         """直接按 ACT 时间检查 READ/WRITE 各自的 tRCD。
 
         READ 检查 tRCDRD，WRITE 检查 tRCDWR，因此两者大小关系不受限制。
@@ -2202,9 +2293,9 @@ class ColEligibilityChecker:
         bank = self._banks[col_cmd.bank_id]
         if bank.state not in (BankState.ACT_WAIT, BankState.ACTING):
             return False
-        required = (self._timing.t_rcdwr_cycles if col_cmd.is_write
-                    else self._timing.t_rcdrd_cycles)
-        return current_cycle >= bank.last_act_at + required
+        required = (self._timing.t_rcdwr_slots if col_cmd.is_write
+                    else self._timing.t_rcdrd_slots)
+        return current_slot >= bank.last_act_at + required
 
     def _txn_and_order_ok(self, col_cmd: ColumnCommand) -> bool:
         """检查 dispatch 依赖以及 segment 内命令顺序。"""
@@ -2212,41 +2303,41 @@ class ColEligibilityChecker:
         return (col_cmd.dispatch_id == bank.serving_dispatch_id
                 and col_cmd.segment_col_index == bank.cols_dispatched)
 
-    def _tccd_ok(self, col_cmd: ColumnCommand, current_cycle: int,
+    def _tccd_ok(self, col_cmd: ColumnCommand, current_slot: int,
                  bus: _ColBusState) -> bool:
-        # 1. per-bg 检查 (same bg 必须 tCCDL=3 DFI)
+        # 1. per-bg 检查 (same bg 必须 tCCDL=3 slots = 1.5 DFI)
         """检查同类或跨 bank-group 列命令的 tCCD 约束。"""
-        if (current_cycle
-                < bus.last_dispatch_cycle_per_bg[col_cmd.bank_group_id]
-                + self._timing.t_ccd_l_cycles):
+        if (current_slot
+                < bus.last_dispatch_slot_per_bg[col_cmd.bank_group_id]
+                + self._timing.t_ccd_l_slots):
             return False
-        # 2. bus-wide 检查 (tCCDS=1 DFI, 任何 col 间隔最小值)
-        if current_cycle < bus.last_dispatch_cycle + self._timing.t_ccd_s_cycles:
+        # 2. bus-wide 检查 (tCCDS=1 slot = 0.5 DFI: 同一 DFI cycle 的 phase0/phase1
+        #    可各发一条不同 BG 的 col, 占用 HBM phase0 与 phase2)
+        if current_slot < bus.last_dispatch_slot + self._timing.t_ccd_s_slots:
             return False
-        # 3. HBM3 inter-SID tCCDR 检查（READ only；参数单位为 DFI/model cycle）
-        #    spec JESD238B.01 Table 93 Note 17: 仅 READ 跨 SID 用 tCCDR, WRITE 仍用 tCCDS
-        #    SID 数 (num_sid) per spec Table 5: 16→1, 32→2, 48→4, 64→4
+        # 3. inter-SID tCCDR 检查（READ only；HBM4 默认 4 nCK = 2 slots）
+        #    spec: 仅 READ 跨 SID 用 tCCDR, WRITE 仍用 tCCDS
         #    同一 SID 内的不同 bank_group 走 tCCDS, 跨 SID 走 tCCDR
         if (not col_cmd.is_write
                 and col_cmd.sid_id != bus.last_dispatch_sid
-                and current_cycle < bus.last_dispatch_cycle
-                                  + self._timing.t_ccdr_cycles):
+                and current_slot < bus.last_dispatch_slot
+                                  + self._timing.t_ccdr_slots):
             return False
         return True
 
-    def _turnaround_ok(self, col_cmd: ColumnCommand, current_cycle: int,
+    def _turnaround_ok(self, col_cmd: ColumnCommand, current_slot: int,
                        bus: _ColBusState) -> bool:
         """检查读写切换相关的总线 turnaround 约束。"""
         current_type = RWType.WRITE if col_cmd.is_write else RWType.READ
         if bus.last_rw_type in (RWType.NONE, current_type):
             return True
         if current_type == RWType.WRITE:   # R → W: tRTW
-            return current_cycle >= bus.last_dispatch_cycle + self._timing.t_rtw_cycles
+            return current_slot >= bus.last_dispatch_slot + self._timing.t_rtw_slots
         # W → R: WL+2+tWTR, same/diff bg 不同
-        gap = (self._timing.write_to_read_same_bg_cycles
+        gap = (self._timing.write_to_read_same_bg_slots
                if col_cmd.bank_group_id == bus.last_bank_group
-               else self._timing.write_to_read_diff_bg_cycles)
-        return current_cycle >= bus.last_dispatch_cycle + gap
+               else self._timing.write_to_read_diff_bg_slots)
+        return current_slot >= bus.last_dispatch_slot + gap
 
 
 # ============================================================
@@ -2267,7 +2358,7 @@ class SidRefpbRollingState:
 
 
 class RefreshScheduler:
-    """HBM3 REFpb 调度器（v16.3）。
+    """HBM per-bank REFpb 调度器 (HBM4, 继承 HBM3 v16.3 结构)。
 
     五层语义严格分离：
       * Channel nominal opportunity：每 tREFIpb 产生一条 REFpb 义务；
@@ -2314,7 +2405,12 @@ class RefreshScheduler:
         self._last_refpb_state = last_refpb_state
         self._last_act_state = last_act_state
         self._act_refpb_faw_cycles = (act_refpb_faw_cycles
-                                      if act_refpb_faw_cycles is not None else [])
+                                       if act_refpb_faw_cycles is not None else [])
+        # HBM4 双时间域: CTL bookkeeping (debt/deadline/统计) 每 DFI cycle 只推一次
+        # (主循环每 cycle 调 try_issue 2 次, 每 slot 一次; memo 防止重复计数)。
+        self._bookkeeping_cycle: int = -1
+        self._opportunity_counted_cycle: int = -1
+        self._mandatory_counted_cycle: int = -1
 
         if bank_sid is None or len(bank_sid) != num_banks:
             raise ValueError("bank_sid 必须提供完整的 bank→SID 映射")
@@ -2425,8 +2521,21 @@ class RefreshScheduler:
         if self._refresh_debt >= self._max_postpone_credits:
             self._debt_at_limit_cycles += 1
 
-    def _prune_faw(self, current_cycle: int) -> None:
-        cutoff = current_cycle - self._timing.t_faw_cycles
+    def begin_cycle(self, current_cycle: int) -> None:
+        """每 DFI cycle 推进一次 CTL bookkeeping (幂等, 重复调用安全)。
+
+        nominal opportunity / hard deadline 统计 / prepare deadline 都是 DFI cycle
+        粒度; 主循环每个 slot 调一次 try_issue, 通过 memo 保证每 cycle 只推一次。
+        """
+        if self._bookkeeping_cycle == current_cycle:
+            return
+        self._bookkeeping_cycle = current_cycle
+        self._update_nominal_opportunities(current_cycle)
+        self._update_hard_deadline_stats(current_cycle)
+        self._update_prepare_deadlines(current_cycle)
+
+    def _prune_faw(self, current_slot: int) -> None:
+        cutoff = current_slot - self._timing.t_faw_slots
         while self._act_refpb_faw_cycles and self._act_refpb_faw_cycles[0] <= cutoff:
             self._act_refpb_faw_cycles.pop(0)
 
@@ -2436,7 +2545,8 @@ class RefreshScheduler:
         state = self._sid_states[sid]
         if state.refreshed_mask != self._sid_full_mask[sid]:
             return True
-        return current_cycle >= state.set_complete_cycle + self._timing.t_rfc_pb_cycles
+        # rolling-set bookkeeping 为 DFI cycle (CTL 域), tRFCpb 用 DFI 版本。
+        return current_cycle >= state.set_complete_cycle + self._timing.t_rfc_pb_dfi_cycles
 
     def _rolling_set_query_allows(self, bank_id: int, current_cycle: int) -> bool:
         sid = self._bank_sid[bank_id]
@@ -2483,42 +2593,47 @@ class RefreshScheduler:
 
     # ---- prepare deadline / time budget ----
 
-    def _channel_timing_budget(self) -> int:
-        return max(self._timing.t_rrefd_cycles,
-                   self._timing.t_rrd_l_cycles,
-                   self._timing.t_faw_cycles)
+    def _channel_timing_budget_slots(self) -> int:
+        return max(self._timing.t_rrefd_slots,
+                   self._timing.t_rrd_l_slots,
+                   self._timing.t_faw_slots)
 
-    def _estimate_prepare_latency(self, bank_id: int, current_cycle: int) -> int:
-        """保守估计从当前 bank 状态到可合法发 REFpb 的剩余 cycle。"""
+    def _estimate_prepare_latency(self, bank_id: int, current_slot: int) -> int:
+        """保守估计从当前 bank 状态到可合法发 REFpb 的剩余时间, 返回 DFI cycles。
+
+        bank 时间戳为 dfi_phase_slot (AC 域), 而 prepare/hard deadline bookkeeping
+        为 DFI cycle (CTL 域): 内部以 slot 计算, 返回前向上取整换算为 DFI cycle。
+        """
         bank = self._banks[bank_id]
-        channel_wait = self._channel_timing_budget()
+        channel_wait = self._channel_timing_budget_slots()
         if bank.state == BankState.IDLE:
-            return channel_wait
-        if bank.state == BankState.REFRESHING:
-            remain = max(0, bank._refresh_start_cycle + self._timing.t_rfc_pb_cycles
-                         - current_cycle)
-            return remain + channel_wait
-        if bank.state == BankState.PRE_WAIT:
-            return max(0, bank.last_pre_at + self._timing.t_rp_cycles
-                       - current_cycle) + channel_wait
-        if bank.state == BankState.AUTO_PRE_WAIT:
-            return max(0, bank._auto_precharge_complete_cycle - current_cycle) + channel_wait
-
-        # ACT_WAIT 必须等 row 可进入可 PRE 状态；ACTING 同样检查 tRAS/col-to-PRE。
-        wait_acting = max(0, bank.last_act_at + self._timing.t_rcdrd_cycles
-                          - current_cycle)
-        wait_ras = max(0, bank.last_act_at + self._timing.t_ras_cycles
-                       - current_cycle)
-        if bank.last_col_at == INITIAL_CYCLE_SENTINEL:
-            wait_col = 0
+            remain_slots = 0
+        elif bank.state == BankState.REFRESHING:
+            remain_slots = max(0, bank._refresh_start_cycle + self._timing.t_rfc_pb_slots
+                               - current_slot)
+        elif bank.state == BankState.PRE_WAIT:
+            remain_slots = max(0, bank.last_pre_at + self._timing.t_rp_slots
+                               - current_slot)
+        elif bank.state == BankState.AUTO_PRE_WAIT:
+            remain_slots = max(0, bank._auto_precharge_complete_cycle - current_slot)
         else:
-            wait_col = max(0, bank.last_col_at + self._col_to_pre_delay_cycles(bank)
-                           - current_cycle)
-        return max(wait_acting, wait_ras, wait_col) + self._timing.t_rp_cycles + channel_wait
+            # ACT_WAIT 必须等 row 可进入可 PRE 状态；ACTING 同样检查 tRAS/col-to-PRE。
+            wait_acting = max(0, bank.last_act_at + self._timing.t_rcdrd_slots
+                              - current_slot)
+            wait_ras = max(0, bank.last_act_at + self._timing.t_ras_slots
+                           - current_slot)
+            if bank.last_col_at == INITIAL_CYCLE_SENTINEL:
+                wait_col = 0
+            else:
+                wait_col = max(0, bank.last_col_at + self._col_to_pre_delay_slots(bank)
+                               - current_slot)
+            remain_slots = max(wait_acting, wait_ras, wait_col) + self._timing.t_rp_slots
+        return max(1, (remain_slots + channel_wait + 1) // 2)
 
     def _update_prepare_deadlines(self, current_cycle: int) -> None:
+        current_slot = current_cycle * ClockModel.DFI_PHASE_SLOTS_PER_CYCLE
         for bank_id in range(self._num_banks):
-            latency = self._estimate_prepare_latency(bank_id, current_cycle)
+            latency = self._estimate_prepare_latency(bank_id, current_slot)
             # prepare_deadline = "最晚开始排空(force-PRE)的时刻" = hard_deadline − latency.
             # 不与 normal_due 取 min: normal_due 只是 nominal 时刻, 不是 deadline; 提前排空
             # 的唯一理由是赶 hard_deadline. 旧 min(normal_due, hard_deadline−latency) 会在
@@ -2538,9 +2653,9 @@ class RefreshScheduler:
                 self._last_refresh_cycle[bank_id],
                 bank_id)
 
-    def _timing_allows_refpb(self, bank_id: int, current_cycle: int,
+    def _timing_allows_refpb(self, bank_id: int, current_slot: int,
                              count_stats: bool = True) -> bool:
-        """检查 tRREFD / tRRD_L·S / tFAW 是否允许对本 bank 发 REFpb.
+        """检查 tRREFD / tRRD_L·S / tFAW 是否允许对本 bank 发 REFpb (AC 域, slot 单位)。
 
         count_stats=False 时只做判定, 不累加 block 计数 — 供 non-mandatory
         候选遍历使用, 避免一次 cycle 探测多个候选时把 per-reason block
@@ -2549,28 +2664,28 @@ class RefreshScheduler:
         """
         bank = self._banks[bank_id]
         if self._last_refpb_state is not None:
-            last_cycle = self._last_refpb_state["cycle"]
+            last_slot = self._last_refpb_state["cycle"]
             last_bank = self._last_refpb_state["bank"]
             if (last_bank != -1 and bank_id != last_bank
-                    and current_cycle < last_cycle + self._timing.t_rrefd_cycles):
+                    and current_slot < last_slot + self._timing.t_rrefd_slots):
                 if count_stats:
                     self._rrefd_blocked_count += 1
                     self._refpb_issue_block_events += 1
                 return False
         if self._last_act_state is not None:
-            last_cycle = self._last_act_state["cycle"]
+            last_slot = self._last_act_state["cycle"]
             last_bank = self._last_act_state["bank"]
             last_bg = self._last_act_state["bank_group"]
             if last_bank != -1 and bank_id != last_bank:
-                gap = (self._timing.t_rrd_l_cycles
+                gap = (self._timing.t_rrd_l_slots
                        if bank.bank_group_id == last_bg
-                       else self._timing.t_rrd_s_cycles)
-                if current_cycle < last_cycle + gap:
+                       else self._timing.t_rrd_s_slots)
+                if current_slot < last_slot + gap:
                     if count_stats:
                         self._trrd_refpb_blocked_count += 1
                         self._refpb_issue_block_events += 1
                     return False
-        self._prune_faw(current_cycle)
+        self._prune_faw(current_slot)
         if len(self._act_refpb_faw_cycles) >= 4:
             if count_stats:
                 self._tfaw_refpb_blocked_count += 1
@@ -2595,15 +2710,20 @@ class RefreshScheduler:
                 self._hard_deadline_active[bank_id] = False
                 self._hard_deadline_consecutive_cycles[bank_id] = 0
 
-    def _issue_mandatory_refpb(self, bank_id: int, current_cycle: int) -> RowCommand:
-        """发出 mandatory REFpb (调用方已确认 IDLE + AC timing OK). 返回 RowCommand."""
+    def _issue_mandatory_refpb(self, bank_id: int, current_cycle: int,
+                               current_slot: int) -> RowCommand:
+        """发出 mandatory REFpb (调用方已确认 IDLE + AC timing OK). 返回 RowCommand.
+
+        bank 状态机 (start_refresh) 与 bus tracker 走 AC 域 slot;
+        debt/deadline/rolling-set bookkeeping 走 CTL 域 DFI cycle.
+        """
         bank = self._banks[bank_id]
-        bank.start_refresh(current_cycle)
+        bank.start_refresh(current_slot)
         self._record_refresh(bank_id, current_cycle)
         if self._last_refpb_state is not None:
-            self._last_refpb_state["cycle"] = current_cycle
+            self._last_refpb_state["cycle"] = current_slot
             self._last_refpb_state["bank"] = bank_id
-        self._act_refpb_faw_cycles.append(current_cycle)
+        self._act_refpb_faw_cycles.append(current_slot)
         for i in range(self._num_banks):
             self._refresh_pending[i] = (i == bank_id)
         # mandatory latch 计数: 每发一个 mandatory REFpb, count+1; 刷满 postpone_low_thr 解除 latch.
@@ -2624,11 +2744,14 @@ class RefreshScheduler:
             self._mandatory_refresh_count = 0
             self._debt_prevention_trigger_count += 1
 
-    def try_issue(self, current_cycle: int,
+    def try_issue(self, current_cycle: int, current_slot: int,
                   cam_busy_banks: Optional[set] = None,
                   via_fallback: bool = False
                   ) -> Tuple[Optional[RowCommand], bool]:
         """尝试发一个 REFpb / force-PRE. 返回 (row_cmd, is_mandatory).
+
+        HBM4 双时间域: ``current_cycle`` 为 DFI cycle (CTL bookkeeping),
+        ``current_slot`` 为绝对 dfi_phase_slot (AC timing 闸与 bank 状态机)。
 
         v16.3 重构:
           - 新增第二个返回值 is_mandatory, 告诉编排器本次发出的 row_cmd 是否
@@ -2642,9 +2765,7 @@ class RefreshScheduler:
             _non_mandatory_fallback_issued_count (与原 _non_mandatory_refpb_count
             并行计数, 区分"通过 row_bus 抢占" vs "ACT/PRE 让出来后再发").
         """
-        self._update_nominal_opportunities(current_cycle)
-        self._update_hard_deadline_stats(current_cycle)
-        self._update_prepare_deadlines(current_cycle)
+        self.begin_cycle(current_cycle)
         if self._refresh_debt <= 0:
             for i in range(self._num_banks):
                 self._refresh_pending[i] = False
@@ -2663,7 +2784,11 @@ class RefreshScheduler:
         # 语义: non-mandatory 路径会累计 opportunity cycles (用于统计).
         # 若 cam_busy_banks 过滤后 candidates 为空, 不发 REFpb, 本 cycle "等待".
         if not is_mandatory:
-            self._non_mandatory_opportunity_cycles += 1
+            # per-DFI-cycle 统计语义: 每个 cycle 只计一次 opportunity (HBM4 下
+            # try_issue 每 cycle 被调 2 次, 每 slot 一次)。
+            if self._opportunity_counted_cycle != current_cycle:
+                self._opportunity_counted_cycle = current_cycle
+                self._non_mandatory_opportunity_cycles += 1
             if cam_busy_banks:
                 raw_count = len(candidates)
                 filtered = [b for b in candidates if b not in cam_busy_banks]
@@ -2689,11 +2814,11 @@ class RefreshScheduler:
                 cand_bank = self._banks[cand]
                 if cand_bank.state != BankState.IDLE:
                     continue
-                if not self._timing_allows_refpb(cand, current_cycle,
+                if not self._timing_allows_refpb(cand, current_slot,
                                                  count_stats=False):
                     continue
                 # 命中: 发出 non-mandatory REFpb.
-                cand_bank.start_refresh(current_cycle)
+                cand_bank.start_refresh(current_slot)
                 self._non_mandatory_refpb_count += 1
                 # ref_priority: 仅当本 cycle 是 "row_scheduler 没发 → refresh 兜底"
                 # 的调用, 才计 fallback; 否则视作正常 non-mandatory 抢占 row bus
@@ -2702,9 +2827,9 @@ class RefreshScheduler:
                     self._non_mandatory_fallback_issued_count += 1
                 self._record_refresh(cand, current_cycle)
                 if self._last_refpb_state is not None:
-                    self._last_refpb_state["cycle"] = current_cycle
+                    self._last_refpb_state["cycle"] = current_slot
                     self._last_refpb_state["bank"] = cand
-                self._act_refpb_faw_cycles.append(current_cycle)
+                self._act_refpb_faw_cycles.append(current_slot)
                 for i in range(self._num_banks):
                     self._refresh_pending[i] = (i == cand)
                 return RowCommand(RowCommandType.REFPB, cand, -1), False
@@ -2717,7 +2842,9 @@ class RefreshScheduler:
         # tier 1: IDLE + CAM 不命中 + timing OK → 直接 REFpb (零干扰)
         # tier 2: IDLE + CAM 命中  + timing OK → 直接 REFpb (row 已关, CAM 命令延迟 re-ACT)
         # tier 3: ACTING → force-PRE candidates[0] (最紧急); 非 ACTING / 时序不满足则 block
-        self._time_budget_mandatory_cycles += 1
+        if self._mandatory_counted_cycle != current_cycle:
+            self._mandatory_counted_cycle = current_cycle
+            self._time_budget_mandatory_cycles += 1
         cam_busy = cam_busy_banks if cam_busy_banks is not None else set()
 
         for tier_need_free in (True, False):
@@ -2730,9 +2857,9 @@ class RefreshScheduler:
                         continue
                 elif not in_cam:
                     continue  # not-in-CAM 已在 tier 1 处理
-                if not self._timing_allows_refpb(cand, current_cycle, count_stats=False):
+                if not self._timing_allows_refpb(cand, current_slot, count_stats=False):
                     continue
-                return self._issue_mandatory_refpb(cand, current_cycle), True
+                return self._issue_mandatory_refpb(cand, current_cycle, current_slot), True
 
         # tier 3: force-PRE candidates[0] (最紧急 ACTING); 否则让位等下 cycle
         target = candidates[0]
@@ -2740,15 +2867,15 @@ class RefreshScheduler:
             self._refresh_pending[i] = (i == target)
         bank = self._banks[target]
         if bank.state == BankState.ACTING:
-            if current_cycle < bank.last_act_at + self._timing.t_ras_cycles:
+            if current_slot < bank.last_act_at + self._timing.t_ras_slots:
                 self._t_ras_wait_count += 1
                 return None, False
-            col2pre = self._col_to_pre_delay_cycles(bank)
+            col2pre = self._col_to_pre_delay_slots(bank)
             if (bank.last_col_at != INITIAL_CYCLE_SENTINEL
-                    and current_cycle < bank.last_col_at + col2pre):
+                    and current_slot < bank.last_col_at + col2pre):
                 self._t_col2pre_wait_count += 1
                 return None, False
-            if bank.force_precharge_for_refresh(current_cycle):
+            if bank.force_precharge_for_refresh(current_slot):
                 self._force_pre_count += 1
                 return RowCommand(RowCommandType.PRE, target, bank.open_row), True
             self._bank_not_idle_block_count += 1
@@ -2762,8 +2889,7 @@ class RefreshScheduler:
         postpone_low_thr 个 REFpb 才解除) 或 prepare_due (candidates[0] 临近 hard_deadline).
         cam_busy_banks 不影响 mandatory 判定 (保留参数为编排器 API 兼容).
         """
-        self._update_nominal_opportunities(current_cycle)
-        self._update_prepare_deadlines(current_cycle)
+        self.begin_cycle(current_cycle)
         if self._refresh_debt <= 0:
             return False
         self._update_mandatory_latch()
@@ -2783,10 +2909,10 @@ class RefreshScheduler:
         """
         self._non_mandatory_yield_count += 1
 
-    def _col_to_pre_delay_cycles(self, bank: DRAMBank) -> int:
-        return (self._timing.write_ap_cycles
+    def _col_to_pre_delay_slots(self, bank: DRAMBank) -> int:
+        return (self._timing.write_ap_slots
                 if bank.last_col_rw_type == RWType.WRITE
-                else self._timing.t_rtp_cycles)
+                else self._timing.t_rtp_slots)
 
     def _record_refresh(self, bank_id: int, current_cycle: int) -> None:
         previous_debt = self._refresh_debt
@@ -2906,8 +3032,8 @@ class RefreshScheduler:
 class RowScheduler:
     """PRE/ACT 调度: 优先 PRE, 然后 ACT, RR 仲裁.
 
-    自持有 ACT 通道 tracker (last_act_cycle 全局/per-bg, recent_act_cycles 供 tFAW),
-    派发成功后自行更新, 编排器只需计数.
+    自持有 ACT 通道 tracker (last_act_slot 全局/per-bg, recent_act_slots 供 tFAW),
+    派发成功后自行更新, 编排器只需计数. 所有时间戳为 dfi_phase_slot (AC 域).
 
     v17+: 新增 BG 交织 ACT 选优 (默认开). 维护每个 SID 的 last_act_bg, 选 ACT
     时优先同 SID 不同 BG 的 bank, 提升 BG 级并行, 减少 tRRDL 集中.
@@ -2932,9 +3058,9 @@ class RowScheduler:
         self._banks = banks
         self._timing = timing
         self._rr_pointer = 0
-        self._last_act_cycle = INITIAL_CYCLE_SENTINEL
-        self._last_act_cycle_per_bg = [INITIAL_CYCLE_SENTINEL] * num_bank_groups
-        self._recent_act_cycles: List[int] = []
+        self._last_act_slot = INITIAL_CYCLE_SENTINEL
+        self._last_act_slot_per_bg = [INITIAL_CYCLE_SENTINEL] * num_bank_groups
+        self._recent_act_slots: List[int] = []
         self._last_act_state = last_act_state
         self._act_refpb_faw_cycles = (act_refpb_faw_cycles
                                       if act_refpb_faw_cycles is not None else [])
@@ -2964,9 +3090,10 @@ class RowScheduler:
         self._age_priority_used: int = 0         #: 实际用 age 选优的次数 (即 age 不是平局)
         self._max_age_seen: int = 0             #: 仿真期内见过的最大 age (cycles)
 
-    def try_issue(self, current_cycle: int,
+    def try_issue(self, current_slot: int,
                   cams: List[BurstCommandGroup]) -> Optional[RowCommand]:
-        """尝试发一个 Row 命令: 先 PRE 后 ACT, 每 cycle 最多一个.
+        """尝试发一个 Row 命令: 先 PRE 后 ACT, 每 dfi_phase_slot 最多一个
+        (HBM4: 每 DFI cycle 2 个 row 发射 slot, ACT 实际速率受 tRRD=1.5 DFI 限制).
 
         cams 是当前 mode 可见的 CAM 列表, 由 ColScheduler.get_row_candidate_cams 决定:
           - NORMAL READ  → [read_cam]
@@ -2977,17 +3104,17 @@ class RowScheduler:
         PRE 不通道化, 扫全部 bank — autoprecharge 是 bank 自治行为,
         对向 mode 遗留的已完成 bank 必须能被 PRE, 否则永久挂在 ACTING.
         """
-        row_cmd = self._try_precharge(current_cycle)
+        row_cmd = self._try_precharge(current_slot)
         if row_cmd is None:
-            row_cmd = self._try_activate(current_cycle, cams)
+            row_cmd = self._try_activate(current_slot, cams)
         if row_cmd is not None and row_cmd.kind == RowCommandType.ACT:
             bank = self._banks[row_cmd.bank_id]
-            self._last_act_cycle = current_cycle
-            self._last_act_cycle_per_bg[bank.bank_group_id] = current_cycle
-            self._recent_act_cycles.append(current_cycle)
-            self._act_refpb_faw_cycles.append(current_cycle)
+            self._last_act_slot = current_slot
+            self._last_act_slot_per_bg[bank.bank_group_id] = current_slot
+            self._recent_act_slots.append(current_slot)
+            self._act_refpb_faw_cycles.append(current_slot)
             if self._last_act_state is not None:
-                self._last_act_state["cycle"] = current_cycle
+                self._last_act_state["cycle"] = current_slot
                 self._last_act_state["bank"] = bank.bank_id
                 self._last_act_state["bank_group"] = bank.bank_group_id
             # v17+: 更新 per-SID last ACT BG (供下次 BG 交织选优用)
@@ -2999,58 +3126,58 @@ class RowScheduler:
 
     # ---- PRE ----
 
-    def _try_precharge(self, current_cycle: int) -> Optional[RowCommand]:
+    def _try_precharge(self, current_slot: int) -> Optional[RowCommand]:
         """PRE 扫全部 bank (不按 mode 通道化).
 
         只有 precharge_pending=True 的 bank 会被 PRE (即已完成全部 col 的 bank),
         这是 bank 自治的收尾行为, 与当前 mode 无关. 若按 mode 过滤, 对向 mode
         遗留的已完成 bank 会永远等不到 PRE, 进而挡住该 bank 后续所有 ACT.
         """
-        pre_eligible = self._collect_pre_eligible_banks(current_cycle)
+        pre_eligible = self._collect_pre_eligible_banks(current_slot)
         if not pre_eligible:
             return None
 
         selected = self._rr_select(pre_eligible, lambda b: b.bank_id)
         selected.state = BankState.PRE_WAIT
-        selected.last_pre_at = current_cycle
+        selected.last_pre_at = current_slot
         selected.precharge_pending = False
         return RowCommand(RowCommandType.PRE, selected.bank_id, selected.open_row)
 
-    def _collect_pre_eligible_banks(self, current_cycle: int) -> List[DRAMBank]:
+    def _collect_pre_eligible_banks(self, current_slot: int) -> List[DRAMBank]:
         """PRE 条件: precharge_pending + ACTING +
-        距 last_col ≥ tColToPre(R/W 分流) + 距 last_act ≥ tRAS"""
+        距 last_col ≥ tColToPre(R/W 分流) + 距 last_act ≥ tRAS (slot 单位)"""
         result = []
         for bank in self._banks:
             if not (bank.precharge_pending and bank.state == BankState.ACTING):
                 continue
-            if current_cycle < bank.last_col_at + self._col_to_pre_delay_cycles(bank):
+            if current_slot < bank.last_col_at + self._col_to_pre_delay_slots(bank):
                 continue
-            if current_cycle < bank.last_act_at + self._timing.t_ras_cycles:
+            if current_slot < bank.last_act_at + self._timing.t_ras_slots:
                 continue
             result.append(bank)
         return result
 
-    def _col_to_pre_delay_cycles(self, bank: DRAMBank) -> int:
-        """READ: t_rtp_cycles; WRITE: write_ap_cycles (= WL+2+tWR)"""
+    def _col_to_pre_delay_slots(self, bank: DRAMBank) -> int:
+        """READ: t_rtp_slots; WRITE: write_ap_slots (= WL+2+tWR)"""
         if bank.last_col_rw_type == RWType.WRITE:
-            return self._timing.write_ap_cycles
-        return self._timing.t_rtp_cycles
+            return self._timing.write_ap_slots
+        return self._timing.t_rtp_slots
 
     # ---- ACT ----
 
-    def _try_activate(self, current_cycle: int,
+    def _try_activate(self, current_slot: int,
                       cams: List[BurstCommandGroup]) -> Optional[RowCommand]:
         # 短路: 全局 t_rrd_s / t_faw 不满足直接跳过 (避免无谓的 bank 遍历)
-        """收集并选择当前周期可以发出的 ACT 命令。"""
-        if current_cycle < self._last_act_cycle + self._timing.t_rrd_s_cycles:
+        """收集并选择当前 dfi_phase_slot 可以发出的 ACT 命令。"""
+        if current_slot < self._last_act_slot + self._timing.t_rrd_s_slots:
             return None
-        cutoff = current_cycle - self._timing.t_faw_cycles
+        cutoff = current_slot - self._timing.t_faw_slots
         while self._act_refpb_faw_cycles and self._act_refpb_faw_cycles[0] <= cutoff:
             self._act_refpb_faw_cycles.pop(0)
         if len(self._act_refpb_faw_cycles) >= 4:
             return None
 
-        act_eligible = self._collect_act_eligible_banks(current_cycle, cams)
+        act_eligible = self._collect_act_eligible_banks(current_slot, cams)
         if not act_eligible:
             return None
 
@@ -3058,17 +3185,20 @@ class RowScheduler:
         # v18+: Age 优先级 (默认开) — age > BG 交织 > RR, age 是主排序
         if self._age_priority:
             bank, row_id, dispatch_id = self._select_act_with_age_priority(
-                act_eligible, cams, current_cycle)
+                act_eligible, cams, current_slot)
         elif self._bg_interleave_priority:
             bank, row_id, dispatch_id = self._select_act_with_bg_priority(act_eligible)
         else:
             bank, row_id, dispatch_id = self._rr_select(act_eligible, lambda x: x[0].bank_id)
         bank.state = BankState.ACT_WAIT
-        bank.last_act_at = current_cycle
+        bank.last_act_at = current_slot
         bank.serving_dispatch_id = dispatch_id
         bank.open_row = row_id
         bank.page_hit_chain_active = False
         bank.write_timing_satisfied = False
+        # v21+: 标记 bank 打开周期起点, 在 Bank._record_open_close 中记录时长
+        bank._open_start_cycle = current_slot
+        bank._open_in_progress = True
         return RowCommand(RowCommandType.ACT, bank.bank_id, row_id)
 
     def _select_act_with_bg_priority(self,
@@ -3103,8 +3233,11 @@ class RowScheduler:
 
     def _compute_bank_act_age(self, bank: 'DRAMBank',
                              cams: List['BurstCommandGroup'],
-                             current_cycle: int) -> int:
-        """v18+: 算 bank 的 ACT 等待年龄 = current_cycle - min(entry.entry_cycle).
+                             current_slot: int) -> int:
+        """v18+: 算 bank 的 ACT 等待年龄 (DFI cycles) = current_cycle - min(entry_cycle).
+
+        current_slot 为 dfi_phase_slot (AC 域), entry_cycle 为 DFI cycle (CTL 域,
+        准入时间), 因此先换算 current_slot // 2 再相减.
 
         仅考虑 cams 里 bank_id 匹配且仍有未派发 cmd 的 burst entry.
         若 bank 不在 cams 中 (cams 列表为空场景), 返回 0.
@@ -3119,12 +3252,12 @@ class RowScheduler:
                 min_cycle = entry.entry_cycle
         if min_cycle is None:
             return 0
-        return current_cycle - min_cycle
+        return (current_slot // 2) - min_cycle
 
     def _select_act_with_age_priority(self,
                                     candidates: List[Tuple['DRAMBank', int, int]],
                                     cams: List['BurstCommandGroup'],
-                                    current_cycle: int) -> Tuple['DRAMBank', int, int]:
+                                    current_slot: int) -> Tuple['DRAMBank', int, int]:
         """v18+: Age 优先级选 bank (age > BG 交织 > RR).
 
         排序键: (-age, bg_interleave_score, bank_id)
@@ -3137,7 +3270,7 @@ class RowScheduler:
         def sort_key(entry):
             nonlocal max_age
             bank = entry[0]
-            age = self._compute_bank_act_age(bank, cams, current_cycle)
+            age = self._compute_bank_act_age(bank, cams, current_slot)
             if age > max_age:
                 max_age = age
             # BG 交织得分: 0 = 不同 BG (优先), 1 = 同 BG (或初始)
@@ -3150,8 +3283,8 @@ class RowScheduler:
 
         sorted_candidates = sorted(candidates, key=sort_key)
         # 统计: 选出的 bank 是否真的是 age 最大的 (非并列)
-        top_age = self._compute_bank_act_age(sorted_candidates[0][0], cams, current_cycle)
-        second_age = (self._compute_bank_act_age(sorted_candidates[1][0], cams, current_cycle)
+        top_age = self._compute_bank_act_age(sorted_candidates[0][0], cams, current_slot)
+        second_age = (self._compute_bank_act_age(sorted_candidates[1][0], cams, current_slot)
                       if len(sorted_candidates) > 1 else top_age)
         if top_age > second_age:
             self._age_priority_used += 1
@@ -3159,7 +3292,7 @@ class RowScheduler:
             self._max_age_seen = max_age
         return sorted_candidates[0]
 
-    def _collect_act_eligible_banks(self, current_cycle: int,
+    def _collect_act_eligible_banks(self, current_slot: int,
                                     cams: List[BurstCommandGroup]
                                     ) -> List[Tuple[DRAMBank, int, int]]:
         """ACT 条件: IDLE + 距 last_act ≥ tRC + 同 bg 距 last_act ≥ tRRDl + cams 有该 bank 待派发 cmd
@@ -3167,39 +3300,40 @@ class RowScheduler:
         cams 由 ColScheduler.get_row_candidate_cams 决定 (按 mode 通道化),
         所以这里只在当前 mode (或准备期的目标 mode) 涉及的 bank 里找 ACT 机会.
 
-        v6.7: 加 tRREFD 闸 (JESD238B.01 §6.3.2.6 Table 35 NOTE 3)
-          REFpb → ACT（不同 bank，跨 SID 生效）≥ 8ns = t_rrefd_cycles
-          同 bank 情况由 state != IDLE 排除 (tRFCpb 240 cycles 保护).
+        tRREFD 闸: REFpb → ACT（不同 bank，跨 SID 生效）≥ tRREFD
+          同 bank 情况由 state != IDLE 排除 (tRFCpb 保护).
         """
         result = []
         for bank in self._banks:
             if bank.state != BankState.IDLE:
                 continue
-            if current_cycle < bank.last_act_at + self._timing.t_rc_cycles:
+            if current_slot < bank.last_act_at + self._timing.t_rc_slots:
                 continue
-            if (current_cycle
-                    < self._last_act_cycle_per_bg[bank.bank_group_id]
-                    + self._timing.t_rrd_l_cycles):
+            if (current_slot
+                    < self._last_act_slot_per_bg[bank.bank_group_id]
+                    + self._timing.t_rrd_l_slots):
                 continue
             # tRREFD: 最近 REFpb 作用于其他 bank 时，跨 SID 同样需要等待
             if self._last_refpb_state is not None:
-                last_cycle = self._last_refpb_state["cycle"]
+                last_slot = self._last_refpb_state["cycle"]
                 last_bank = self._last_refpb_state["bank"]
                 if (last_bank != -1 and bank.bank_id != last_bank
-                        and current_cycle < last_cycle + self._timing.t_rrefd_cycles):
+                        and current_slot < last_slot + self._timing.t_rrefd_slots):
                     self._rrefd_act_blocked_count += 1
                     continue
+            # data-ready 检查用 CTL 域 (DFI cycle = current_slot // 2)
+            current_dfi_cycle = current_slot // ClockModel.DFI_PHASE_SLOTS_PER_CYCLE
             for burst_entry in cams:
                 if burst_entry.bank_id != bank.bank_id:
                     continue
                 if burst_entry.next_dispatch_index >= len(burst_entry.commands):
                     continue
                 # v19.4: ACT 阶段只 可见，不要求 data ready. WRITE 入 CAM 后即可 ACT, WR/WRA 仍需 data ready (_try_issue_of_type 过滤).
-                if not _is_entry_visible_for_act(burst_entry, current_cycle):
+                if not _is_entry_visible_for_act(burst_entry, current_dfi_cycle):
                     continue
                 # v20: write_requires_data_ready=True 时, ACT 必须等 data ready (commit 后才能发);
                 # False 模式 admit 时已直接 ready, 此检查无影响.
-                if self._write_requires_data_ready and not _is_entry_data_ready(burst_entry, current_cycle):
+                if self._write_requires_data_ready and not _is_entry_data_ready(burst_entry, current_dfi_cycle):
                     continue
                 col_cmd = burst_entry.commands[burst_entry.next_dispatch_index]
                 if col_cmd.segment_col_index == bank.cols_dispatched:
@@ -3295,6 +3429,7 @@ class ColScheduler:
                  batch_scheduling: bool,
                  batch_timeout_cycles: int,
                  initial_batch_type: RWType,
+                 bank_sid: Optional[List[int]] = None,
                  preparation_min_banks: int = 8,
                  preparation_max_dispatches: int = 16,
                  preparation_max_cycles: int = 64,
@@ -3309,8 +3444,17 @@ class ColScheduler:
                  rda_only_after_page_hit: bool = False,
                  rw_4state_mode: bool = True,
                  write_data_buffer_state: Optional[dict] = None,
-     write_requires_data_ready: bool = True):
-        """初始化对象状态及其依赖组件。"""
+                 write_requires_data_ready: bool = True,
+                 cs_prefetch_window_enable: bool = False,
+                 cs_prefetch_window: Optional[int] = 8,
+                 dfi_prefetch_window_enable: bool = False,
+                 dfi_prefetch_window: Optional[int] = 4,
+                 cs_prefetch_active_admit: bool = True):
+        """初始化对象状态及其依赖组件。
+
+        注: Prefetch Window (两级 bank 窗口) 参数由 HBMCommandScheduler 统一校验后
+        传入 (HBMCommandScheduler 是唯一配置入口)。两级默认启用 (cs=8, dfi=4)。
+        """
         self._banks = banks
         self._timing = timing
         self._eligibility = ColEligibilityChecker(banks, timing)
@@ -3344,6 +3488,60 @@ class ColScheduler:
         # True (默认) 保持 v19.3 行为; False 跳过 commit 模型.
         self._write_requires_data_ready = write_requires_data_ready
 
+        # ---- Prefetch Window (两级 bank 窗口, 替代 v21.1 Col Lock Window) ----
+        # cs 窗口: 按 bank 计量, col 命令 (R+W) 只能派发窗口内 bank 上的命令。
+        #   - 准入 (v7 严格主动, cs_prefetch_active_admit=True 默认): bank 被 ACT 后
+        #     入已 ACT 大池子, 由 BG 多样性筛选晋升入窗 (见 _promote_from_act_pool);
+        #     v0.3.1 被动准入 (False): bank 的首条 col 派发时占位 (准入顺序=派发序);
+        #   - 释放 (entry 级, 即时): 任一 entry 的全部 col 派发完的当拍立即
+        #     移出窗口 (bank 不默认保留位); 同 bank 其他在途 entry 若仍已 ACT
+        #     则回大池子重新晋升 (写在子窗口满时原地等待)。
+        #     refresh force-PRE 关闭 bank 时同样立即释放;
+        #   - 窗口满时窗口外 bank 的候选被跳过 (等空位)。
+        # dfi 写子窗口: cs 窗口内准入时间最早的前 dfi_window_size 个 bank。
+        #   写命令只能派发子窗口内 bank; 排在第 dfi 位之后的写原地等待前移,
+        #   期间不阻塞读命令。读命令可用 cs 窗口全部 bank。
+        # 两级均关闭 (enable=False 或 size=None) 时无限制 (等同 v20.1 行为)。
+        self._cs_window_enable: bool = (cs_prefetch_window_enable
+                                        and cs_prefetch_window is not None)
+        self._cs_window_size: int = cs_prefetch_window if self._cs_window_enable else 0
+        self._dfi_window_enable: bool = (dfi_prefetch_window_enable
+                                         and dfi_prefetch_window is not None
+                                         and self._cs_window_enable)
+        self._dfi_window_size: int = dfi_prefetch_window if self._dfi_window_enable else 0
+        # v7+: True = 严格主动准入 (大池子筛选晋升, 用户方案); False = v0.3.1 被动准入 (A/B 用)
+        self._cs_active_admit: bool = cs_prefetch_active_admit
+        self._cs_window: List[int] = []   #: 已准入 bank_id, 按准入时间升序 (index 0 = 最早)
+        # v7+ 已 ACT 大池子: 已 ACT (state ∈ {ACT_WAIT, ACTING}) 但尚未入窗的
+        # bank_id, 按 ACT 时间升序 (FIFO); 晋升/兜底时惰性剔除已回 IDLE 的陈旧项。
+        self._act_pool: List[int] = []
+        # bank_id → SID 映射 (来自 HBMCommandScheduler 顶层, 兼容保留)
+        self._bank_sid: List[int] = (list(bank_sid) if bank_sid is not None
+                                      else [0] * num_banks)
+        # 统计
+        self._cs_total_admits: int = 0      #: bank 占入窗口总次数
+        self._cs_total_releases: int = 0    #: bank 移出窗口总次数 (= entry 完成 + force-PRE)
+        self._cs_entry_complete_releases: int = 0  #: entry 全部 col 派发完触发的释放次数
+        self._cs_force_pre_releases: int = 0       #: refresh force-PRE 关闭 bank 触发的释放次数
+        self._cs_peak_used: int = 0         #: 窗口峰值占用 (bank 数)
+        self._cs_full_block_count: int = 0  #: cs 窗口满导致窗口外候选被跳过的次数 (实际派发路径)
+        self._dfi_write_wait_count: int = 0 #: 写候选因 bank 不在 dfi 子窗口被跳过的次数 (实际派发路径)
+        self._cs_occupancy_sum: int = 0     #: 每 cycle 窗口占用累计 (供平均)
+        self._cs_occupancy_cycles: int = 0
+        # v7+ 大池子主动准入统计
+        self._cs_active_admit_count: int = 0   #: 大池子主动晋升入窗次数
+        self._cs_bg_diversity_hits: int = 0    #: 晋升时选中"窗口内没有的 BG"的次数
+        self._cs_bg_fallback_count: int = 0    #: 无不同 BG 候选, 退回同 BG 的次数
+        self._cs_pool_total_activations: int = 0  #: ACT 入池总次数
+        self._cs_pool_peak_used: int = 0      #: 池子峰值占用 (bank 数)
+        self._cs_pool_occupancy_sum: int = 0  #: 每 cycle 池子占用累计 (供平均)
+        self._cs_pool_occupancy_cycles: int = 0
+        self._cs_stale_evict_releases: int = 0  #: v7.1 窗口陈旧项清扫逐出次数
+        self._cs_mode_evict_releases: int = 0   #: v7.2 切 RD/WR 态时逐出反向 serving bank 次数
+        # v7.2 dispatch_id → is_write 映射 (begin_cycle 从两 CAM 重建, ≤1 cycle 陈旧),
+        # 供窗口晋升的模式对齐优先 + 切态逐出使用
+        self._dispatch_type_cache: Dict[int, bool] = {}
+
         # v16.3+ 新增: 4 态 R/W 调度状态机
         self._rw_4state_mode: bool = rw_4state_mode
         self._rw_state: RWState = RWState.RD
@@ -3369,6 +3567,9 @@ class ColScheduler:
         self._rr_pointer_drain = 0
         self._current_stuck_cycles = 0   #: 当前 mode + drain 连续不可派发的 cycle 数
         self._drain_dispatch_count = 0   #: drain (in-flight 对向 txn 续发) 总次数
+        # HBM4: 当前 DFI cycle (CTL 域), begin_cycle 每 cycle 更新, 供 batch 模式
+        # (准备期 bookkeeping) 在 per-slot try_issue 时取用
+        self._current_ctl_cycle: int = 0
 
         # ---- 准备期状态 ----
         # _preparation_state is None → NORMAL 模式
@@ -3409,19 +3610,58 @@ class ColScheduler:
         self._write_page_hit_chain_count: int = 0
         self._read_page_hit_chain_count: int = 0
 
-    def try_issue(self, current_cycle: int,
+    def try_issue(self, current_slot: int,
                   read_cam: List[BurstCommandGroup],
                   write_cam: List[BurstCommandGroup]) -> Optional[ColumnCommand]:
-        """按模式选择调度策略, 尝试发一个 Col 命令.
+        """按模式选择调度策略, 在当前 dfi_phase_slot 尝试发一个 Col 命令.
 
-        v16.3+: rw_4state_mode=True 时走 4 态机 (RD/WR/RD_WR/WR_RD), 否则走
-        原有 batch (preparation) 或 alternating 模式.
+        HBM4: 每 DFI cycle 有 2 个 dfi_phase_slot (phase0→HBM phase0, phase1→HBM
+        phase2), 本方法每个 slot 调用一次 (每 cycle ≤ 2 条 col)。4 态机 / batch
+        准备期等 CTL 决策由 ``begin_cycle(current_cycle, ...)`` 每 DFI cycle
+        推进一次, 与 slot 派发解耦。
+
+        三层调度模式 (按优先级, batch_scheduling 是大类开关):
+          batch_scheduling=False
+              → 强制走 alternating (try opposite first), rw_4state_mode 被忽略
+          batch_scheduling=True + rw_4state_mode=True  (默认)
+              → 4 态 R/W 状态机 (RD/WR/RD_WR/WR_RD, v17+ 推荐)
+          batch_scheduling=True + rw_4state_mode=False
+              → 原 batch + preparation phase (v15-v16, 向后兼容)
         """
+        if not self._batch_scheduling:
+            return self._try_issue_alternating(current_slot, read_cam, write_cam)
         if self._rw_4state_mode:
-            return self._try_issue_4state(current_cycle, read_cam, write_cam)
-        if self._batch_scheduling:
-            return self._try_issue_batch(current_cycle, read_cam, write_cam)
-        return self._try_issue_alternating(current_cycle, read_cam, write_cam)
+            return self._try_issue_4state(current_slot, read_cam, write_cam)
+        return self._try_issue_batch(self._current_ctl_cycle, current_slot,
+                                     read_cam, write_cam)
+
+    def begin_cycle(self, current_cycle: int,
+                    read_cam: List[BurstCommandGroup],
+                    write_cam: List[BurstCommandGroup]) -> None:
+        """每 DFI cycle 开头调用一次: 推进 CTL 域决策 (占用采样 + 4 态机切换)。
+
+        与 per-slot 的 try_issue 解耦。v0.3.1 起窗口释放在派发点即时发生
+        (entry 完成即释放 / force-PRE 即释放), 这里只剩每 cycle 一次的
+        占用采样 (timer / dwell 仍为 DFI cycle 粒度)。
+        """
+        self._current_ctl_cycle = current_cycle
+        # v7.2: 重建 dispatch_id → is_write 映射 (必须在 promote/状态机之前,
+        # 晋升的模式对齐优先与切态逐出都要用它)
+        cache: Dict[int, bool] = {}
+        for cam in (read_cam, write_cam):
+            for e in cam:
+                if e.next_dispatch_index < len(e.commands):
+                    cache[e.commands[0].dispatch_id] = e.commands[0].is_write
+        self._dispatch_type_cache = cache
+        # prefetch window: v7 每 cycle 兜底尝试一次大池子晋升 (row/释放事件之外
+        # 的保险, 同时惰性清理池子陈旧项), 再做窗口占用采样 (释放已在派发点即时完成)
+        if self._cs_active_admit:
+            self._promote_from_act_pool()
+        self._sample_window_occupancy()
+        if not self._batch_scheduling:
+            return
+        if self._rw_4state_mode:
+            self._update_rw_state(current_cycle, read_cam, write_cam)
 
     # ---- v16.3+ 4 态 R/W 调度状态机 ----
 
@@ -3440,13 +3680,14 @@ class ColScheduler:
           WR_RD → RD  : RD CAM 有可派发命令 或 WR CAM 已空
                        或 **RD 已开 ≥ preparation_min_banks 个 ACT 且至少 1 个 col ready**
         """
-        # 统计: 上一 cycle 处于哪个 state
+        # 统计: 上一 cycle 处于哪个 state (begin_cycle 每 DFI cycle 调一次)
         self._rw_4state_cycles_in_state[self._rw_state.name] += 1
 
         state = self._rw_state
+        # AC 域检查统一用本 cycle 的 slot0 作代表 (CTL 决策启发式, 允许半 cycle 误差)
+        probe_slot = current_cycle * ClockModel.DFI_PHASE_SLOTS_PER_CYCLE
         rd_has = self._cam_has_unprocessed(read_cam, current_cycle)
         wr_has = self._cam_has_unprocessed(write_cam, current_cycle)
-
         if state == RWState.RD:
             if not rd_has and wr_has:
                 # 规则 1: RD CAM 空, WR 有活, 直切
@@ -3485,7 +3726,7 @@ class ColScheduler:
             #   c) WR 已开 ≥ preparation_min_banks 个 ACT 且 至少 1 个 col ready
             #      (target ACT 池足够 + 不需要等 tRCD, 可立即切到 WR)
             wr_dispatchable = wr_has and self._has_dispatchable(
-                current_cycle, RWType.WRITE, read_cam, write_cam)
+                probe_slot, RWType.WRITE, read_cam, write_cam)
             wr_acted_count = self._count_acted_banks_in_cam(write_cam, current_cycle)
             wr_target_ready = (wr_acted_count >= self._preparation_min_banks
                                and wr_dispatchable)
@@ -3503,7 +3744,7 @@ class ColScheduler:
             #   b) WR CAM 已空
             #   c) RD 已开 ≥ preparation_min_banks 个 ACT 且 至少 1 个 col ready
             rd_dispatchable = rd_has and self._has_dispatchable(
-                current_cycle, RWType.READ, read_cam, write_cam)
+                probe_slot, RWType.READ, read_cam, write_cam)
             rd_acted_count = self._count_acted_banks_in_cam(read_cam, current_cycle)
             rd_target_ready = (rd_acted_count >= self._preparation_min_banks
                                and rd_dispatchable)
@@ -3513,6 +3754,17 @@ class ColScheduler:
                 self._rw_4state_exit_transition += 1
                 if rd_target_ready and wr_has:
                     self._rw_4state_exit_via_target_act += 1
+
+        # v7.3: 切态不再触发窗口逐出 — 反向 serving bank 由纯态 drain 兜底派发
+        # (v7.2 的切态逐出实测造成 WR 态空窗活锁, 见 _try_issue_4state_with_drain)。
+
+    def _bank_serving_is_write(self, bank_id: int) -> Optional[bool]:
+        """v7.2: bank 当前 serving 的 dispatch 是读还是写 (None = 未知).
+
+        用 begin_cycle 重建的 dispatch_id → is_write 映射查 bank.serving_dispatch_id;
+        entry 已从 CAM 移除/未入 CAM 时 miss → None (不参与模式对齐判定)。
+        """
+        return self._dispatch_type_cache.get(self._banks[bank_id].serving_dispatch_id)
 
     def _count_acted_banks_in_cam(self, cam: List[BurstCommandGroup],
                                   current_cycle: int) -> int:
@@ -3536,40 +3788,65 @@ class ColScheduler:
                 acted_banks.add(entry.bank_id)
         return len(acted_banks)
 
-    def _try_issue_4state(self, current_cycle: int,
+    def _try_issue_4state(self, current_slot: int,
                           read_cam: List[BurstCommandGroup],
                           write_cam: List[BurstCommandGroup]) -> Optional[ColumnCommand]:
-        """4 态 R/W 调度主入口.
+        """4 态 R/W 调度主入口 (每个 dfi_phase_slot 调用一次).
 
-        每 cycle 流程:
-          1. _update_rw_state — 检查是否要切态
-          2. 根据当前 state 决定派发哪个 CAM 的 col 命令:
+        每 cycle 流程 (状态切换已移到 begin_cycle, 每 DFI cycle 一次):
+          1. begin_cycle/_update_rw_state — 检查是否要切态
+          2. 根据当前 state 决定派发哪个 CAM 的 col 命令 (本 slot, ≤1 条):
              - RD     : RD CAM RD 命令
              - WR     : WR CAM WR 命令
              - RD_WR  : RD CAM RD 命令 (drain), WR CAM 由 row 侧开 ACT
              - WR_RD  : WR CAM WR 命令 (drain), RD CAM 由 row 侧开 ACT
         """
-        self._update_rw_state(current_cycle, read_cam, write_cam)
         state = self._rw_state
 
         if state == RWState.RD:
-            return self._try_issue_of_type(current_cycle, RWType.READ, read_cam, write_cam)
+            return self._try_issue_4state_with_drain(
+                current_slot, RWType.READ, read_cam, write_cam)
         if state == RWState.WR:
-            return self._try_issue_of_type(current_cycle, RWType.WRITE, read_cam, write_cam)
+            return self._try_issue_4state_with_drain(
+                current_slot, RWType.WRITE, read_cam, write_cam)
         if state == RWState.RD_WR:
             # 过渡: 只发 RD (drain RD CAM), 不发 WR col
-            return self._try_issue_of_type(current_cycle, RWType.READ, read_cam, write_cam)
+            return self._try_issue_of_type(current_slot, RWType.READ, read_cam, write_cam)
         if state == RWState.WR_RD:
             # 过渡: 只发 WR (drain WR CAM), 不发 RD col
-            return self._try_issue_of_type(current_cycle, RWType.WRITE, read_cam, write_cam)
+            return self._try_issue_of_type(current_slot, RWType.WRITE, read_cam, write_cam)
         return None
+
+    def _try_issue_4state_with_drain(self, current_slot: int, r_w_type: RWType,
+                                     read_cam: List[BurstCommandGroup],
+                                     write_cam: List[BurstCommandGroup]) -> Optional[ColumnCommand]:
+        """v7.3 纯态派发 = 本侧优先 + drain 兜底 (与 legacy batch 的
+        _issue_current_else_drain 同语义).
+
+        背景 (linear_RW50_batch 复盘): 4 态机纯态只扫单侧 CAM 且无 drain。
+        linear RW50 下 R/W txn 打在同一批 bank 上, 进入 WR 态时若全部写 entry
+        都堵在读占用的 bank 上 (读未派完 → bank 不释放 → 写无 bank 可 ACT),
+        WR 态零派发, 只能等 800-cycle 定时器切态, 形成周期性长 stall。
+
+        对策: 本侧发不出时, 用 _try_drain_inflight 排空两个 CAM 中 bank 已
+        open serving 的 entry (含对向), 让被占 bank 尽快释放。drain 天然受
+        eligibility (txn 匹配) + cs/dfi 窗口约束, 不会乱序派发; 也自动治愈
+        dfi 子窗口被对向 serving bank 占据的污染 (drain 派完即腾位)。
+        """
+        col_cmd = self._try_issue_of_type(current_slot, r_w_type, read_cam, write_cam)
+        if col_cmd is not None:
+            return col_cmd
+        return self._try_drain_inflight(current_slot, read_cam, write_cam)
 
     # ---- Batch 策略 ----
 
-    def _try_issue_batch(self, current_cycle: int,
+    def _try_issue_batch(self, current_cycle: int, current_slot: int,
                          read_cam: List[BurstCommandGroup],
                          write_cam: List[BurstCommandGroup]) -> Optional[ColumnCommand]:
         """stick-to-one-side + 准备期 (preparation phase) 机制.
+
+        HBM4 双时间域: ``current_cycle`` (CTL) 用于准备期 bookkeeping / timeout,
+        ``current_slot`` (AC) 用于本 slot 的实际派发。
 
         这是两阶段切模式的核心入口, 优先级链:
 
@@ -3605,9 +3882,9 @@ class ColScheduler:
         # 卡死检测: 当前 mode 发不出, drain (in-flight 对向 txn) 也发不出.
         # 连续卡 STUCK_FALLBACK_CYCLES 以上才认为真卡死 (滤掉 tCCD/turnaround 短气泡).
         current_dispatchable = self._has_dispatchable(
-            current_cycle, current_type, read_cam, write_cam)
+            current_slot, current_type, read_cam, write_cam)
         drain_dispatchable = self._has_dispatchable_inflight(
-            current_cycle, read_cam, write_cam)
+            current_slot, read_cam, write_cam)
         if current_dispatchable or drain_dispatchable:
             self._current_stuck_cycles = 0
         else:
@@ -3616,7 +3893,8 @@ class ColScheduler:
 
         # ---- 1. 已在准备期 → 走准备期逻辑 ----
         if self._preparation_state is not None:
-            return self._continue_preparation(current_cycle, read_cam, write_cam)
+            return self._continue_preparation(current_cycle, current_slot,
+                                              read_cam, write_cam)
 
         # ---- 2a. timeout + A2 + 对向有活 → 检查 ready / 进 prep ----
         # A2 豁免: 当前侧真卡死时 (current+drain 都发不出), 不再有"先发 1 条"可等,
@@ -3631,10 +3909,11 @@ class ColScheduler:
                 self._current_batch_dispatch_count = 0
                 self._atomic_switch_count += 1
                 return self._try_issue_of_type(
-                    current_cycle, other_type, read_cam, write_cam)
+                    current_slot, other_type, read_cam, write_cam)
             # 2a-ii. 对向未 ready → 进 prep
             self._enter_preparation(other_type, current_cycle, read_cam, write_cam)
-            return self._continue_preparation(current_cycle, read_cam, write_cam)
+            return self._continue_preparation(current_cycle, current_slot,
+                                              read_cam, write_cam)
 
         # ---- 2b. empty-fallback: current CAM 全空, atomic 切 ----
         # 准备期救不了"current 模式真没活干"的场景, 这里直接跳切
@@ -3647,14 +3926,14 @@ class ColScheduler:
         # STUCK_FALLBACK_CYCLES 以上, 且对向现在就能发 → atomic 切.
         # 对向只是"有活但不可派发"时, 交给 2a 的 timeout/准备期处理.
         elif (self._current_stuck_cycles >= STUCK_FALLBACK_CYCLES
-                and self._has_dispatchable(current_cycle, other_type, read_cam, write_cam)):
+                and self._has_dispatchable(current_slot, other_type, read_cam, write_cam)):
             self._current_batch_type = other_type
             self._current_batch_dispatch_count = 0
             self._empty_fallback_count += 1
             current_type = other_type
 
         # ---- 2c. 正常发, 发不出则 drain in-flight 对向 txn ----
-        return self._issue_current_else_drain(current_cycle, current_type,
+        return self._issue_current_else_drain(current_slot, current_type,
                                               read_cam, write_cam)
 
     # ---- 准备期: 进入 / 检退出 / 继续 / 退出 / ready 判定 ----
@@ -3850,7 +4129,7 @@ class ColScheduler:
         # 永远等不到 target ready. CAM 不空就继续等 (drain/空转), 由 prep_timeout 兜底.
         current_cam = (read_cam if self._current_batch_type == RWType.READ
                        else write_cam)
-        if not self._cam_has_unprocessed(current_cam):
+        if not self._cam_has_unprocessed(current_cam, current_cycle):
             return 'current_empty'
 
         # 4. 兜底: 准备期总时长超限 (degraded).
@@ -3862,10 +4141,10 @@ class ColScheduler:
 
         return None
 
-    def _continue_preparation(self, current_cycle: int,
+    def _continue_preparation(self, current_cycle: int, current_slot: int,
                               read_cam: List[BurstCommandGroup],
                               write_cam: List[BurstCommandGroup]) -> Optional[ColumnCommand]:
-        """准备期每 cycle 的逻辑.
+        """准备期每 cycle 的逻辑 (current_cycle=CTL bookkeeping, current_slot=AC 派发).
 
         顺序: 检 exit → (退出则翻 mode + 发 target) → (没退则发 current R/W + dispatch_count++)
 
@@ -3877,17 +4156,19 @@ class ColScheduler:
         # 1. 检退出条件
         exit_reason = self._check_preparation_exit(current_cycle, read_cam, write_cam)
         if exit_reason is not None:
-            return self._exit_and_dispatch(current_cycle, exit_reason, read_cam, write_cam)
+            return self._exit_and_dispatch(current_cycle, current_slot, exit_reason,
+                                           read_cam, write_cam)
 
         # 2. 没退出, 继续发 current mode R/W, 发不出则 drain in-flight 对向 txn
         col_cmd = self._issue_current_else_drain(
-            current_cycle, self._current_batch_type, read_cam, write_cam)
+            current_slot, self._current_batch_type, read_cam, write_cam)
         if (col_cmd is not None
                 and (col_cmd.is_write == (self._current_batch_type == RWType.WRITE))):
             self._preparation_state['dispatch_count'] += 1
         return col_cmd
 
-    def _exit_and_dispatch(self, current_cycle: int, exit_reason: str,
+    def _exit_and_dispatch(self, current_cycle: int, current_slot: int,
+                           exit_reason: str,
                            read_cam: List[BurstCommandGroup],
                            write_cam: List[BurstCommandGroup]) -> Optional[ColumnCommand]:
         """退出准备期: 翻 mode, 清 prep_state, 累计 exit 统计 + 写入 per-prep history, 发 target R/W.
@@ -3917,8 +4198,8 @@ class ColScheduler:
             self._preparation_exit_counts.get(exit_reason, 0) + 1)
         self._preparation_state = None
 
-        # 发 target R/W (本 cycle)
-        return self._try_issue_of_type(current_cycle, target, read_cam, write_cam)
+        # 发 target R/W (本 slot)
+        return self._try_issue_of_type(current_slot, target, read_cam, write_cam)
 
     # ---- 公开 API: 准备期统计 (供 HBMCommandScheduler 写 summary) ----
 
@@ -4030,7 +4311,10 @@ class ColScheduler:
           - 4 态机过渡态关键: 过渡时不开新的 source 侧 ACT, 否则会重新打开
             source 侧 bank, 干扰 drain 语义
         """
-        # 4 态机路径
+        # batch_scheduling=False 强制走 alternating 视角 (row scheduler 看双 CAM)
+        if not self._batch_scheduling:
+            return list(read_cam) + list(write_cam)
+        # batch=True + 4 态机模式 (按 self._rw_state 决定 row 看哪个 CAM)
         if self._rw_4state_mode:
             state = self._rw_state
             if state == RWState.RD:
@@ -4043,53 +4327,68 @@ class ColScheduler:
             if state == RWState.WR_RD:
                 # 过渡 WR→RD: 只开 RD 的 bank (不开新 WR, 让现有 WR banks drain)
                 return list(read_cam)
-        # 兼容: Alternating 模式: 必须同时看两个 CAM
-        if not self._batch_scheduling:
-            return list(read_cam) + list(write_cam)
-        # Batch 模式 + 准备期: 目标 bank 也需要 ACT/PRE
+        # batch=True + 原 batch 模式 + 准备期: 目标 bank 也需要 ACT/PRE
         if self._preparation_state is not None:
             return list(read_cam) + list(write_cam)
-        # Batch 模式 + 正常: 只给当前 mode 的 CAM
+        # batch=True + 原 batch 模式 + 正常: 只给当前 mode 的 CAM
         if self._current_batch_type == RWType.READ:
             return list(read_cam)
         return list(write_cam)
 
     # ---- Alternating 策略 ----
 
-    def _try_issue_alternating(self, current_cycle: int,
+    def _try_issue_alternating(self, current_slot: int,
                                read_cam: List[BurstCommandGroup],
                                write_cam: List[BurstCommandGroup]) -> Optional[ColumnCommand]:
         """优先尝试相反类型, 不行再 fallback. 配合 tRTW 建模后, 切换方向被 block
-        期间只能 fallback, 自然形成长 R/W 段, 效果与 Batch 接近."""
+        期间只能 fallback, 自然形成长 R/W 段, 效果与 Batch 接近.
+
+        HBM4: 每个 dfi_phase_slot 调用一次 (每 cycle ≤ 2 条 col).
+        """
         preferred_type = _opposite_type(self._current_batch_type)
 
-        col_cmd = self._try_issue_of_type(current_cycle, preferred_type, read_cam, write_cam)
+        col_cmd = self._try_issue_of_type(current_slot, preferred_type, read_cam, write_cam)
         if col_cmd is not None:
             self._current_batch_type = preferred_type
             return col_cmd
 
-        return self._try_issue_of_type(current_cycle, self._current_batch_type,
+        return self._try_issue_of_type(current_slot, self._current_batch_type,
                                        read_cam, write_cam)
 
     # ---- 派发 ----
 
-    def _try_issue_of_type(self, current_cycle: int,
+    def _try_issue_of_type(self, current_slot: int,
                            r_w_type: RWType,
                            read_cam: List[BurstCommandGroup],
                            write_cam: List[BurstCommandGroup]) -> Optional[ColumnCommand]:
-        """指定 R/W 类型, RR 选一个派发; 命中后完成全部副作用"""
+        """指定 R/W 类型, RR 选一个派发; 命中后完成全部副作用.
+
+        HBM4: ``current_slot`` 为 dfi_phase_slot (AC 域); data ready 过滤用
+        DFI cycle (current_slot // 2, CTL 域)。
+
+        选择流程:
+          1. 收集 dispatchable (data ready + bank state + AC timing OK)
+          2. (enable 时) cs/dfi prefetch window 过滤:
+             - 窗口内候选优先 (续发, 保持命令聚焦于少数 bank);
+             - 窗口外候选: 读需 cs 窗口有空位, 写需子窗口有空位 (准入后
+               排在窗口末尾, 从准入起即受 dfi 子窗口闸约束);
+             - 写候选排在 dfi 子窗口之后 (窗口内等待或子窗口满) → 原地等待 (跳过)。
+          3. SID-aware 选优 (跨 SID 软优化, 与窗口正交)
+          4. RR 选 bank_id 命中
+        """
         is_write = (r_w_type == RWType.WRITE)
         target_cam = write_cam if is_write else read_cam
         rr_pointer = self._rr_pointer_write if is_write else self._rr_pointer_read
+        current_dfi_cycle = current_slot // ClockModel.DFI_PHASE_SLOTS_PER_CYCLE
 
         dispatchable = []
         for burst_entry in target_cam:
             if burst_entry.next_dispatch_index >= len(burst_entry.commands):
                 continue
-            if not _is_entry_data_ready(burst_entry, current_cycle):
+            if not _is_entry_data_ready(burst_entry, current_dfi_cycle):
                 continue
             col_cmd = burst_entry.commands[burst_entry.next_dispatch_index]
-            if self._eligibility.check(col_cmd, current_cycle, self._bus):
+            if self._eligibility.check(col_cmd, current_slot, self._bus):
                 dispatchable.append((burst_entry, col_cmd))
 
         if not dispatchable:
@@ -4097,20 +4396,35 @@ class ColScheduler:
 
         dispatchable.sort(key=lambda x: x[1].bank_id)
 
+        # ---- cs/dfi prefetch window 过滤 (enable 时生效) ----
+        if self._cs_window_enable:
+            pool = [(b, c) for b, c in dispatchable
+                    if self._window_allows_dispatch(c, count_stats=True)]
+            # 窗口内候选优先 (保持聚焦); 全部被 dfi 子窗口挡住时才用窗口外候选
+            in_pool = [(b, c) for b, c in pool if c.bank_id in self._cs_window]
+            if in_pool:
+                pool = in_pool
+            if not pool:
+                # 窗口内不可发 (dfi 等待) + 窗口外不可入 (满) → 本 slot 此 type 无 col 可派
+                return None
+        else:
+            pool = dispatchable
+
         # ---- SID-aware 选优 ----
         # 软优化: 同 SID (跟 bus.last_dispatch_sid 相同) 优先于跨 SID.
         # 跨 SID 仍受 _eligibility.check 内的 tCCDR 硬卡 (>= 2 DFI).
         # 同 SID 池空时退到跨 SID 池 (避免饿死).
         if self._sid_aware and self._bus.last_dispatch_sid >= 0:
             last_sid = self._bus.last_dispatch_sid
-            same_sid = [e for e in dispatchable if e[1].sid_id == last_sid]
-            cross_sid = [e for e in dispatchable if e[1].sid_id != last_sid]
+            same_sid = [e for e in pool if e[1].sid_id == last_sid]
+            cross_sid = [e for e in pool if e[1].sid_id != last_sid]
             # 统计
             self._sid_aware_same_hits += len(same_sid) > 0
             self._sid_aware_fallback += len(same_sid) == 0 and len(cross_sid) > 0
             pool = same_sid if same_sid else cross_sid
-        else:
-            pool = dispatchable
+
+        if not pool:
+            return None
 
         selected = next(
             (e for e in pool if e[1].bank_id >= rr_pointer),
@@ -4123,7 +4437,7 @@ class ColScheduler:
             self._rr_pointer_read = new_rr
 
         burst_entry, col_cmd = selected
-        self._complete_dispatch(burst_entry, col_cmd, current_cycle, target_cam)
+        self._complete_dispatch(burst_entry, col_cmd, current_slot, target_cam)
         return col_cmd
 
     @staticmethod
@@ -4148,13 +4462,17 @@ class ColScheduler:
         return min(candidates, key=lambda e: (e.entry_cycle, e.transaction_id, e.segment_id))
 
     def _complete_dispatch(self, burst_entry: BurstCommandGroup,
-                           col_cmd: ColumnCommand, current_cycle: int,
+                           col_cmd: ColumnCommand, current_slot: int,
                            target_cam: List[BurstCommandGroup]) -> None:
         """一笔派发的全部副作用: bank 状态 + autoprecharge 触发 + bus tracker +
-        batch 计数 + CAM 移除 (_try_issue_of_type 与 drain 共用)"""
+        batch 计数 + CAM 移除 (_try_issue_of_type 与 drain 共用).
+
+        HBM4: ``current_slot`` 为 dfi_phase_slot (AC 域); refresh deadline /
+        page-hit 串接的 data-ready 检查换算回 DFI cycle (CTL 域)。
+        """
         bank = self._banks[col_cmd.bank_id]
         bank.cols_dispatched += 1
-        bank.last_col_at = current_cycle
+        bank.last_col_at = current_slot
         bank.last_col_rw_type = RWType.WRITE if col_cmd.is_write else RWType.READ
 
         segment_complete = bank.cols_dispatched >= col_cmd.segment_cmd_count
@@ -4166,8 +4484,8 @@ class ColScheduler:
         next_page_hit = None
         auto_precharge_enabled = (self._write_auto_precharge if col_cmd.is_write
                                   else self._read_auto_precharge)
-        col_to_pre_delay = (self._timing.write_ap_cycles if col_cmd.is_write
-                            else self._timing.t_rtp_cycles)
+        col_to_pre_delay = (self._timing.write_ap_slots if col_cmd.is_write
+                            else self._timing.t_rtp_slots)
         refresh_guard = (self._wra_refresh_guard_cycles if col_cmd.is_write
                          else self._rda_refresh_guard_cycles)
         only_after_page_hit = (self._wra_only_after_page_hit if col_cmd.is_write
@@ -4175,19 +4493,22 @@ class ColScheduler:
 
         # 若 refresh 已 pending，或预计当前命令采用 WRA/RDA 后 bank 变为 IDLE 之前
         # refresh deadline 就会到达，则不再串接下一笔 page-hit，提前收尾。
-        projected_auto_pre_idle_cycle = max(
-            current_cycle + col_to_pre_delay,
-            bank.last_act_at + self._timing.t_ras_cycles,
-        ) + self._timing.t_rp_cycles
+        # (projected_idle 为 slot; next_refresh_cycle / guard 为 DFI cycle, ×2 对齐)
+        projected_auto_pre_idle_slot = max(
+            current_slot + col_to_pre_delay,
+            bank.last_act_at + self._timing.t_ras_slots,
+        ) + self._timing.t_rp_slots
         refresh_is_pending = bool(
             (self._refresh_pending is not None
              and self._refresh_pending[col_cmd.bank_id])
             or (self._next_refresh_cycle is not None
-                and projected_auto_pre_idle_cycle + refresh_guard
-                    >= self._next_refresh_cycle[col_cmd.bank_id])
+                and projected_auto_pre_idle_slot + refresh_guard * ClockModel.DFI_PHASE_SLOTS_PER_CYCLE
+                    >= self._next_refresh_cycle[col_cmd.bank_id] * ClockModel.DFI_PHASE_SLOTS_PER_CYCLE)
         )
         if auto_precharge_enabled and segment_complete and not refresh_is_pending:
-            next_page_hit = self._find_next_same_page_entry(burst_entry, target_cam, current_cycle)
+            next_page_hit = self._find_next_same_page_entry(
+                burst_entry, target_cam,
+                current_slot // ClockModel.DFI_PHASE_SLOTS_PER_CYCLE)
 
         use_auto_precharge = bool(
             auto_precharge_enabled
@@ -4200,13 +4521,13 @@ class ColScheduler:
         if col_cmd.is_write:
             if use_auto_precharge:
                 self._wra_count += 1
-                bank.start_write_auto_precharge(current_cycle, self._timing)
+                bank.start_write_auto_precharge(current_slot, self._timing)
             else:
                 self._normal_write_count += 1
         else:
             if use_auto_precharge:
                 self._rda_count += 1
-                bank.start_read_auto_precharge(current_cycle, self._timing)
+                bank.start_read_auto_precharge(current_slot, self._timing)
             else:
                 self._normal_read_count += 1
 
@@ -4227,16 +4548,28 @@ class ColScheduler:
             # 自动预充电关闭时继续使用显式 PRE
             bank.precharge_pending = True
 
-        self._bus.last_dispatch_cycle = current_cycle
-        self._bus.last_dispatch_cycle_per_bg[col_cmd.bank_group_id] = current_cycle
-        self._bus.last_dispatch_cycle_per_sid[col_cmd.sid_id] = current_cycle
+        self._bus.last_dispatch_slot = current_slot
+        self._bus.last_dispatch_slot_per_bg[col_cmd.bank_group_id] = current_slot
+        self._bus.last_dispatch_slot_per_sid[col_cmd.sid_id] = current_slot
         self._bus.last_rw_type = bank.last_col_rw_type
         self._bus.last_bank_group = col_cmd.bank_group_id
         self._bus.last_dispatch_sid = col_cmd.sid_id
 
         self._current_batch_dispatch_count += 1
 
+        # ---- cs prefetch window: bank 占位 (幂等, 安全网) ----
+        # v7 严格准入 (cs_prefetch_active_admit=True): bank 在 ACT 当拍已由大池子
+        # 筛选晋升入窗, 派发路径只可能是窗口内 bank → 此处 no-op 防呆;
+        # v0.3.1 被动准入 (False): bank 的首条 col 派发时占入窗口一个位
+        # (准入顺序 = 派发顺序, FIFO), 已在窗口中的 bank 为 no-op
+        # (含 page-hit chain 串接 / drain 续发)。
+        # 释放均为 entry 级即时 — entry 全部 col 派发完当拍立即释放
+        # (见本方法尾), force-PRE 关闭 bank 亦即时释放 (见编排器 row 段)。
+        self._admit_bank_to_window(col_cmd.bank_id)
+        was_first_dispatch = (burst_entry.next_dispatch_index == 0)
         burst_entry.next_dispatch_index += 1
+        will_be_done = (burst_entry.next_dispatch_index >= len(burst_entry.commands))
+
         # v20: write_data_buffer 释放. entry 已 commit (data_ready_cycle != SENTINEL)
         # 即占 N 个 slot, 全部 col dispatch 完后释放.
         # 注意: True/False 模式都释放 (False 模式 commit 也跑, WDB 也占空间).
@@ -4250,20 +4583,24 @@ class ColScheduler:
             buf_state["used"] -= len(burst_entry.commands)
         if burst_entry.next_dispatch_index >= len(burst_entry.commands):
             target_cam.remove(burst_entry)
+            # v0.3.1: entry 级即时释放 — 该 entry 的全部 col 已派发完, bank
+            # 立即移出窗口 (同 bank 其他在途 entry 不默认继承窗口位, 下次
+            # 派发时按准入条件重新排队尾)。
+            self._release_bank_from_window(col_cmd.bank_id, reason='entry_complete')
 
     # ---- drain: in-flight 对向 txn 续发 ----
 
-    def _issue_current_else_drain(self, current_cycle: int,
+    def _issue_current_else_drain(self, current_slot: int,
                                   current_type: RWType,
                                   read_cam: List[BurstCommandGroup],
                                   write_cam: List[BurstCommandGroup]) -> Optional[ColumnCommand]:
         """先发当前 mode; 发不出则 drain 两个 CAM 里的 in-flight txn (兜底防 stranding)"""
-        col_cmd = self._try_issue_of_type(current_cycle, current_type, read_cam, write_cam)
+        col_cmd = self._try_issue_of_type(current_slot, current_type, read_cam, write_cam)
         if col_cmd is not None:
             return col_cmd
-        return self._try_drain_inflight(current_cycle, read_cam, write_cam)
+        return self._try_drain_inflight(current_slot, read_cam, write_cam)
 
-    def _try_drain_inflight(self, current_cycle: int,
+    def _try_drain_inflight(self, current_slot: int,
                             read_cam: List[BurstCommandGroup],
                             write_cam: List[BurstCommandGroup]) -> Optional[ColumnCommand]:
         """扫描两个 CAM, 派发任何 bank 已打开且正在服务其 txn 的 cmd (RR 独立指针).
@@ -4273,20 +4610,28 @@ class ColScheduler:
         对向 CAM 里 bank 未打开的 entry 天然被 eligibility 的 bank 状态检查排除,
         不会变相提前启动对向 txn — drain 只续发, 不新开.
         """
+        current_dfi_cycle = current_slot // ClockModel.DFI_PHASE_SLOTS_PER_CYCLE
         dispatchable = []
         for cam in (read_cam, write_cam):
             for entry in cam:
                 if entry.next_dispatch_index >= len(entry.commands):
                     continue
-                if not _is_entry_data_ready(entry, current_cycle):
+                if not _is_entry_data_ready(entry, current_dfi_cycle):
                     continue
                 col_cmd = entry.commands[entry.next_dispatch_index]
-                if self._eligibility.check(col_cmd, current_cycle, self._bus):
+                if self._eligibility.check(col_cmd, current_slot, self._bus):
+                    if not self._window_allows_dispatch(col_cmd, count_stats=True):
+                        continue
                     dispatchable.append((entry, col_cmd))
         if not dispatchable:
             return None
 
         dispatchable.sort(key=lambda x: x[1].bank_id)
+        # 窗口内候选优先 (保持聚焦; drain 的 bank 通常已在窗口内)
+        if self._cs_window_enable:
+            in_pool = [e for e in dispatchable if e[1].bank_id in self._cs_window]
+            if in_pool:
+                dispatchable = in_pool
         selected = next(
             (e for e in dispatchable if e[1].bank_id >= self._rr_pointer_drain),
             dispatchable[0]
@@ -4295,38 +4640,43 @@ class ColScheduler:
 
         burst_entry, col_cmd = selected
         cam = write_cam if col_cmd.is_write else read_cam
-        self._complete_dispatch(burst_entry, col_cmd, current_cycle, cam)
+        self._complete_dispatch(burst_entry, col_cmd, current_slot, cam)
         self._drain_dispatch_count += 1
         return col_cmd
 
-    def _has_dispatchable_inflight(self, current_cycle: int,
+    def _has_dispatchable_inflight(self, current_slot: int,
                                    read_cam: List[BurstCommandGroup],
                                    write_cam: List[BurstCommandGroup]) -> bool:
-        """两个 CAM 里是否有 in-flight (bank 已打开服务其 txn) 可派发的 cmd"""
+        """两个 CAM 里是否有 in-flight (bank 已打开服务其 txn) 可派发的 cmd
+        (含 cs/dfi prefetch window 过滤, 探测无统计副作用)"""
+        current_dfi_cycle = current_slot // ClockModel.DFI_PHASE_SLOTS_PER_CYCLE
         for cam in (read_cam, write_cam):
             for entry in cam:
                 if entry.next_dispatch_index >= len(entry.commands):
                     continue
-                if not _is_entry_data_ready(entry, current_cycle):
+                if not _is_entry_data_ready(entry, current_dfi_cycle):
                     continue
                 col_cmd = entry.commands[entry.next_dispatch_index]
-                if self._eligibility.check(col_cmd, current_cycle, self._bus):
-                    return True
+                if self._eligibility.check(col_cmd, current_slot, self._bus):
+                    if self._window_allows_dispatch(col_cmd, count_stats=False):
+                        return True
         return False
 
     # ---- helpers ----
 
-    def _has_dispatchable(self, current_cycle: int, r_w_type: RWType,
+    def _has_dispatchable(self, current_slot: int, r_w_type: RWType,
                           read_cam: List[BurstCommandGroup],
                           write_cam: List[BurstCommandGroup]) -> bool:
-        """指定类型是否有可立即派发的 cmd (与 _try_issue_of_type 同一套检查, 无副作用)"""
+        """指定类型是否有可立即派发的 cmd
+        (与 _try_issue_of_type 同一套检查, 无副作用; 含窗口过滤)"""
         target_cam = write_cam if r_w_type == RWType.WRITE else read_cam
         for burst_entry in target_cam:
             if burst_entry.next_dispatch_index >= len(burst_entry.commands):
                 continue
             col_cmd = burst_entry.commands[burst_entry.next_dispatch_index]
-            if self._eligibility.check(col_cmd, current_cycle, self._bus):
-                return True
+            if self._eligibility.check(col_cmd, current_slot, self._bus):
+                if self._window_allows_dispatch(col_cmd, count_stats=False):
+                    return True
         return False
 
     @staticmethod
@@ -4349,22 +4699,289 @@ class ColScheduler:
             return 0
         return current_cycle - min_cycle
 
+    # ---- Prefetch Window 辅助方法 ----
+
+    def _admit_bank_to_window(self, bank_id: int) -> None:
+        """将 bank 占入 cs 窗口一个位 (幂等; 首条 col 派发时调用).
+
+        已在窗口中的 bank 为 no-op。窗口满时理论上不应到达
+        (_window_allows_dispatch 已在派发路径过滤), 到达则抛错防呆。
+        """
+        if not self._cs_window_enable:
+            return
+        if bank_id in self._cs_window:
+            return
+        if len(self._cs_window) >= self._cs_window_size:
+            raise RuntimeError(
+                "cs prefetch window 已满但试图 admit bank — "
+                "上层 _window_allows_dispatch 过滤漏判")
+        self._cs_window.append(bank_id)
+        self._cs_total_admits += 1
+        if len(self._cs_window) > self._cs_peak_used:
+            self._cs_peak_used = len(self._cs_window)
+
+    def _is_bank_window_eligible(self, bank_id: int) -> bool:
+        """v7.1 窗口/池子成员有效性: bank 当前是否有 (或将要有) 可派发的 col 工作.
+
+        有效 = ACT_WAIT (row 打开中, 其 entry 已在 CAM 等 tRCD)
+               或 ACTING 且未挂 precharge_pending (还有未派完的 col / page-hit 链).
+        无效 = PRE_WAIT / AUTO_PRE_WAIT / REFRESHING / IDLE (无派发工作),
+               或 ACTING + precharge_pending (该 bank 全部 col 已派完, 只等 PRE
+               收尾) — 这些 bank 占窗口位永远派发不出命令。
+
+        v7 教训 (linear_RW50_batch eff 0.745→0.132 复盘): 无逐出机制时,
+        entry 完成→释放→(仍 ACTING) 回池子→立即重新晋升 的"僵尸" bank
+        会把窗口钉死 (平均占用 7.88/8, 满阻塞 28 万次), 池子里真正有工作的
+        bank 进不来, 只能等 refresh force-PRE 慢慢腾位。
+        """
+        bank = self._banks[bank_id]
+        if bank.state == BankState.ACT_WAIT:
+            return True
+        return bank.state == BankState.ACTING and not bank.precharge_pending
+
+    def _on_bank_activated(self, bank_id: int) -> None:
+        """v7 ACT 事件钩子 (编排器 row 段在发出 ACT 当拍调用):
+        bank 进入已 ACT 大池子并立即尝试晋升入 cs 窗口.
+
+        大池子 = 已 ACT (state ∈ {ACT_WAIT, ACTING}) 但尚未入窗的 bank.
+        这是严格主动准入模式下窗口的唯一准入来源 (被动准入已移除)。
+        cs_prefetch_active_admit=False (v0.3.1 兼容模式) 时 no-op。
+        """
+        if not self._cs_window_enable or not self._cs_active_admit:
+            return
+        if bank_id in self._cs_window:
+            return
+        self._cs_pool_total_activations += 1
+        if bank_id not in self._act_pool:
+            self._act_pool.append(bank_id)
+        self._promote_from_act_pool()
+
+    def _promote_from_act_pool(self) -> None:
+        """v7 大池子主动筛选准入: 从池子选与窗口不冲突的 bank 晋升入 cs 窗口.
+
+        筛选规则 (严格模式, 用户方案):
+          1. 硬条件: 候选不在窗口中 (= 与当前窗口内 bank 不冲突) 且仍已 ACT
+             (state ∈ {ACT_WAIT, ACTING}); 已回 IDLE/PRE 的陈旧项惰性剔除;
+          2. 软优先: BG (bank.bank_group_id) 不在窗口已有 BG 集合中的候选优先
+             (不同 BG 打散, 减少 tCCDL/tRRDL 串行); 无不同 BG 候选时退回同 BG;
+          3. 同优先级内按 ACT 先后 (池子 FIFO 序, 即最早 ACT 优先);
+          4. 循环准入直到窗口满或池子无合格候选。
+
+        触发点: ACT 当拍 (_on_bank_activated) / 窗口释放回填
+        (_release_bank_from_window 末尾) / begin_cycle 每 cycle 兜底。
+        幂等: 窗口满且池子无候选时 no-op。
+        """
+        if not self._cs_window_enable or not self._cs_active_admit:
+            return
+        # v7.3 模式对齐参数: 仅 4 态机 + batch 模式下有意义 (alternating 模式
+        # 读写交替派发, 无偏好)。对齐只影响晋升优先级, 不做逐出 — 反向 serving
+        # bank 在窗内可被纯态 drain 兜底 (v7.3) 派发, 逐出反而造成空窗活锁。
+        use_align = self._batch_scheduling and self._rw_4state_mode
+        want_write = use_align and self._rw_state in (RWState.WR, RWState.RD_WR)
+        # 1. v7.1 陈旧项清扫: 窗口中已无可派发工作的 bank 立即逐出 (腾位给池子),
+        #    防止 entry 完成后被重新晋升的"僵尸" bank 钉死窗口 (见谓词 docstring)。
+        stale = [b for b in self._cs_window
+                 if not self._is_bank_window_eligible(b)]
+        for b in stale:
+            self._cs_window.remove(b)
+            self._cs_total_releases += 1
+            self._cs_stale_evict_releases += 1
+        # 2. 池子筛选晋升 (循环准入直到窗口满或无合格候选)
+        while len(self._cs_window) < self._cs_window_size:
+            cs_set = set(self._cs_window)
+            # 惰性清理: 只保留仍有效 (谓词通过) 且未入窗的候选 (FIFO 序保留)
+            valid = [b for b in self._act_pool
+                     if b not in cs_set and self._is_bank_window_eligible(b)]
+            if not valid:
+                self._act_pool = []
+                return
+            cs_bgs = {self._banks[b].bank_group_id for b in self._cs_window}
+            # v7.3 模式对齐优先 (主键): RD/WR_RD → 读 serving 优先, WR/RD_WR →
+            # 写 serving 优先 (过渡态 = target 侧准备); 无对齐候选时回退全量
+            # (进度优先 — 反向 bank 可被纯态 drain 派发, 见 _try_issue_4state_with_drain)。
+            if want_write:
+                aligned = [b for b in valid
+                           if self._bank_serving_is_write(b) is True]
+            elif use_align:
+                aligned = [b for b in valid
+                           if self._bank_serving_is_write(b) is False]
+            else:
+                # alternating 模式 (无 4 态机): 不做模式偏好, 纯 BG 多样性。
+                # (v7.3 曾实验 dfi 读写均衡启发, 实测 RW50_altern 劣化, 已回退。)
+                aligned = list(valid)
+            base = aligned if aligned else valid
+            priority = [b for b in base
+                        if self._banks[b].bank_group_id not in cs_bgs]
+            if priority:
+                chosen = priority[0]
+                self._cs_bg_diversity_hits += 1
+            else:
+                chosen = base[0]
+                self._cs_bg_fallback_count += 1
+            self._act_pool.remove(chosen)
+            self._cs_window.append(chosen)
+            self._cs_total_admits += 1
+            self._cs_active_admit_count += 1
+            if len(self._cs_window) > self._cs_peak_used:
+                self._cs_peak_used = len(self._cs_window)
+        # 窗口已满: 顺带清理池子中的陈旧项 (限制池子增长), 保留仍有效的等待者
+        cs_set = set(self._cs_window)
+        self._act_pool = [b for b in self._act_pool
+                          if b not in cs_set
+                          and self._is_bank_window_eligible(b)]
+
+    def _window_allows_dispatch(self, col_cmd: ColumnCommand,
+                                count_stats: bool = True) -> bool:
+        """检查 col_cmd 是否被 cs/dfi prefetch window 允许派发.
+
+        规则:
+          1. cs 窗口关闭 → 永远 True (无限制);
+          2. bank 已在 cs 窗口 → 读 True; 写还需 bank 在 dfi 子窗口
+             (窗口内准入最早前 _dfi_window_size 个) 内, 否则原地等待;
+          3. bank 不在 cs 窗口:
+             - v7 严格主动准入 (cs_prefetch_active_admit=True, 默认):
+               一律 False — 只能经大池子筛选晋升入窗 (ACT/释放事件触发);
+             - v0.3.1 被动准入 (False): 读需 cs 窗口有空位; 写须
+               len(window) < dfi 子窗口容量 (准入后排在窗口末尾, 从准入
+               起就受子窗口闸约束, 否则会绕过规则 2)。
+
+        count_stats=False 时只做判定不累加统计 (供 _has_dispatchable 等
+        无副作用探测使用, 避免统计被放大)。
+        """
+        if not self._cs_window_enable:
+            return True
+        bank_id = col_cmd.bank_id
+        if bank_id in self._cs_window:
+            if col_cmd.is_write and self._dfi_window_enable:
+                idx = self._cs_window.index(bank_id)
+                if idx >= self._dfi_window_size:
+                    # 写排在 dfi 子窗口之后 → 原地等待前移
+                    if count_stats:
+                        self._dfi_write_wait_count += 1
+                    return False
+            return True
+        # ---- 窗口外 ----
+        if self._cs_active_admit:
+            # v7 严格主动准入: 窗口外 bank 一律拒绝, 只能经大池子筛选晋升入窗。
+            # 触发点在 row/释放事件侧 (ACT 当拍 _on_bank_activated + 释放回填
+            # _release_bank_from_window + begin_cycle 兜底), 不依赖派发路径被
+            # 调用, 规避 v4 把筛选挂在派发路径导致的死锁 (full_block 单调上升)。
+            if count_stats:
+                self._cs_full_block_count += 1
+            return False
+        # ---- v0.3.1 被动准入语义保留 (cs_prefetch_active_admit=False, A/B 兼容) ----
+        if col_cmd.is_write and self._dfi_window_enable:
+            # 准入后排在窗口末尾, 必须已落在 dfi 子窗口内;
+            # 子窗口满 → 原地等待 (与窗口内写等待同一计数器)。
+            if len(self._cs_window) >= self._dfi_window_size:
+                if count_stats:
+                    self._dfi_write_wait_count += 1
+                return False
+            return True
+        # 窗口外读: 有空位才允许 (准入)
+        if len(self._cs_window) < self._cs_window_size:
+            return True
+        if count_stats:
+            self._cs_full_block_count += 1
+        return False
+
+    def _release_bank_from_window(self, bank_id: int, reason: str) -> None:
+        """将 bank 立即移出 cs 窗口 (entry 级即时释放, v0.3.1).
+
+        触发点:
+          - reason='entry_complete': 某 entry 的全部 col 派发完 (CAM 移除时);
+          - reason='force_pre'     : refresh force-PRE 关闭该 bank。
+
+        幂等: bank 不在窗口中为 no-op。释放后窗口 FIFO 前移, dfi 子窗口
+        (= 前 N 个) 自动更新。同 bank 其他在途 entry 不默认继承窗口位 —
+        下次派发时经 _window_allows_dispatch 重新准入 (写在子窗口满时
+        原地等待), 符合"每个 entry 独立过准入条件"的语义。
+        """
+        if not self._cs_window_enable:
+            return
+        if bank_id not in self._cs_window:
+            return
+        self._cs_window.remove(bank_id)
+        self._cs_total_releases += 1
+        if reason == 'entry_complete':
+            self._cs_entry_complete_releases += 1
+        elif reason == 'force_pre':
+            self._cs_force_pre_releases += 1
+        # v7 严格主动准入: 释放空出的窗口位立即从大池子回填; 若被释放的 bank
+        # 仍有效 (谓词通过: 有 page-hit 后继等待续派等), 也回池子参与晋升 —
+        # 通常其 ACT 最早 (池子 FIFO 头部), 立即重新入窗, 保持服务连续。
+        # v7.1: 无效 bank (已派完等 PRE 收尾) 不回池, 防止僵尸重新晋升。
+        if self._cs_active_admit:
+            if (bank_id not in self._act_pool
+                    and self._is_bank_window_eligible(bank_id)):
+                self._act_pool.append(bank_id)
+            self._promote_from_act_pool()
+
+    def _sample_window_occupancy(self) -> None:
+        """每 DFI cycle (begin_cycle) 采样一次窗口/大池子占用 (供平均统计)."""
+        if not self._cs_window_enable:
+            return
+        self._cs_occupancy_sum += len(self._cs_window)
+        self._cs_occupancy_cycles += 1
+        if self._cs_active_admit:
+            self._cs_pool_occupancy_sum += len(self._act_pool)
+            self._cs_pool_occupancy_cycles += 1
+            if len(self._act_pool) > self._cs_pool_peak_used:
+                self._cs_pool_peak_used = len(self._act_pool)
+
+    def get_prefetch_window_stats(self) -> dict:
+        """返回 cs/dfi prefetch window 统计 (供 summary 输出)."""
+        avg_occ = (self._cs_occupancy_sum / self._cs_occupancy_cycles
+                   if self._cs_occupancy_cycles else 0.0)
+        avg_pool = (self._cs_pool_occupancy_sum / self._cs_pool_occupancy_cycles
+                    if self._cs_pool_occupancy_cycles else 0.0)
+        return {
+            "cs_enabled": self._cs_window_enable,
+            "cs_size": self._cs_window_size,
+            "cs_used_end": len(self._cs_window),
+            "cs_peak_used": self._cs_peak_used,
+            "cs_avg_used": avg_occ,
+            "cs_full_block_count": self._cs_full_block_count,
+            "cs_total_admits": self._cs_total_admits,
+            "cs_total_releases": self._cs_total_releases,
+            "cs_entry_complete_releases": self._cs_entry_complete_releases,
+            "cs_force_pre_releases": self._cs_force_pre_releases,
+            "cs_stale_evict_releases": self._cs_stale_evict_releases,
+            "cs_mode_evict_releases": self._cs_mode_evict_releases,
+            "dfi_enabled": self._dfi_window_enable,
+            "dfi_size": self._dfi_window_size,
+            "dfi_write_wait_count": self._dfi_write_wait_count,
+            # v7+ 大池子主动准入统计
+            "cs_active_admit": self._cs_active_admit,
+            "cs_active_admit_count": self._cs_active_admit_count,
+            "cs_bg_diversity_hits": self._cs_bg_diversity_hits,
+            "cs_bg_fallback_count": self._cs_bg_fallback_count,
+            "cs_pool_total_activations": self._cs_pool_total_activations,
+            "cs_pool_peak_used": self._cs_pool_peak_used,
+            "cs_pool_avg_used": avg_pool,
+        }
+
 
 # ============================================================
 #  Simulation reporter (log + summary)
 # ============================================================
 
 class SimulationReporter:
-    """每 cycle 状态行 / summary 的格式化与双写 (console + 可选 log file)"""
+    """每 cycle 状态行 / summary 的格式化与双写 (console + 可选 log file)
 
-    _W_CYCLE, _W_REMAIN, _W_CAM, _W_ROW, _W_COL = 7, 18, 38, 34, 44
+    HBM4: 每 cycle 行显示 2 个 dfi_phase_slot 的命令明细 (slot0→HBM phase0,
+    slot1→HBM phase2, 即 MC0 的 phase0/phase1), 便于 debug phase 级时序。
+    """
+
+    _W_CYCLE, _W_REMAIN, _W_CAM, _W_SLOT, _W_CSW = 7, 18, 38, 72, 24
     HEADER = (f"  {'Cyc':>{_W_CYCLE}} | {'Remain':>{_W_REMAIN}} | "
-              f"{'CAM_Entry':>{_W_CAM}} | {'Row_Cmd':>{_W_ROW}} | {'Col_Cmd':>{_W_COL}}")
+              f"{'CAM_Entry':>{_W_CAM}} | {'Slot0':>{_W_SLOT}} | "
+              f"{'Slot1':>{_W_SLOT}} | {'CSW':>{_W_CSW}}")
     SEPARATOR = (f"  {'─'*_W_CYCLE}─┼─{'─'*_W_REMAIN}─┼─{'─'*_W_CAM}─┼─"
-                 f"{'─'*_W_ROW}─┼─{'─'*_W_COL}")
+                 f"{'─'*_W_SLOT}─┼─{'─'*_W_SLOT}─┼─{'─'*_W_CSW}")
 
     def __init__(self, log_fp: Optional[TextIO] = None, verbose_cycles: int = 200,
-                 banks_per_bank_group: int = 4, groups_per_sid: int = 4):
+                 banks_per_bank_group: int = 8, groups_per_sid: int = 2):
         """初始化对象状态及其依赖组件。"""
         self._log_fp = log_fp
         self._verbose_boundary = verbose_cycles
@@ -4405,12 +5022,18 @@ class SimulationReporter:
                           current_cycle: int,
                           cam_remaining: Tuple[int, int],
                           entered_entry: Optional[BurstCommandGroup],
-                          row_cmd: Optional[RowCommand],
-                          col_cmd: Optional[ColumnCommand],
-                          wdb_remaining: Optional[int] = None) -> str:
-        """把一个 cycle 的状态拼成对齐的一行 (无操作的列用 "--")
+                          row_cmds: List[Optional[RowCommand]],
+                          col_cmds: List[Optional[ColumnCommand]],
+                          wdb_remaining: Optional[int] = None,
+                          cs_window_banks: Optional[List[int]] = None,
+                          cs_window_enabled: bool = True) -> str:
+        """把一个 DFI cycle 的状态拼成对齐的一行 (两个 dfi_phase_slot 各一列)。
 
+        row_cmds / col_cmds 为长度 2 的列表 (slot0/slot1 各自派发的命令, 无则 None)。
+        slot0 → HBM phase0, slot1 → HBM phase2 (MC0 视角)。
         wdb_remaining=None 时向后兼容旧格式 (仅 R/W), 否则追加 WDBxxx.
+        cs_window_banks/cs_window_enabled: CSW 列 (cs_prefetch_window 当前占用 bank_id,
+        按准入时间升序); enable=False 时显示 "--", 启用但当前空显示 "{}".
         """
         read_remain, write_remain = cam_remaining
         if wdb_remaining is None:
@@ -4428,19 +5051,38 @@ class SimulationReporter:
         else:
             cam_s = "--"
 
+        slot0_s = self._format_slot(0, row_cmds[0], col_cmds[0])
+        slot1_s = self._format_slot(1, row_cmds[1], col_cmds[1])
+
+        # CSW 列: 关闭 → "--"; 启用空 → "{}"; 有 bank → "{0, 1, 9, 11}"
+        if not cs_window_enabled:
+            csw_s = "--"
+        else:
+            csw_s = "{" + ", ".join(str(b) for b in (cs_window_banks or [])) + "}"
+
+        return (f"  {current_cycle:>{self._W_CYCLE}} | {remain_s:>{self._W_REMAIN}} | "
+                f"{cam_s:>{self._W_CAM}} | {slot0_s:>{self._W_SLOT}} | "
+                f"{slot1_s:>{self._W_SLOT}} | {csw_s:>{self._W_CSW}}")
+
+    def _format_slot(self, slot_idx: int,
+                     row_cmd: Optional[RowCommand],
+                     col_cmd: Optional[ColumnCommand]) -> str:
+        """单个 dfi_phase_slot 的 'R[...] C[...]' 片段 (无任何命令时 '--').
+
+        phase 信息由列位置 (Slot0/Slot1) 隐含, 不再逐行重复打印。
+        """
         row_s = ("--"
                  if not row_cmd
                  else f"{row_cmd.kind.value} {self._addr(row_cmd.bank_id)} row--"
                  if row_cmd.kind == RowCommandType.REFPB
                  else f"{row_cmd.kind.value} {self._addr(row_cmd.bank_id)} row{row_cmd.row_id}")
-
-        col_s = (f"{self._addr(col_cmd.bank_id)} txn={col_cmd.transaction_id} "
-                 f"col={col_cmd.col_index} "
-                 f"{('WRA' if col_cmd.is_write else 'RDA') if col_cmd.auto_precharge else ('W' if col_cmd.is_write else 'R')}"
+        col_s = (f"{('WRA' if col_cmd.is_write else 'RDA') if col_cmd.auto_precharge else ('W' if col_cmd.is_write else 'R')}"
+                 f" {self._addr(col_cmd.bank_id)} txn={col_cmd.transaction_id}"
+                 f" col={col_cmd.col_index}"
                  if col_cmd else "--")
-
-        return (f"  {current_cycle:>{self._W_CYCLE}} | {remain_s:>{self._W_REMAIN}} | "
-                f"{cam_s:>{self._W_CAM}} | {row_s:>{self._W_ROW}} | {col_s:>{self._W_COL}}")
+        if row_s == "--" and col_s == "--":
+            return "--"
+        return f"R[{row_s}] C[{col_s}]"
 
     def print_lines(self, lines: List[str]) -> None:
         """按顺序输出多行日志文本。"""
@@ -4453,7 +5095,7 @@ class SimulationReporter:
 # ============================================================
 
 class HBMCommandScheduler:
-    """HBM3 内存控制器命令调度器 (DFI 视角) 编排器.
+    """HBM4 内存控制器命令调度器 (DFI 视角) 编排器.
 
     每个 cycle 的执行顺序 (`_run_one_cycle`):
       1. `_try_admit_burst_entry`  — 按节流把下一个 burst command group 入对应 R/W CAM
@@ -4475,30 +5117,51 @@ class HBMCommandScheduler:
 
     def __init__(self,
                  # ---- Clock model ----
-                 data_rate_gbps: float = 9.6,
-                 # ---- DRAM 结构 ----
+                 data_rate_gbps: float = 12.0,
+                 # ---- DRAM 颗粒 (die) 参数 (结构 + AC timing + die refresh, 集中一处) ----
+                 # v1.2: AC timing 默认 = HBM4_12000.xlsx (12 Gbps 档, CK=3 GHz, 表值单位 CK);
+                 #       双单位对 CK/ns 两路各换算成 dfi_phase_slot 后取 max (0 = 该路不约束),
+                 #       v1.2 默认全走 CK 路 (ns 路为 0)。
+                 # 结构
                  num_banks: int = 48,
-                 banks_per_bank_group: int = 4,
-                 # ---- Bank timing (ns / HBM CK 输入) ----
-                 t_rcdrd_ns: float = 18.0,
-                 t_rcdwr_ns: float = 12.0,
-                 t_rp_ns:    float = 18.0,
-                 t_rc_ns:    float = 52.0,
-                 t_ras_ns:   float = 34.0,
-                 t_rtp_hbmck: int   = 5,
-                 t_wr_ns:    float   = 21.0,
-                 wl_hbmck:   int     = 16,
-                 # ---- 通道 timing (cycles, 除 t_faw 用 HBM CK) ----
-                 t_ccd_s: int = 1,
-                 t_ccd_l: int = 3,
-                 t_ccdr_cycles: int = 2,        # HBM3 inter-SID tCCDR（READ only）；输入单位为 DFI/model cycle
-                 t_rrd_s: int = 3,
-                 t_rrd_l: int = 3,
-                 t_faw_hbmck: int = 24,
-                 # ---- R/W Turnaround ----
-                 t_rtw_ns:  float = 23.0,
-                 t_wtrl_hbmck: int = 4,
-                 t_wtrs_hbmck: int = 2,
+                 banks_per_bank_group: int = 8,
+                 # Bank timing (CK / ns 双单位原始输入, 换算见 TimingParameters.from_inputs)
+                 t_rcdrd_hbmck: int = 57,         # CK 路: tRCDRD (表 57 CK)
+                 t_rcdrd_ns: float = 0.0,         # ns  路: tRCDRD
+                 t_rcdwr_hbmck: int = 43,         # CK 路: tRCDWR (表 43 CK)
+                 t_rcdwr_ns: float = 0.0,         # ns  路: tRCDWR
+                 t_rp_hbmck: int = 45,            # CK 路: tRP (表 45 CK)
+                 t_rp_ns: float = 0.0,            # ns  路: tRP
+                 t_rc_hbmck: int = 135,           # CK 路: tRC (表 135 CK)
+                 t_rc_ns: float = 0.0,            # ns  路: tRC
+                 t_ras_hbmck: int = 90,           # CK 路: tRAS (表 90 CK)
+                 t_ras_ns: float = 0.0,           # ns  路: tRAS
+                 t_rtp_hbmck: int = 12,           # CK: tRTP (表 12 CK)
+                 t_wr_hbmck: int = 60,            # CK 路: tWR (表 60 CK; write_ap=WL+2+tWR)
+                 t_wr_ns: float = 0.0,            # ns  路: tWR
+                 wl_hbmck: int = 14,              # CK: WL (表 14 CK)
+                 # 通道 timing (CK 输入; 内部统一换算为 dfi_phase_slot, 1 slot = 2 nCK = 0.5 DFI)
+                 t_ccd_s: int = 2,          # CK: 跨 BG col→col 间隔 (表 2 CK → 1 slot)
+                 t_ccd_l: int = 5,          # CK: 同 BG col→col 间隔 (表 5 CK → 3 slots)
+                 t_ccdr_hbmck: int = 2,     # CK: inter-SID tCCDR (READ only, 表 2 CK → 1 slot)
+                 # 双单位约束对: 两路各自换算成 slot 后取 max 作为最终约束 (0 = 该路不约束)
+                 t_rrd_s: int = 6,          # CK 路: 跨 BG ACT→ACT (短, 表 6 CK)
+                 t_rrd_s_ns: float = 0.0,   # ns  路: 跨 BG ACT→ACT (短)
+                 t_rrd_l: int = 6,          # CK 路: 同 BG ACT→ACT (长, 表 6 CK)
+                 t_rrd_l_ns: float = 0.0,   # ns  路: 同 BG ACT→ACT (长)
+                 t_faw_hbmck: int = 24,     # CK 路: tFAW rolling window (4 ACT, 表 24 CK)
+                 t_faw_ns: float = 0.0,     # ns  路: tFAW rolling window (4 ACT)
+                 # R/W Turnaround (tRTW 双单位: CK/ns 两路各换算成 slot 后取 max)
+                 t_rtw_hbmck: int = 65,     # CK 路: R→W (表 tRTW 无值 "-", 保留 65 CK)
+                 t_rtw_ns:  float = 0,      # ns  路: R→W (与 t_rtw_hbmck 取 max)
+                 t_wtrl_hbmck: int = 16,    # CK: W→R (same bg, 表 16 CK)
+                 t_wtrs_hbmck: int = 14,    # CK: W→R (diff bg, 表 14 CK)
+                 # die refresh (颗粒级: per-bank refresh 命令耗时, bank 阻塞时间)
+                 t_rfc_pb_hbmck: int = 720,     # CK 路: tRFCpb (表 720 CK, 240ns/LC-200ns)
+                 t_rfc_pb_ns: float = 0.0,      # ns  路: tRFCpb
+                 # REFpb → REFpb / REFpb → ACT 最小间隔 (CK/ns 双单位)
+                 t_rrefd_hbmck: int = 24,       # CK 路: tRREFD (表 24 CK)
+                 t_rrefd_ns: float = 0.0,       # ns  路: tRREFD
                  # ---- CAM 深度 ----
                  read_cam_depth:  int = 32,
                  write_cam_depth: int = 32,
@@ -4568,10 +5231,9 @@ class HBMCommandScheduler:
                  #   所以本参数物理意义 = per-bank interval ≈ tREFI (设备级), 8-High 默认 4680 cycles.
                  # 历史值备注: 早期默认 2340 (= 1.95μs = tREFI/2, 协议里没这个数, 应是笔误);
                  #            中间改成 307 (= rolling 256ns) 后 case 1 perf 跌到 0.275 (过严).
-                 #: per-bank refresh 间隔 cycles (~3.9 μs @ 1.2 GHz DFI, = tREFI per 8-High)
-                 t_refi_per_bank_cycles: int = 4680,
-                 #: per-bank refresh 命令耗时 (~200 ns, bank 阻塞时间)
-                 t_rfc_pb_ns: float = 200.0,
+                 #: per-bank refresh 间隔 cycles (~3.9 μs @ 1 GHz DFI, = tREFI per bank)
+                 t_refi_per_bank_cycles: int = 3900,
+                 # (t_rfc_pb_ns 已归入上方 DRAM 颗粒参数段)
                  #: 触发 mandatory 的 debt 阈值 (REFpb 个数, 默认 8)
                  max_postpone_credits: int = 8,
                  #: 协议 "refresh postpone all bank" 上限轮数 (9×tREFI); fail-fast debt 上限 = 该值 × num_banks
@@ -4597,7 +5259,21 @@ class HBMCommandScheduler:
                  # ACT 调度时, 优先选 ACT 等待最久的 bank (age 优先级)
                  # 防止调度偏向, 保证公平. False = 退回 v17 (仅 BG 交织 + RR).
                  # 优先级链: age (desc) > BG 交织 (tiebreaker) > RR.
-                 age_priority: bool = True):
+                 age_priority: bool = True,
+                 # ---- Prefetch Window (两级 bank 窗口, 替代 v21.1 Col Lock Window) ----
+                 #: cs 窗口: 按 bank 计量 (默认 8)。col 命令 (R+W) 只能调度窗口内
+                 #: bank 上的命令; bank 在其首条 col 派发时占位 (FIFO), 该 bank 全部
+                 #: 命令派发完后释放, 窗口滚动向前。None 或 enable=False 关闭 (= 无限制)。
+                 cs_prefetch_window_enable: bool = False,
+                 cs_prefetch_window: Optional[int] = 8,
+                 #: dfi 写子窗口: cs 窗口内准入时间最早的前 N 个 bank (默认 4, <= cs 窗口)。
+                 #: 写命令只能调度子窗口内 bank, 排在后面的原地等待前移; 读不受限。
+                 dfi_prefetch_window_enable: bool = False,
+                 dfi_prefetch_window: Optional[int] = 4,
+                 #: v7+: True (默认) = cs 窗口严格主动准入 (bank 被 ACT 后入大池子,
+                 #: BG 多样性筛选晋升入窗, 派发路径不再被动占位);
+                 #: False = v0.3.1 被动准入 (首条 col 派发时占位), 供 A/B 对比。
+                 cs_prefetch_active_admit: bool = True):
         """构造调度器: 参数校验 → clock/timing → workload/banks → schedulers.
 
         Raises:
@@ -4628,14 +5304,37 @@ class HBMCommandScheduler:
                 f"txn_id_assignment 必须是 'sequential' 或 'random', 当前 '{txn_id_assignment}'")
         self._txn_id_assignment = txn_id_assignment
 
+        # ---- Prefetch Window 参数校验 (两级 bank 窗口) ----
+        # 有效 = enable 且 size 非 None (两者任一关闭即该级不生效)。
+        cs_pw_eff = cs_prefetch_window_enable and cs_prefetch_window is not None
+        dfi_pw_eff = dfi_prefetch_window_enable and dfi_prefetch_window is not None
+        if cs_pw_eff and cs_prefetch_window < 1:
+            raise ValueError(
+                f"cs_prefetch_window 必须 >= 1, 当前 {cs_prefetch_window}")
+        if dfi_pw_eff:
+            if not cs_pw_eff:
+                raise ValueError(
+                    "dfi_prefetch_window 启用时 cs_prefetch_window 必须同时启用 "
+                    "(dfi 是 cs 窗口的子窗口)")
+            if dfi_prefetch_window < 1:
+                raise ValueError(
+                    f"dfi_prefetch_window 必须 >= 1, 当前 {dfi_prefetch_window}")
+            if dfi_prefetch_window > cs_prefetch_window:
+                raise ValueError(
+                    f"dfi_prefetch_window ({dfi_prefetch_window}) 必须 <= "
+                    f"cs_prefetch_window ({cs_prefetch_window})")
+
+        # 注: Prefetch Window 校验已在前段完成 (两级 bank 窗口参数)。
+
         num_bank_groups = num_banks // banks_per_bank_group
         # Derive and validate configuration/density/remap before creating config/workload.
         resolved_configuration, resolved_density_code, geometry = _normalize_configuration(
             num_banks, configuration, density_code)
         resolved_addr_map = (dict(addr_map) if addr_map is not None
-                             else _default_addr_map_for(geometry["sid_remap_type"]))
+                             else _default_addr_map_for(geometry["sid_remap_type"],
+                                                        resolved_configuration))
         _validate_addr_map(resolved_addr_map, geometry["sid_remap_type"], geometry["effective_bits"])
-        # HBM3 SID 数 (per JESD238B.01 Table 5 + NOTE 7): 16→1, 32→2, 48→3, 64→4
+        # HBM4 SID 数 (每 16 bank 一个 SID): 16→1, 32→2, 48→3, 64→4
         num_sid, _ = _compute_sid_layout(num_banks, banks_per_bank_group)
 
         # 提前构造 clock/timing 以便把 tRL 转换为 cycles
@@ -4647,11 +5346,18 @@ class HBMCommandScheduler:
             num_banks=num_banks,
             banks_per_bank_group=banks_per_bank_group,
             num_bank_groups=num_bank_groups,
-            t_rcdrd_ns=t_rcdrd_ns, t_rcdwr_ns=t_rcdwr_ns,
-            t_rp_ns=t_rp_ns, t_rc_ns=t_rc_ns, t_ras_ns=t_ras_ns,
-            t_rtp_hbmck=t_rtp_hbmck, t_wr_ns=t_wr_ns, wl_hbmck=wl_hbmck,
-            t_ccd_s=t_ccd_s, t_ccd_l=t_ccd_l,
-            t_rrd_s=t_rrd_s, t_rrd_l=t_rrd_l, t_faw_hbmck=t_faw_hbmck,
+            t_rcdrd_ns=t_rcdrd_ns, t_rcdrd_hbmck=t_rcdrd_hbmck,
+            t_rcdwr_ns=t_rcdwr_ns, t_rcdwr_hbmck=t_rcdwr_hbmck,
+            t_rp_ns=t_rp_ns, t_rp_hbmck=t_rp_hbmck,
+            t_rc_ns=t_rc_ns, t_rc_hbmck=t_rc_hbmck,
+            t_ras_ns=t_ras_ns, t_ras_hbmck=t_ras_hbmck,
+            t_rtp_hbmck=t_rtp_hbmck,
+            t_wr_ns=t_wr_ns, t_wr_hbmck=t_wr_hbmck, wl_hbmck=wl_hbmck,
+            t_ccd_s=t_ccd_s, t_ccd_l=t_ccd_l, t_ccdr_hbmck=t_ccdr_hbmck,
+            t_rrd_s=t_rrd_s, t_rrd_s_ns=t_rrd_s_ns,
+            t_rrd_l=t_rrd_l, t_rrd_l_ns=t_rrd_l_ns,
+            t_faw_hbmck=t_faw_hbmck, t_faw_ns=t_faw_ns,
+            t_rtw_hbmck=t_rtw_hbmck,
             t_rtw_ns=t_rtw_ns, t_wtrl_hbmck=t_wtrl_hbmck, t_wtrs_hbmck=t_wtrs_hbmck,
             read_cam_depth=read_cam_depth, write_cam_depth=write_cam_depth,
             write_data_ready_delay=write_data_ready_delay,
@@ -4679,8 +5385,14 @@ class HBMCommandScheduler:
             rda_refresh_guard_cycles=rda_refresh_guard_cycles,
             wra_only_after_page_hit=wra_only_after_page_hit,
             rda_only_after_page_hit=rda_only_after_page_hit,
+            cs_prefetch_window_enable=cs_prefetch_window_enable,
+            cs_prefetch_window=cs_prefetch_window,
+            dfi_prefetch_window_enable=dfi_prefetch_window_enable,
+            dfi_prefetch_window=dfi_prefetch_window,
+            cs_prefetch_active_admit=cs_prefetch_active_admit,
             t_refi_per_bank_cycles=t_refi_per_bank_cycles,
             t_rfc_pb_ns=t_rfc_pb_ns,
+            t_rfc_pb_hbmck=t_rfc_pb_hbmck,
             t_rl_ns=t_rl_ns,
             link_node_count=link_node_count,
             link_list_count=link_list_count,
@@ -4711,7 +5423,20 @@ class HBMCommandScheduler:
             t_ccd_s, t_ccd_l, t_rrd_s, t_rrd_l, t_faw_hbmck,
             t_rtw_ns, t_wtrl_hbmck, t_wtrs_hbmck,
             t_rfc_pb_ns=t_rfc_pb_ns,
-            t_ccdr_cycles=t_ccdr_cycles,
+            t_ccdr_hbmck=t_ccdr_hbmck,
+            t_rrefd_ns=t_rrefd_ns,
+            t_rcdrd_hbmck=t_rcdrd_hbmck,
+            t_rcdwr_hbmck=t_rcdwr_hbmck,
+            t_rp_hbmck=t_rp_hbmck,
+            t_rc_hbmck=t_rc_hbmck,
+            t_ras_hbmck=t_ras_hbmck,
+            t_wr_hbmck=t_wr_hbmck,
+            t_rfc_pb_hbmck=t_rfc_pb_hbmck,
+            t_rrefd_hbmck=t_rrefd_hbmck,
+            t_rrd_s_ns=t_rrd_s_ns,
+            t_rrd_l_ns=t_rrd_l_ns,
+            t_faw_ns=t_faw_ns,
+            t_rtw_hbmck=t_rtw_hbmck,
         )
         self._timing.validate()
 
@@ -4775,6 +5500,7 @@ class HBMCommandScheduler:
             self._banks, self._timing, num_banks, num_bank_groups, num_sid,
             cmds_per_transaction, batch_scheduling, batch_timeout_cycles,
             initial_rw_type,
+            bank_sid=self._bank_sid,
             preparation_min_banks=preparation_min_banks,
             preparation_max_dispatches=preparation_max_dispatches,
             preparation_max_cycles=preparation_max_cycles,
@@ -4790,8 +5516,12 @@ class HBMCommandScheduler:
             rw_4state_mode=rw_4state_mode,
             write_data_buffer_state=self._write_data_buffer_state,
             write_requires_data_ready=write_requires_data_ready,
+            cs_prefetch_window_enable=cs_prefetch_window_enable,
+            cs_prefetch_window=cs_prefetch_window,
+            dfi_prefetch_window_enable=dfi_prefetch_window_enable,
+            dfi_prefetch_window=dfi_prefetch_window,
+            cs_prefetch_active_admit=cs_prefetch_active_admit,
         )
-
         # ---- CAM + 准入节流 (v6.6: R/W 独立节流 + W col 累加器) ----
         self._read_cam: List[BurstCommandGroup] = []
         self._write_cam: List[BurstCommandGroup] = []
@@ -4851,6 +5581,7 @@ class HBMCommandScheduler:
         if write_data_buffer_depth < 1:
             raise ValueError(
                 f"write_data_buffer_depth 必须 >= 1, 当前 {write_data_buffer_depth}")
+        # Prefetch Window 校验在 __init__ 前段完成 (cs >= 1, 1 <= dfi <= cs)。
 
     # --------------------------------------------------------
     #  公开 API
@@ -4859,7 +5590,8 @@ class HBMCommandScheduler:
     def simulate(self,
                  verbose_cycles: int = 200,
                  log_fp: Optional[TextIO] = None) -> float:
-        """跑仿真, 返回 perf (cmds/cycle); 超 max_cycles 异常终止返回 0.0"""
+        """跑仿真, 返回 efficiency = (cmds/DFI cycle)/2 (满带宽 2 cmd/cycle, 满分 1.0);
+        超 max_cycles 异常终止返回 0.0"""
         _, groups_per_sid = _compute_sid_layout(
             self._config.num_banks, self._config.banks_per_bank_group)
         reporter = SimulationReporter(
@@ -4894,111 +5626,131 @@ class HBMCommandScheduler:
 
         elapsed_cycles = self._performance_elapsed_cycles()
         perf = total_cmds / elapsed_cycles if elapsed_cycles > 0 else 0.0
+        # HBM4: 满带宽 = 每 DFI cycle 2 条 col (2 个 dfi_phase_slot)。
+        # 性能口径只输出 efficiency = (cmds/DFI cycle) / 2, 满分 1.0。
+        efficiency = perf / ClockModel.DFI_PHASE_SLOTS_PER_CYCLE
         reporter.print_lines(
-            self._build_summary_lines(total_cmds, current_cycle, elapsed_cycles, perf))
-        return perf
+            self._build_summary_lines(total_cmds, current_cycle, elapsed_cycles, efficiency))
+        return efficiency
 
     def _run_one_cycle(self, current_cycle: int,
                        reporter: SimulationReporter,
                        verbose_cycles: int) -> int:
-        """一个 cycle: 入 CAM → tick banks → refresh vs row → col → log.
+        """一个 DFI cycle: CTL 段 (commit/admit) → 2×dfi_phase_slot (tick/row/col) → CTL 收尾/log。
 
-        ref_priority 策略:
+        HBM4 双时间域:
+          - CTL 段 (每 DFI cycle 一次): WDB commit, burst 准入 (R 1 entry/cycle,
+            W 2 col/cycle), refresh/col 调度器决策推进, link node data-ready/释放
+            (2 nodes/cycle), 性能统计。
+          - AC 段 (每 cycle 2 个 dfi_phase_slot: slot0→HBM phase0, slot1→HBM phase2,
+            即 MC0 的 phase0/phase1): bank tick + refresh/row 仲裁 (每 slot ≤1 条 row)
+            + col 派发 (每 slot ≤1 条, 受 tCCDS=1 slot / tCCDL=3 slots 约束)。
+
+        ref_priority 策略 (每个 slot 独立仲裁):
           - 优先级链: mandatory REFpb > ACT/PRE > non-mandatory REFpb.
           - mandatory (prepare_due / hard_deadline / debt ≥ max_postpone_credits):
               refresh 抢占 row bus; timing 闸不允许时退让给 row.
           - non-mandatory: row_scheduler 先尝试; row 没发 → refresh 兜底.
           - cam_busy_banks 过滤: non-mandatory REFpb 选 bank 时跳过 CAM 中已有
-            对应 cmd 的 bank, 避免选了一个 "REFPB 即将发出但 col 还在等待" 的 bank.
+              对应 cmd 的 bank, 避免选了一个 "REFPB 即将发出但 col 还在等待" 的 bank.
         """
+        # ==== CTL 段: commit + admit (每 DFI cycle 一次) ====
         # 先尝试 commit 等待中的 write data (buffer 资源管理).
         # 必须在 _try_admit_burst_entry 之前: 防止 admit 与 commit 互相抢占.
         self._commit_pending_write_data(current_cycle)
-
         entered_entry = self._try_admit_burst_entry(current_cycle)
-        for bank in self._banks:
-            bank.tick(current_cycle, self._timing)
+
+        # ==== CTL 段: 每 cycle 一次的决策推进 ====
+        self._refresh_scheduler.begin_cycle(current_cycle)
+        self._col_scheduler.begin_cycle(current_cycle, self._read_cam, self._write_cam)
 
         # 收集当前 CAM 中还有未派发 cmd 的 bank 集合, 传给 refresh_scheduler
         # 使其 non-mandatory REFpb 选 bank 时跳过已有对应 cmd 的 bank。
         cam_busy_banks = self._collect_cam_busy_banks(current_cycle)
-
-        from_refresh = False
-        row_cmd: Optional[RowCommand] = None
-
-        # ===== ref_priority 策略 =====
-        # 优先级: mandatory REFpb > ACT/PRE > non-mandatory REFpb
-        #
-        # - mandatory (prepare_due / hard_deadline / debt ≥ max_postpone_credits):
-        #     refresh 抢占 row bus; 仅当 timing 闸不允许时退让给 row.
-        # - non-mandatory:
-        #     row_scheduler 先尝试 (PRE > ACT); row 没发 → refresh 兜底.
-        #     兜底发出的非强制 REFpb 计入 _non_mandatory_fallback_issued_count.
-        # - mandatory 但 row_bus 已发 ACT/PRE 的情况: 见编排器 row 之后 try_issue;
-        #   此处只保证"row_bus 没被 row 占时, mandatory 优先".
         active_cams = self._col_scheduler.get_row_candidate_cams(
             self._read_cam, self._write_cam)
-        # 预判 refresh 是否 mandatory 
+        # 预判 refresh 是否 mandatory (每 cycle 判一次, 两个 slot 共用)
         is_mandatory = self._refresh_scheduler.is_mandatory_needed(
             current_cycle, cam_busy_banks)
-        if is_mandatory:
-            # mandatory: refresh 抢占 row bus
-            row_cmd, _ = self._refresh_scheduler.try_issue(
-                current_cycle, cam_busy_banks, via_fallback=False)
-            if row_cmd is not None:
-                from_refresh = True
-            else:
-                # 即便 mandatory, 若 timing 闸 (tRREFD/tFAW/tRRD) 不允许 → 退让给 row,
-                # 避免 mandatory 死锁.
-                row_cmd = self._row_scheduler.try_issue(current_cycle, active_cams)
-        else:
-            # non-mandatory: ACT/PRE 优先
-            row_cmd = self._row_scheduler.try_issue(current_cycle, active_cams)
-            if row_cmd is None:
-                # row 没发 → refresh 兜底 (non-mandatory 也允许发, 走 row_bus 空闲 path)
+
+        # ==== AC 段: 2 个 dfi_phase_slot ====
+        row_cmds: List[Optional[RowCommand]] = []
+        col_cmds: List[Optional[ColumnCommand]] = []
+        for slot_idx in range(ClockModel.DFI_PHASE_SLOTS_PER_CYCLE):
+            # slot0 → HBM phase0, slot1 → HBM phase2 (MC0 的 phase0/phase1)
+            current_slot = (current_cycle * ClockModel.DFI_PHASE_SLOTS_PER_CYCLE
+                            + slot_idx)
+            for bank in self._banks:
+                bank.tick(current_slot, self._timing)
+
+            from_refresh = False
+            row_cmd: Optional[RowCommand] = None
+
+            # ===== ref_priority 策略 =====
+            # 优先级: mandatory REFpb > ACT/PRE > non-mandatory REFpb
+            #
+            # - mandatory (prepare_due / hard_deadline / debt ≥ max_postpone_credits):
+            #     refresh 抢占 row bus; 仅当 timing 闸不允许时退让给 row.
+            # - non-mandatory:
+            #     row_scheduler 先尝试 (PRE > ACT); row 没发 → refresh 兜底.
+            #     兜底发出的非强制 REFpb 计入 _non_mandatory_fallback_issued_count.
+            if is_mandatory:
+                # mandatory: refresh 抢占 row bus
                 row_cmd, _ = self._refresh_scheduler.try_issue(
-                    current_cycle, cam_busy_banks, via_fallback=True)
+                    current_cycle, current_slot, cam_busy_banks, via_fallback=False)
                 if row_cmd is not None:
                     from_refresh = True
-            else:
-                # row 已发 → refresh 让位. 让位次数可间接从以下关系推导:
-                #   yield ≈ non_mandatory_opportunity - non_mandatory_fallback_issued
-                # 无需额外调用, 避免重复 is_mandatory_needed 判定.
-                pass
-
-        if row_cmd is not None:
-            if row_cmd.kind == RowCommandType.ACT:
-                self._total_act_count += 1
-            elif row_cmd.kind == RowCommandType.PRE:
-                # 区分 refresh 触发的 force-PRE 与常规 PRE (autoprecharge 等)
-                if from_refresh:
-                    self._total_refresh_force_pre_count += 1
                 else:
-                    self._total_pre_count += 1
-            # REFPB 不计入 ACT/PRE 计数 (单独归入 refresh 统计)
-        # 通知 col_scheduler: 当前 cycle 的 row 事件 (供准备期统计 target bank 的 ACT/PRE)
-        self._col_scheduler.record_row_event(row_cmd)
+                    # 即便 mandatory, 若 timing 闸 (tRREFD/tFAW/tRRD) 不允许 → 退让给 row,
+                    # 避免 mandatory 死锁.
+                    row_cmd = self._row_scheduler.try_issue(current_slot, active_cams)
+            else:
+                # non-mandatory: ACT/PRE 优先
+                row_cmd = self._row_scheduler.try_issue(current_slot, active_cams)
+                if row_cmd is None:
+                    # row 没发 → refresh 兜底 (non-mandatory 也允许发, 走 row_bus 空闲 path)
+                    row_cmd, _ = self._refresh_scheduler.try_issue(
+                        current_cycle, current_slot, cam_busy_banks, via_fallback=True)
+                    if row_cmd is not None:
+                        from_refresh = True
 
-        col_cmd = self._col_scheduler.try_issue(
-            current_cycle, self._read_cam, self._write_cam)
-        if col_cmd is not None:
-            self._total_cols_dispatched += 1
-            self._simulation_end_cycle = current_cycle
-            if col_cmd.is_write:
-                self._last_write_issue_cycle = current_cycle
-            elif self._last_read_release_cycle is None:
-                # READ 终点由 link node 释放阶段确定，而不是由 RD 发出确定。
-                pass
-            # V15 fix: READ 真正派发时记录 tRL 起点 (issued_cycle + col_cmd.issue_cycle).
-            # 必须在 _complete_dispatch 之后 (col_cmd 已在 list 中) 且在 update_data_ready
-            # 之前 (否则本 cycle 就可能被误标 ready).
-            # WRITE 不走 link node, 不调.
-            # 路径覆盖: _try_issue_of_type + _try_drain_inflight 都会走到这里.
-            if not col_cmd.is_write:
-                self._link_list_mgr.mark_dispatched(col_cmd, current_cycle)
+            if row_cmd is not None:
+                if row_cmd.kind == RowCommandType.ACT:
+                    self._total_act_count += 1
+                    # v7 严格准入: ACT 当拍通知 col 调度器 — bank 入已 ACT 大池子
+                    # 并立即尝试晋升入 cs 窗口 (BG 多样性优先, 与窗口 bank 不冲突)。
+                    self._col_scheduler._on_bank_activated(row_cmd.bank_id)
+                elif row_cmd.kind == RowCommandType.PRE:
+                    # 区分 refresh 触发的 force-PRE 与常规 PRE (autoprecharge 等)
+                    if from_refresh:
+                        self._total_refresh_force_pre_count += 1
+                        # v0.3.1: force-PRE 关闭 bank → 立即释放 cs 窗口位
+                        # (该 bank 上的在途 entry 之后重新 ACT/派发时重新准入)
+                        self._col_scheduler._release_bank_from_window(
+                            row_cmd.bank_id, reason='force_pre')
+                    else:
+                        self._total_pre_count += 1
+                # REFPB 不计入 ACT/PRE 计数 (单独归入 refresh 统计)
+            # 通知 col_scheduler: 本 slot 的 row 事件 (供准备期统计 target bank 的 ACT/PRE)
+            self._col_scheduler.record_row_event(row_cmd)
+            row_cmds.append(row_cmd)
 
-        # V15: 更新 READ link node data_ready (dispatch + tRL ≤ current), 释放已 ready 的 head 节点.
-        # 每 cycle 调用一次: _run_simulation_loop 的结束条件依赖此调用让 read 数据回流.
+            col_cmd = self._col_scheduler.try_issue(
+                current_slot, self._read_cam, self._write_cam)
+            if col_cmd is not None:
+                self._total_cols_dispatched += 1
+                self._simulation_end_cycle = current_cycle
+                if col_cmd.is_write:
+                    self._last_write_issue_cycle = current_cycle
+                # V15 fix: READ 真正派发时记录 tRL 起点 (issued_cycle + tRL, DFI cycle).
+                # WRITE 不走 link node, 不调.
+                if not col_cmd.is_write:
+                    self._link_list_mgr.mark_dispatched(col_cmd, current_cycle)
+            col_cmds.append(col_cmd)
+
+        # ==== CTL 收尾段: link node 回流 + 性能统计 + log ====
+        # V15: 更新 READ link node data_ready (dispatch + tRL ≤ current), 释放已 ready 的
+        # head 节点. HBM4: 每 DFI cycle 最多释放 2 个 (LINK_NODE_FREE_PER_CYCLE=2).
         self._link_list_mgr.update_data_ready(current_cycle, self._config.t_rl_cycles)
         self._link_list_mgr.release_ready_nodes(current_cycle)
         link_stats = self._link_list_mgr.get_stats()
@@ -5012,9 +5764,15 @@ class HBMCommandScheduler:
                          self._config.write_cam_depth - len(self._write_cam))
         wdb_remaining = (self._config.write_data_buffer_depth
                          - self._write_data_buffer_state["used"])
+        # CSW 列: 关闭 → None (format_cycle_line 输出 --); 启用 → 当前窗口 bank 列表
+        cs_window_enabled = self._col_scheduler._cs_window_enable
+        cs_window_banks = (list(self._col_scheduler._cs_window)
+                           if cs_window_enabled else None)
         line = reporter.format_cycle_line(
-            current_cycle, cam_remaining, entered_entry, row_cmd, col_cmd,
-            wdb_remaining)
+            current_cycle, cam_remaining, entered_entry, row_cmds, col_cmds,
+            wdb_remaining,
+            cs_window_banks=cs_window_banks,
+            cs_window_enabled=cs_window_enabled)
         should_print = (verbose_cycles == -1) or (current_cycle < verbose_cycles)
         reporter.write_cycle_line(current_cycle, line, should_print)
 
@@ -5062,23 +5820,20 @@ class HBMCommandScheduler:
                 state["peak_usage"] = state["used"]
 
     def _try_admit_burst_entry(self, current_cycle: int) -> Optional[BurstCommandGroup]:
-        """v6.6: R/W 独立节流 + W col 累加器 (上游真实时序)
+        """v6.6: R/W 独立节流 + W col 累加器 (上游真实时序; HBM4: W 2 col/cycle)
 
         规则:
-          - W col 累加器: 每 cycle 收 1 W col (从 _w_col_stream 按顺序拆), 跟 R 准入独立
-            收齐当前预拆 entry 的全部 1~4 条才 admit (上游 "W 收满 4 col 才下发")
+          - W col 累加器: 每 DFI cycle 收 2 W col (HBM3 为 1; 从 _w_col_stream
+            按顺序拆), 跟 R 准入独立; 收齐当前预拆 entry 的全部 1~4 条才 admit
+            (上游 "W 收满 4 col 才下发", HBM4 下 4-col burst 每 2 cycle 发一个)
           - R 实时: 1 entry / cycle, 不需要累加器
           - R 节流: next_r_admit_cycle 推进 (R_ADMIT_INTERVAL_CYCLES=1)
-          - W 节流: next_w_admit_cycle 推进 (admit 后 +entry 内 col 数)
+          - W 节流: next_w_admit_cycle 推进 (admit 后 + ceil(entry col 数/2))
           - R/W 节流独立: R 节流不阻塞 W, W 节流不阻塞 R
           - RR: 严格交替 R 和 W (primary = self._admission_rr_is_r 决定)
           - Fallback: primary 不可入 (节流 / 累加器不满 / workload 越界 / CAM 满)
             → 试 secondary, 不阻塞
           - 若两侧都不可入: 本 cycle 不 admit, RR 不前进
-
-        跟 v6.5 区别:
-          - 旧: BURST_ADMIT_INTERVAL_CYCLES=4 统一节流, W 跟 R 共享
-          - 新: R/W 各自节流 (R 1, W entry col 数), W 走 col-level 累加器
         """
         # 步骤 1: W col 累加器每 cycle 收 1 col (独立运行, 跟 R 准入无关)
         self._accumulate_w_col_if_needed(current_cycle)
@@ -5104,8 +5859,10 @@ class HBMCommandScheduler:
         if admitted is not None:
             self._admission_rr_is_r = not self._admission_rr_is_r
             if admitted.commands[0].is_write:
-                # W 节流: 下次准入最早 cycle = current + entry col 数
-                self._next_w_admit_cycle = current_cycle + len(admitted.commands)
+                # W 节流 (HBM4): 上游 2 col/cycle, 下次准入最早 cycle =
+                # current + ceil(entry col 数 / 2) (4-col burst → 每 2 cycle 一个)
+                self._next_w_admit_cycle = current_cycle + max(
+                    1, math.ceil(len(admitted.commands) / W_COL_ACCUMULATE_PER_CYCLE))
                 if self._first_write_cam_cycle is None:
                     self._first_write_cam_cycle = current_cycle
             else:
@@ -5153,13 +5910,14 @@ class HBMCommandScheduler:
             return len(self._w_col_buffer) < len(self._w_entries[self._next_w_index].commands)
 
     def _accumulate_w_col_if_needed(self, current_cycle: int) -> None:
-        """每 cycle 接收当前预拆 Write entry 的一条 command，保留 partial entry 边界。"""
+        """每 DFI cycle 接收当前预拆 Write entry 的最多 2 条 command (HBM4 上游 2 col/cycle)。"""
         if self._next_w_index >= len(self._w_entries):
             return
         target = self._w_entries[self._next_w_index]
-        if len(self._w_col_buffer) >= len(target.commands):
-            return
-        self._w_col_buffer.append(target.commands[len(self._w_col_buffer)])
+        # HBM4: 写上游 2 col / DFI cycle (HBM3 为 1), 4-col burst 每 2 cycle 收满下发
+        need = len(target.commands) - len(self._w_col_buffer)
+        for _ in range(min(W_COL_ACCUMULATE_PER_CYCLE, need)):
+            self._w_col_buffer.append(target.commands[len(self._w_col_buffer)])
 
     def _try_admit_specific_type(self, current_cycle: int,
                                  rw_type: RWType) -> Optional[BurstCommandGroup]:
@@ -5265,50 +6023,99 @@ class HBMCommandScheduler:
             intervals.append(self._last_write_issue_cycle - self._first_write_cam_cycle)
         return max(intervals) if intervals else 0
 
+    def get_bank_open_duration_stats(self) -> dict:
+        """v21+: 聚合所有 bank 的"ACT 到真正 IDLE"打开时长统计.
+
+        每个 bank 在自己的 tick() 中记录 _open_durations (List[int]),
+        本方法把所有 banks 合并, 计算 count/avg/min/max/p50/p95/sum.
+
+        返回 dict (供 _format_bank_open_duration_stats 使用).
+        """
+        durations: List[float] = []
+        for bank in self._banks:
+            # bank 记录的是 dfi_phase_slot, 换算为 DFI cycle (÷2) 后统计
+            durations.extend(d / 2 for d in bank._open_durations)
+        if not durations:
+            return {'count': 0, 'avg': 0, 'min': 0, 'max': 0,
+                    'p50': 0, 'p95': 0, 'sum': 0}
+        durations_sorted = sorted(durations)
+        n = len(durations_sorted)
+        return {
+            'count': n,
+            'avg': sum(durations_sorted) / n,
+            'min': durations_sorted[0],
+            'max': durations_sorted[-1],
+            'p50': durations_sorted[n // 2],
+            'p95': durations_sorted[int(n * 0.95)] if n >= 20 else durations_sorted[-1],
+            'sum': sum(durations_sorted),
+        }
+
     # --------------------------------------------------------
     #  Summary
     # --------------------------------------------------------
 
     def _build_summary_lines(self, total_cmds: int, current_cycle: int,
-                             elapsed_cycles: int, perf: float) -> List[str]:
-        """汇总吞吐率、命令计数、刷新和调度统计信息。"""
+                             elapsed_cycles: int, efficiency: float) -> List[str]:
+        """汇总吞吐率、命令计数、刷新和调度统计信息。
+
+        HBM4 性能口径: efficiency = (Col命令数 / DFI cycles) / 2,
+        满带宽 = 每 DFI cycle 2 条 col (2 个 dfi_phase_slot), 满分 1.0。
+        """
         cfg = self._config
         timing = self._timing
+
+        def _dfi(slots: int) -> str:
+            """slot 数 → DFI cycle 显示 (半 cycle 用 .5)。"""
+            v = slots / 2
+            return f"{v:g}"
+
         return [
             f"\n  {'='*72}",
             f"  addr_mode={cfg.addr_mode} (read_ratio={cfg.read_ratio}) 仿真结果",
             f"  {'='*72}",
-            f"  [参数配置]",
-            f"    DATA_RATE={cfg.data_rate_gbps} Gbps, "
-            f"DQS={self._clock.dqs_freq_ghz} GHz, "
+            f"  [参数配置] HBM4: dfi:ck:wck = 1:4:8; 1 DFI cycle = 4 HBM CK = 8 WCK, "
+            f"含 2 个 dfi_phase_slot (AC 域最小粒度)",
+            f"    DATA_RATE={cfg.data_rate_gbps} Gbps, WCK={self._clock.dqs_freq_ghz} GHz, "
             f"HBM_CK={self._clock.hbm_ck_freq_ghz} GHz, "
-            f"DFI_CLK={self._clock.dfi_clk_freq_ghz} GHz, "
-            f"tDQS={self._clock.tdqs_ns:.5f} ns, "
-            f"tCK={self._clock.tck_hbm_ns:.5f} ns, "
-            f"tDFI={self._clock.tdfi_ns:.5f} ns "
-            f"(1 model cycle={self._clock.HBM_CK_PER_DFI_CYCLE} HBM CK; "
-            f"MC0 phase={self._clock.MC0_PHASE}, MC1 phase={self._clock.MC1_PHASE})",
-            f"    NUM_BANKS={cfg.num_banks}, NUM_BANK_GROUPS={cfg.num_bank_groups}",
+            f"DFI_CLK={self._clock.dfi_clk_freq_ghz} GHz",
+            f"    tWCK={self._clock.tdqs_ns:.5f} ns, tCK={self._clock.tck_hbm_ns:.5f} ns, "
+            f"tDFI={self._clock.tdfi_ns:.5f} ns, "
+            f"tSlot={self._clock.t_dfi_phase_slot_ns:.5f} ns (1 slot = 2 nCK = 0.5 DFI)",
+            f"    Phase 映射 (单 MC/MC0 视角): MC0 phase0→HBM P{ClockModel.MC0_HBM_PHASES[0]}, "
+            f"MC0 phase1→HBM P{ClockModel.MC0_HBM_PHASES[1]}; "
+            f"MC1 phase0→P{ClockModel.MC1_HBM_PHASES[0]}/phase1→P{ClockModel.MC1_HBM_PHASES[1]} (仅文档, 未建模)",
+            f"    NUM_BANKS={cfg.num_banks}, NUM_BANK_GROUPS={cfg.num_bank_groups}, "
+            f"BANKS_PER_BG={cfg.banks_per_bank_group} (HBM4: 8 bank/BG, 每 16 bank 一个 SID)",
             f"    地址生成: config={cfg.configuration}, density={cfg.density_code if cfg.density_code is None else format(cfg.density_code, '04b')}, remap_type={cfg.sid_remap_type}, addr_mode={cfg.addr_mode}, max_system_la={cfg.max_system_la}, "
             f"effective_bits={cfg.max_system_la.bit_length()}, "
             f"max_system_la=0x{cfg.max_system_la:X}",
-            f"    tRCDRD={timing.t_rcdrd_cycles} cycles ({cfg.t_rcdrd_ns} ns), "
-            f"tRCDWR={timing.t_rcdwr_cycles} cycles ({cfg.t_rcdwr_ns} ns)",
-            f"    tRP={timing.t_rp_cycles} cycles, "
-            f"tRC={timing.t_rc_cycles} cycles, "
-            f"tRAS={timing.t_ras_cycles} cycles",
-            f"    tRTP={cfg.t_rtp_hbmck} HBM CK ({timing.t_rtp_cycles} cycles), "
-            f"tWR={cfg.t_wr_ns} ns, "
-            f"WL={cfg.wl_hbmck} HBM CK "
-            f"(WRITE+AP = WL+{WL_TWTR_OFFSET}+WR = {timing.write_ap_cycles} cycles)",
-            f"    tCCDs={timing.t_ccd_s_cycles}, tCCDl={timing.t_ccd_l_cycles}, "
-            f"tRRDs={timing.t_rrd_s_cycles}, tRRDl={timing.t_rrd_l_cycles}, "
-            f"tFAW={cfg.t_faw_hbmck} HBM CK ({timing.t_faw_cycles} cycles)",
-            f"    tRTW={timing.t_rtw_cycles} cycles ({cfg.t_rtw_ns} ns, R→W, 公式推导), "
-            f"tWTRL={cfg.t_wtrl_hbmck} HBM CK (W→R same bg), "
-            f"tWTRS={cfg.t_wtrs_hbmck} HBM CK (W→R diff bg)",
+            f"    [AC timing | 输入原始值 → dfi_phase_slot (→ DFI cycle); 双单位参数取 max; "
+            f"v1.2 默认 = HBM4_12000.xlsx 12G 档 (单位 CK)]",
+            f"    tRCDRD=max({cfg.t_rcdrd_hbmck} CK, {cfg.t_rcdrd_ns} ns) → {timing.t_rcdrd_slots} slots ({_dfi(timing.t_rcdrd_slots)} DFI)",
+            f"    tRCDWR=max({cfg.t_rcdwr_hbmck} CK, {cfg.t_rcdwr_ns} ns) → {timing.t_rcdwr_slots} slots ({_dfi(timing.t_rcdwr_slots)} DFI)",
+            f"    tRP=max({cfg.t_rp_hbmck} CK, {cfg.t_rp_ns} ns) → {timing.t_rp_slots} slots ({_dfi(timing.t_rp_slots)} DFI), "
+            f"tRC=max({cfg.t_rc_hbmck} CK, {cfg.t_rc_ns} ns) → {timing.t_rc_slots} slots ({_dfi(timing.t_rc_slots)} DFI), "
+            f"tRAS=max({cfg.t_ras_hbmck} CK, {cfg.t_ras_ns} ns) → {timing.t_ras_slots} slots ({_dfi(timing.t_ras_slots)} DFI)",
+            f"    tRTP={cfg.t_rtp_hbmck} CK → {timing.t_rtp_slots} slots ({_dfi(timing.t_rtp_slots)} DFI), "
+            f"tWR=max({cfg.t_wr_hbmck} CK, {cfg.t_wr_ns} ns), WL={cfg.wl_hbmck} CK, "
+            f"WRITE+AP=WL+{WL_TWTR_OFFSET}+tWR → {timing.write_ap_slots} slots ({_dfi(timing.write_ap_slots)} DFI)",
+            f"    tCCDS={cfg.t_ccd_s} CK → {timing.t_ccd_s_slots} slot ({_dfi(timing.t_ccd_s_slots)} DFI: 同 cycle 双 slot 不同 BG 可发), "
+            f"tCCDL={cfg.t_ccd_l} CK → {timing.t_ccd_l_slots} slots ({_dfi(timing.t_ccd_l_slots)} DFI), "
+            f"tCCDR={cfg.t_ccdr_hbmck} CK → {timing.t_ccdr_slots} slots ({_dfi(timing.t_ccdr_slots)} DFI, READ 跨 SID)",
+            f"    tRRDs=max({cfg.t_rrd_s} CK, {cfg.t_rrd_s_ns} ns) → {timing.t_rrd_s_slots} slots ({_dfi(timing.t_rrd_s_slots)} DFI), "
+            f"tRRDl=max({cfg.t_rrd_l} CK, {cfg.t_rrd_l_ns} ns) → {timing.t_rrd_l_slots} slots ({_dfi(timing.t_rrd_l_slots)} DFI), "
+            f"tFAW=max({cfg.t_faw_hbmck} CK, {cfg.t_faw_ns} ns) → {timing.t_faw_slots} slots ({_dfi(timing.t_faw_slots)} DFI)",
+            f"    tRTW=max({cfg.t_rtw_hbmck} CK, {cfg.t_rtw_ns} ns) → {timing.t_rtw_slots} slots ({_dfi(timing.t_rtw_slots)} DFI, R→W, 表无值\"-\"保留默认), "
+            f"tWTRL={cfg.t_wtrl_hbmck} CK → {timing.write_to_read_same_bg_slots} slots (W→R same bg), "
+            f"tWTRS={cfg.t_wtrs_hbmck} CK → {timing.write_to_read_diff_bg_slots} slots (W→R diff bg)",
             f"    READ_CAM_DEPTH={cfg.read_cam_depth}, "
             f"WRITE_CAM_DEPTH={cfg.write_cam_depth}",
+            f"    PREFETCH_WINDOW: cs_enable={cfg.cs_prefetch_window_enable}, "
+            f"cs_size={cfg.cs_prefetch_window}, "
+            f"dfi_enable={cfg.dfi_prefetch_window_enable}, "
+            f"dfi_size={cfg.dfi_prefetch_window}, "
+            f"active_admit={cfg.cs_prefetch_active_admit}  "
+            f"(两级 bank 窗口; active=True=ACT 大池子严格准入, False=v0.3.1 被动准入)",
             f"    read_ratio={cfg.read_ratio} (per-txn)",
             f"    WRITE 自动预充电: {'WRA enabled' if cfg.write_auto_precharge else 'disabled'}, "
             f"refresh_guard={cfg.wra_refresh_guard_cycles} cycles, "
@@ -5327,12 +6134,12 @@ class HBMCommandScheduler:
             f"snapshot<{cfg.preparation_min_banks} 时按全数算), "
             f"max_dispatches={cfg.preparation_max_dispatches} (current mode 软上限), "
             f"max_cycles={cfg.preparation_max_cycles} (准备期硬上限)",
-            f"    Refresh (HBM3 REFpb per-bank): "
-            f"per-bank interval={cfg.t_refi_per_bank_cycles} cycles "
-            f"({cfg.t_refi_per_bank_cycles * 0.8333:.0f} ns, "
+            f"    Refresh (HBM4 REFpb per-bank): "
+            f"per-bank interval={cfg.t_refi_per_bank_cycles} DFI cycles "
+            f"({cfg.t_refi_per_bank_cycles * self._clock.tdfi_ns:.0f} ns, "
             f"注: 这是 per-bank 间隔, 不是 spec tREFIpb), "
-            f"tRFCpb={timing.t_rfc_pb_cycles} cycles ({cfg.t_rfc_pb_ns} ns, "
-            f"bank 阻塞时间)",
+            f"tRFCpb=max({cfg.t_rfc_pb_hbmck} CK, {cfg.t_rfc_pb_ns} ns) → {timing.t_rfc_pb_slots} slots "
+            f"({_dfi(timing.t_rfc_pb_slots)} DFI, bank 阻塞时间)",
             f"  [命令统计]",
             f"    Col命令总数 : {total_cmds}",
             f"    ACT命令数   : {self._total_act_count}",
@@ -5364,7 +6171,11 @@ class HBMCommandScheduler:
             *_format_bg_interleave_stats(self._row_scheduler.get_bg_interleave_stats()),
             f"  [Age 优先级 ACT 统计 (v18+)]",
             *_format_age_priority_stats(self._row_scheduler.get_age_priority_stats()),
-            f"  [Refresh 统计 (HBM3 REFpb, per-bank)]",
+            f"  [Prefetch Window 统计 (两级 bank 窗口, 替代 v21.1 Col Lock Window)]",
+            *_format_prefetch_window_stats(self._col_scheduler.get_prefetch_window_stats()),
+            f"  [Bank 打开时长统计 (v21+, ACT 至 bank 真正 IDLE 的 cycle 数)]",
+            *_format_bank_open_duration_stats(self.get_bank_open_duration_stats()),
+            f"  [Refresh 统计 (HBM4 REFpb, per-bank)]",
             *_format_refresh_stats(self._refresh_scheduler.get_stats()),
             f"  [时间统计]",
             f"    simulation_start_cycle (首个burst entry入CAM) : cycle {self._simulation_start_cycle}",
@@ -5374,10 +6185,10 @@ class HBMCommandScheduler:
             f"    性能统计终点 (仿真完成事件cycle)              : cycle {self._performance_end_cycle}",
             f"    仿真总cycles                                    : {current_cycle}",
             f"    elapsed = max(READ区间, WRITE区间)             : {elapsed_cycles}",
-            f"  [性能指标]",
-            f"    Perf = Col命令数 / 新性能统计区间",
-            f"         = {total_cmds} / {elapsed_cycles}",
-            f"         = {perf:.6f} cmds/cycle",
+            f"  [性能指标] (HBM4 口径: 满带宽 = 2 col cmd / DFI cycle)",
+            f"    Efficiency = (Col命令数 / DFI cycles) / 2",
+            f"              = ({total_cmds} / {elapsed_cycles}) / 2",
+            f"              = {efficiency:.6f}  (满分 1.0)",
             f"  {'='*72}",
         ]
 
@@ -5435,7 +6246,7 @@ def _write_log_header(log_fp: TextIO) -> None:
     """向日志文件写入单次测试的配置标题。"""
     log_fp.write("#" * 72 + "\n")
     log_fp.write("#  DRAM Command Scheduling Simulator "
-                 "(HBM3 Spec-Faithful, Batch R/W)\n")
+                 "(HBM4, dfi:ck:wck=1:4:8, 2 col cmd/cycle)\n")
     log_fp.write("#" * 72 + "\n")
 
 
@@ -5457,9 +6268,9 @@ def _run_all_cases(seed: int, verbose_cycles: int, log_fp: TextIO, link_log_fp: 
 
 
 def _run_one(addr_mode: str, read_ratio: float, batch: bool,
-             seed: int, verbose_cycles: int, log_fp: TextIO, link_log_fp: TextIO
+             seed: int, verbose_cycles: int, log_fp: TextIO, link_log_fp: None
              ) -> Tuple[str, float, str, float]:
-    """跑单个 (addr_mode, read_ratio, mode) 组合, 返回 (case, read_ratio, mode, perf)"""
+    """跑单个 (addr_mode, read_ratio, mode) 组合, 返回 (case, read_ratio, mode, efficiency)"""
     mode = "batch" if batch else "alternating"
     header = (f"\n{'#'*72}\n"
               f"#  addr_mode={addr_mode}, read_ratio={read_ratio}, mode={mode}\n"
@@ -5480,30 +6291,33 @@ def _run_one(addr_mode: str, read_ratio: float, batch: bool,
 
 def _write_comparison(runs: List[Tuple[str, float, str, float]],
                       log_fp: TextIO) -> None:
-    """8-run 性能对比表 + 50/50 专项 (Batch vs Alternating)"""
+    """8-run 效率对比表 + 50/50 专项 (Batch vs Alternating)
+
+    HBM4 口径: efficiency = (cmds/DFI cycle)/2, 满带宽 2 cmd/cycle → 满分 1.0。
+    """
     lines = [
         "\n" + "#" * 72,
-        "#  性能对比",
+        "#  性能对比 (efficiency, 满带宽 = 2 col cmd/DFI cycle → 1.0)",
         "#" * 72,
-        f"  {'addr_mode':>10} | {'read_ratio':>10} | {'mode':>12} | {'perf':>10}",
-        f"  {'─'*10}─┼─{'─'*10}─┼─{'─'*12}─┼─{'─'*10}",
+        f"  {'addr_mode':>10} | {'read_ratio':>10} | {'mode':>12} | {'efficiency':>12}",
+        f"  {'─'*10}─┼─{'─'*10}─┼─{'─'*12}─┼─{'─'*12}",
     ]
-    for addr_mode, read_ratio, mode, perf in runs:
+    for addr_mode, read_ratio, mode, eff in runs:
         lines.append(
-            f"  {addr_mode:>10} | {read_ratio:>10.1f} | {mode:>12} | {perf:>10.6f}"
+            f"  {addr_mode:>10} | {read_ratio:>10.1f} | {mode:>12} | {eff:>12.6f}"
         )
     lines.append("#" * 72)
 
     lines += ["", "#  50/50 专项: Batch vs Alternating", "#" * 72]
     for addr_mode in ("linear", "random"):
-        batch_perf = next(p for a, r, m, p in runs
-                          if a == addr_mode and r == 0.5 and m == "batch")
-        alternating_perf = next(p for a, r, m, p in runs
-                                if a == addr_mode and r == 0.5 and m == "alternating")
-        ratio = batch_perf / alternating_perf if alternating_perf > 0 else 0
+        batch_eff = next(p for a, r, m, p in runs
+                         if a == addr_mode and r == 0.5 and m == "batch")
+        alternating_eff = next(p for a, r, m, p in runs
+                               if a == addr_mode and r == 0.5 and m == "alternating")
+        ratio = batch_eff / alternating_eff if alternating_eff > 0 else 0
         lines.append(
             f"  addr_mode={addr_mode} (50/50): "
-            f"batch={batch_perf:.6f}, alternating={alternating_perf:.6f}, "
+            f"batch={batch_eff:.6f}, alternating={alternating_eff:.6f}, "
             f"batch/alternating={ratio:.4f} ({(ratio-1)*100:+.1f}%)"
         )
     lines.append("#" * 72)
