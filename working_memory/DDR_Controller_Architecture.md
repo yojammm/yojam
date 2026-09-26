@@ -43,15 +43,11 @@ AXI / CHI                          ← 第 1 章
      ↓
 Transaction / XMU                  ← 第 1 章
      ↓
-Address Mapping                    ← 第 2 章
-     ↓
-Port Arbitration / Request Queue   ← 第 3 章
+Port Arbitration / Request Queue   ← 第 3 章（PA grant 点执行第 2 章的物理地址映射）
      ↓
 CAM / Command Queue                ← 第 4 章
      ↓
-Command Scheduler                  ← 第 5 章
-     ↓
-Timing Enforcement                 ← 第 6 章
+Command Scheduler                  ← 第 5 章（BSC/Timing Enforcement 给 issue 前 timing ready，FSC 仲裁后下发）
      ↓
 DFI                                ← 第 7 章
      ↓
@@ -65,6 +61,10 @@ DRAM
 > - **CS**：BSC（bank 状态机 + AC timing）/ GSC（读写切换）/ FSC（最终仲裁）（第 5 章）；
 > - **Command Generator**（命令编码与下发）在 RTL 中同属顶层 Command Scheduler 模块，位于 FSC → DFI 通路（0.3 叙事第 ⑤ 步、4.2 CCT 特性）。
 
+> **两条结构性澄清（评审定稿）**：
+> - **Timing Enforcement（第 6 章）不是独立流水级**：BSC 的 forbid/down counter 在 FSC 仲裁**前**给出 timing ready（可执行命令 = CCT 候选 ∩ BSC ready，见 5.1），并在命令**下发拍**装载 counter（5.3.1）；counter 不关心下发后在 DFI 侧延迟多久——同批命令延迟一致，不改变间隔语义 [RTL]；
+> - **Address Mapping（第 2 章）不是独立流水级**：读、写在 PA 前走独立通道，PA 后合流二选一；**PA grant 点**执行物理映射，物理地址写入 CAM entry，此后逻辑地址不再使用 [RTL]（0.3 观察三：上游全程 system/UIF 地址）。
+
 **纲领规则**：对任何 Feature，都必须能指出它位于这条链的哪个位置，以及它影响上下游什么状态。
 
 ### 0.3 一条命令的一生（开场叙事）
@@ -74,7 +74,7 @@ DRAM
 ```
 AXI AW/W → XMU AFIFO（跨时钟域 + outstanding，一物两用）
  ① AW channel 按 64B 拆分 sub-command；W channel 按 64B resize 数据入 buffer
- ② PA grant：分配 CAM ptr + 地址映射（物理地址写入 CAM entry）
+ ② PA grant：分配 CAM ptr + 物理地址映射（物理地址写入 CAM entry，逻辑地址此后弃用）
     同时 write response 推入 B outstanding FIFO（保序节点 = PA grant，见 1.4.2）
  ③ CQ 指示 WDP 从 XMU 取数 → WDP 写入 SRAM（地址与 CAM 一致）→ 写数据 ready
  ④ 命令经三层 filter 上 CCT → 无 hit → CS 生成 ACT → tRCD 满足 → 产生 WR 请求
@@ -124,7 +124,7 @@ AXI AW/W → XMU AFIFO（跨时钟域 + outstanding，一物两用）
 1. **批处理摊薄切换**：读写 batch（5.4）、refresh 见缝插针（4.6）、rank/SID 多命令再切（2.5）——切换代价是常量，batch 是唯一摊薄手段；
 2. **迟滞防乒乓**：SidSwitch 空闲阈值（2.5）、水线 set/clr（3.4）、渐进式读写切换（5.4.2）——用时间迟滞换切换稳定性；
 3. **结构性规避**：DVFS 保证 IDLE（6.4）、零旁路 counter 检查（6.1）、DEVMGR 退出顺序（7.3）——用系统级约束消解模块级难题；
-4. **粒度统一 64B**：cache line = col command = CHI 包 = sub-command（1.2）——一条 64B 线贯穿全流水线。
+4. **粒度统一 64B（设计锚点口径，非协议事实）**：cache line 64B = SoC 侧常态假设；CHI 包 64B = 产品配置，非协议上限（1.6）；sub-command 64B = 内部设计选择；col command 粒度 = 协议 × 位宽推导——DDR4/DDR5、LPDDR5 均为 64B [SPEC]，HBM per PC DQ32×BL8 = 32B [SPEC]（由 CAM burst 合并 / 双发吸收）。一条 64B 线贯穿全流水线，是本设计的锚点而不是协议给的。
 
 ### 0.7 每章八问基础问题
 
@@ -428,9 +428,9 @@ link list 与 link node 个数独立可配。
 
 ### 1.4.2 保序节点 = PA grant（本设计的点睛之笔）
 
-> **sub-command 被 PA grant 后即到达保序节点，这个时刻就可以回 response。**
+> **sub-command 被 PA grant 后即到达保序节点；BRESP 的生成条件 = txn 最后一个 write sub-command 被 PA grant——写数据在 XMU 收齐是命令送往 PA 的前置条件（构造性保证），grant 时刻数据必已就绪 [RTL]。**
 
-- write response 在 **PA grant + 数据到达 XMU** 即返回（3.5.2），**不等到写进 DRAM**；
+- write response 在 **txn 最后一个 write sub-command 被 PA grant** 即返回（3.5.2），**不等到写进 DRAM**——旧口径"PA grant + 数据到达 XMU"中的数据条件由发送顺序构造性保证（数据 ready 才送 PA），不构成额外等待；
 - AXI ID 的作用就是维护顺序：**上游 master 认定"不同方向、同地址的 response 顺序 = 命令执行顺序"**；
 - **提前返回的可见性保证**：BRESP 返回时命令必已通过 PA grant 进入 PA→CQ buffer/CAM，后续同地址命令（**无论 ID**）在 CAM 入口被 RAW/WAR 检测拦截 Pending（§3.5.1）——可见性不靠 ID，靠入口冲突检测 + 单通路阻塞；
 - 把保序点尽量前移，是读延迟之外的另一个端到端延迟收益来源。
@@ -451,7 +451,7 @@ AW/W 数据不同步到达的场景**没有设计超时/死锁防护**：
 |---|---|---|---|---|
 | 1 | 同 ID 同方向（read→read） | AXI 协议要求 slave 保证 | **slave（controller）** | link list，head-only 释放（1.3.1） |
 | 2 | 同 ID 同方向（write→write） | 同上 | **slave（controller）** | B outstanding FIFO 顺序（1.4.2） |
-| 3 | 同 ID 不同方向（r vs w） | slave **无**保序义务 | **master**：利用同 ID 特性，按 response 顺序自行维护 | BRESP 在 PA grant + 数据到达即回，master 观察 BRESP 即认定 write 对后续 read 可见 |
+| 3 | 同 ID 不同方向（r vs w） | slave **无**保序义务 | **master**：利用同 ID 特性，按 response 顺序自行维护 | BRESP 在 txn 最后一个 write sub-command 被 PA grant 即回，master 观察 BRESP 即认定 write 对后续 read 可见 |
 | 4 | 不同 ID（任意方向） | 无保序要求 | 双方均不保证 | 乱序交织，link list + RR 分配（1.3.1） |
 | 5 | 地址维度 | **地址不参与保序**——slave 不维护地址间的顺序 | — | RAW/WAR 入口拦截（3.5.1）是**数据正确性机制**，不是 AXI 保序义务 |
 
@@ -461,7 +461,7 @@ AW/W 数据不同步到达的场景**没有设计超时/死锁防护**：
 
 ## 1.5 QoS 映射与 PA 分层仲裁
 
-### 2.5.1 AXI QoS → 优先级队列
+### 1.5.1 AXI QoS → 优先级队列
 
 | 方向 | 机制 | 映射目标 |
 |---|---|---|
@@ -470,7 +470,7 @@ AW/W 数据不同步到达的场景**没有设计超时/死锁防护**：
 
 QoS 值到队列的映射是**软件可配的分段线性映射**——不是硬连线，也不是按值逐档。
 
-### 2.5.2 PA 四层仲裁
+### 1.5.2 PA 四层仲裁
 
 ```
 第 1 层：读写方向仲裁
@@ -489,7 +489,7 @@ QoS 值到队列的映射是**软件可配的分段线性映射**——不是硬
 - **定位（面试口径）**：CHI 与 AXI **协议本身差异很大**（snoop filter、DVM、ordering model、独立 data channel）；"无核心差异"仅指 **CTRL 视野内**——CTRL 只支持 NoSnp 最小特性集，snoop/DVM 一律不支持，normalization 之后的 internal request 与 AXI 同构；
 - **normalization 规则**：ReadNoSnp → 内部 read；**PrefetchRead → LPR（低优先级 read）**——当前上游不投递可丢弃 prefetch，按普通 LPR 处理，不会丢弃；WriteNoSnpFull / WriteNoSnpPt → 内部 write（PtlWrite 借助 datachunk——CHI 类似 strb 的 BE 机制——可发 mask write 到 core）；QoS 划分类似 AXI；
 - **包大小**：固定 size = 64B（**产品配置**，非协议上限）——恰好等于 1 个 sub-command，拆分逻辑天然对齐，无需额外适配；
-- **response**：**wdat 接收后才发生 PA grant，Comp / CompDB 在 PA grant 即返回**——与 AXI 模式"PA grant + 数据到达"是同一原则（CHI 模式数据先到，条件合并为 PA grant）；read 数据由 rdat 返回；
+- **response**：**wdat 接收后才发生 PA grant，Comp / CompDB 在 PA grant 即返回**——与 AXI 模式同一原则：数据就绪是命令送往 PA 的前置条件（AXI 在 grant 时刻已满足，CHI 在 grant 前满足），因此两模式 response 都在 PA grant 点生成；read 数据由 rdat 返回；
 - snoop/DVM 类一致性流量由上游（interconnect/代理）处理，不在 controller 视野内。
 
 ---
@@ -539,7 +539,7 @@ QoS 值到队列的映射是**软件可配的分段线性映射**——不是硬
 | **GPW** | Guaranteed Priority Write：写侧 GPR（与 TPW 同队列，超时晋升，见 4.2） |
 | **NoSnp** | CHI 无 snoop 事务类别，controller 仅支持该类（read/prefetch read/full write/partial write） |
 
-**下一章建议**：第 1 章 Address Mapping（地址映射——sub-command 的物理地址形态由此产生），或第 1 章 Timing Enforcement（BSC 计数器体系的深挖）。
+**下一章建议**：第 2 章 Address Mapping（地址映射——sub-command 的物理地址形态由此产生），或第 6 章 Timing Enforcement（BSC 计数器体系的深挖）。
 
 
 ---
@@ -730,14 +730,14 @@ PA (Port 仲裁)
    ├─ credit 检查：PA grant 即消耗 credit
    └─ 每拍只放行一个 port 的读或写之一（匹配 DDR 单向总线）
    ↓
-CQ / CAM（第 1 章）
+CQ / CAM（第 4 章）
 ```
 
 | 模块 | 职责 | 关键机制 |
 |---|---|---|
 | **XMU** | AXI 协议边界、数据汇聚、协议预处理 | outstanding buffer、reorder buffer、RMW 转换 |
 | **PA** | 多 port 准入仲裁 | 加权 RR、credit 检查 |
-| **CQ/CAM** | 调度窗口 | 见第 1 章 |
+| **CQ/CAM** | 调度窗口 | 见第 4 章 |
 
 **广义 outstanding 模型**（量化口径）：
 
@@ -769,7 +769,7 @@ CAM 为**全相联**：每个 entry 可映射到**任意** CCT(bank)。这是 ba
 
 | entry 字段 | 说明 |
 |---|---|
-| 物理地址 | bank/row/col（经第 1 章映射） |
+| 物理地址 | bank/row/col（经第 2 章映射） |
 | priority | 命令优先级（HPR/LPR/GPR/TPW 属性） |
 | GPR 超时值 | CamAging 计数基准 |
 | 写数据指针 | 指向 WDP buffer |
@@ -838,7 +838,7 @@ Pending 命令已消耗 credit（PA grant 时消耗），不会造成 credit 泄
 ### 3.5.2 WAW：byte-enable 合并
 
 - 未上 CCT 的 WAW 可 **merge，按 byte enable 合并数据**（两次 partial write 拼成一份）；
-- **response 条件**：txn 的**所有 sub-command 被 PA grant 且数据全部到达 XMU** 后返回（AXI 每笔 txn 独立 response，merge 只合并数据不吞 response）；
+- **response 条件**：txn 的**最后一个 sub-command 被 PA grant** 即返回——数据在 XMU 收齐是各 sub-command 送 PA 的前置条件，grant 齐 ⟺ 数据齐（AXI 每笔 txn 独立 response，merge 只合并数据不吞 response）[RTL]；
 - merge 后 entry 不携带 AXI txn 信息，RAW/WAR 判定仅按物理地址——**merge 对冲突检测无影响**（3.5.1）。
 
 ### 3.5.3 RMW：排斥 merge，只能快冲
@@ -896,9 +896,9 @@ Pending 命令已消耗 credit（PA grant 时消耗），不会造成 credit 泄
 
 ## 4.1 定位与设计哲学
 
-**流水线位置**：Request Queue / PA（第 3 章：XMU → PA）之后、CS（BSC/GSC/FSC，第 3 章）之前。
+**流水线位置**：Request Queue / PA（第 3 章：XMU → PA）之后、CS（BSC/GSC/FSC，第 5 章）之前。
 
-**核心职责**：以 CAM（命令窗口）存储全流水线的读写请求，经三层筛选生成 per-bank 候选（CCT），并实施 hit 优先、批处理倾向的调度策略——**"能不能调"在这里决定**（"现在能不能发"在 CS，见第 3 章）。
+**核心职责**：以 CAM（命令窗口）存储全流水线的读写请求，经三层筛选生成 per-bank 候选（CCT），并实施 hit 优先、批处理倾向的调度策略——**"能不能调"在这里决定**（"现在能不能发"在 CS，见第 5 章）。
 
 **设计哲学（效率基本原则）**：
 
@@ -1074,7 +1074,44 @@ debt 达到 postpone 阈值 → 变成 critical ref，优先级最高，强制�
 
 - 普通 ref：作为低优先级请求参与正常调度，利用读写切换间隙执行；
 - critical ref：**最高优先级**，无视 hit/batch 逻辑直接插队——refresh 是不能无限让步的"债"；
-- 答辩提示：refresh 造成的 latency 尖峰 = critical ref 触发时的**补刷连发时间**（最多 8 个 tRFC），postpone 阈值越高、尖峰越罕见但越大——典型的均值/方差取舍。
+### 4.6.4 Perf 视角：REFpb vs REFsb 与 refresh 带宽损失评估
+
+**链路位置**：refresh 由 4.6.1 debt 机制排队、经 5.6 执行路径下发——本节是它在性能归因上的评估口径（perf 学习整理 [MODEL]，关联追踪清单 4-Q-03 / X-P1-07）。
+
+**协议事实 [SPEC]**：HBM3/HBM3E 的 `REFpb` 是真正的 Per-Bank Refresh，一次只刷新一个 bank；DDR5 的 `REFsb` 是 Same-Bank Refresh，一次刷新所有 BG 中相同 bank index 的 bank。
+
+**粒度与可隐藏性的取舍 [MODEL]**：HBM 刷新粒度更细，单次 refresh 期间可继续访问的 bank 更多，更容易利用 Bank-Level Parallelism 把 refresh 藏进其他 bank 的读写；代价是单条 refresh 命令完成的刷新工作更少，需要更频繁地发 REFpb，controller 的 refresh scheduling 压力更大。注意 `tRFCpb` 不一定比 DDR5 的 `tRFCsb` 短——HBM 的设计目标不是缩短目标 bank 的 refresh latency，而是把较长的 refresh latency **限制在单个 bank 内**，让其他 bank 继续工作。
+
+**评估方法：不能用比值，要用互斥归因 [MODEL]**：
+
+REFpb 场景下不能简单用
+
+$$
+Loss_{REF}\approx\frac{tRFC_{pb}}{tREFI_{pb}}
+$$
+
+估算带宽损失——`tRFCpb` 期间只有目标 bank unavailable，其他 bank 仍可提供 RD/WR。有意义的指标是 **Refresh-induced unhideable bubble**：
+
+$$
+Loss_{REF}
+\propto
+\frac{N_{\text{cycles blocked only by refresh}}}
+{N_{\text{total cycles}}}
+$$
+
+只有当存在 pending traffic、但由于 refresh 目标 bank 不可访问、且 scheduler 又无法从其他 bank 找到 timing-ready 的 useful command，才计为 refresh 造成的带宽损失：
+
+$$
+Cost_{REF}
+=
+f(tRFC,\ AffectedBanks,\ TrafficDistribution,\ BankParallelism,\ Scheduler)
+$$
+
+这解释了为什么相同的 `tRFCpb` 在不同 workload 下性能损失可能完全不同。
+
+**AP 作为 refresh-aware bank drain [MODEL/INFERENCE]**：REFpb 要求目标 bank 已 precharged/idle；若当前 row 还剩少量访问，可把最后一次 RD/WR 做成 Auto-Precharge，AP 与 `tRP` 完成后直接进入 REFpb——AP 成为 refresh-aware 的 bank drain 手段。但不能过早 AP，否则牺牲 row-hit locality（与 4.4 的 per-bank AP 策略是同一组旋钮）。
+
+> **待补数据（需补数据）**：per-workload 统计 "blocked only by refresh" cycle 数与 postpone depth sweep——登记于追踪清单 4-Q-03 / X-P1-07。
 
 ---
 
@@ -1095,7 +1132,7 @@ debt 达到 postpone 阈值 → 变成 critical ref，优先级最高，强制�
 | 问题 | 答案 |
 |---|---|
 | **功能** | 以 CAM 存储全流水线请求，按三层 filter 选出每 bank 最优候选（CCT），实施 FR-FCFS、优先级与防饿死 |
-| **输入/输出** | 入：CAM 中的读写命令（含优先级、bank/row/col 地址、到达时间）；出：per-bank CCT 候选提名（timing 过滤/方向切换/仲裁交给 CS，见第 3 章） |
+| **输入/输出** | 入：CAM 中的读写命令（含优先级、bank/row/col 地址、到达时间）；出：per-bank CCT 候选提名（timing 过滤/方向切换/仲裁交给 CS，见第 5 章） |
 | **状态** | bank open/closed 状态（row hit 判断）、读写方向状态、refresh debt、CamAging 计数、CCT 占用 |
 | **性能瓶颈** | hit 判断与三层 filter 的关键路径；CCT 提名粒度（每拍每 bank 一条）；turnaround 间隙 |
 | **BW 参数** | hit rate（地址映射决定上限）、BG 交织度、postpone 阈值、close/open page 策略 |
@@ -1136,7 +1173,7 @@ debt 达到 postpone 阈值 → 变成 critical ref，优先级最高，强制�
 | **TPW** | 默认优先级写命令（写队列中对应读侧 LPR 的角色） |
 | **expired** | CamAging 计数超时状态，是 GPR 晋升的触发条件 |
 
-**下一章建议**：第 3 章 Command Generator——它消费 CCT 的提名，衔接最紧。
+**下一章建议**：第 5 章 Command Scheduler（含 Command Generator）——它消费 CCT 的提名，衔接最紧。
 
 
 ---
@@ -1148,7 +1185,7 @@ debt 达到 postpone 阈值 → 变成 critical ref，优先级最高，强制�
 流水线下游的命令生成/调度侧，对应 RTL 顶层 **Command Scheduler** 模块：
 
 ```
-CQ（第 1 章）：CCT 候选命令（通过资格筛选的提名）
+CQ（第 4 章）：CCT 候选命令（通过资格筛选的提名）
      ↓
 ┌────────────────────────────────────────────┐
 │  CS (Command Scheduler 内核)                │
@@ -1352,7 +1389,7 @@ critical ref 触发
 
 | 术语 | 定义 |
 |---|---|
-| **CQ** | Command Queue，含 CAM 与三层 filter（第 1 章） |
+| **CQ** | Command Queue，含 CAM 与三层 filter（第 4 章） |
 | **CS** | Command Scheduler 内部子模块集合：BSC + GSC + FSC |
 | **BSC** | Bank Scheduler：per-bank 状态机 + bank/BG/rank 三级 AC timing 计数器 |
 | **GSC** | 读写模式切换控制器（详见 5.4） |
@@ -1363,7 +1400,7 @@ critical ref 触发
 | **ref_act_mask** | refresh 模块对 ACT 的 mask 信号，驱动 bank 进入 ACT_FORBID |
 | **drfm** | refresh 管理模块；**drfm pb** = per-bank refresh（LPDDR4/5 特性），在状态机中有独立请求/执行路径 |
 
-**下一章建议**：第 1 章 Timing Enforcement——BSC 的 forbid 计数器体系是它的主体，可深挖 counter 的面积/时序/功耗权衡与 SPDE 等进阶主题。
+**下一章建议**：第 6 章 Timing Enforcement——BSC 的 forbid 计数器体系是它的主体，可深挖 counter 的面积/时序/功耗权衡与 SPDE 等进阶主题。
 
       │ │                │  PRE_WAIT ⇄ FORCE_PRE     │
       │ │                └────────────┬──────────────┘
@@ -1384,14 +1421,14 @@ critical ref 触发
 
 ## 6.1 职责与边界
 
-**流水线位置**：与 Command Scheduler（第 3 章）一体——BSC 的 forbid/down 计数器体系就是 Timing Enforcement 的主体，本章讲它的完整架构。
+**流水线位置**：与 Command Scheduler（第 5 章）一体——BSC 的 forbid/down 计数器体系就是 Timing Enforcement 的主体，本章讲它的完整架构。
 
 **职责边界（一条清晰的分界线）**：
 
 | 归本章管 | 不归本章管 |
 |---|---|
-| **单命令间隔**：所有"命令 A 到命令 B 的最小间隔" | **命令序列的时序**：self refresh 进入/退出等序列型操作的时序由 **DFI 保证**（第 3 章） |
-| 驻留型检查（tRASmax 等"最晚必须做"） | refresh debt 调度策略（第 1 章） |
+| **单命令间隔**：所有"命令 A 到命令 B 的最小间隔" | **命令序列的时序**：self refresh 进入/退出等序列型操作的时序由 **DFI 保证**（第 7 章） |
+| 驻留型检查（tRASmax 等"最晚必须做"） | refresh debt 调度策略（第 4 章） |
 
 **零旁路原则**：**所有命令都必须通过 counter 检查才可下发**——没有任何例外通路。timing 永不违反是**结构性保证**，不是靠事后检查或验证 luck。
 
@@ -1469,7 +1506,7 @@ critical ref 触发
 | **总面积** | **488,888.7** | **100%** |
 
 **三组观察（表格可直接支撑的结论）**：
-1. **面积大头随协议切换**：LPDDR6 在 **CS**（23.08%，第 1 章 counter 体系所在，呼应"counter 占调度模块 40%"）；HBM4 在 **CQ + XMU**（合计 57.7%，双 PC 的 CAM96 队列 + link node 224 的在途结构）；
+1. **面积大头随协议切换**：LPDDR6 在 **CS**（23.08%，第 5 章 counter 体系所在，呼应"counter 占调度模块 40%"）；HBM4 在 **CQ + XMU**（合计 57.7%，双 PC 的 CAM96 队列 + link node 224 的在途结构）；
 2. **配置实证经验区间**：CAM 深度 LPDDR6=32 / HBM4=96，印证 3.2.2 的"32~96 经验值"——**低功耗产品用浅 CAM，高带宽产品用深 CAM**；link node 数同样按带宽需求放大（96 → 224）；
 3. **数据缓冲占比反映 burst 长度**：HBM4 的 WDP 仅 1.76%（BL8 短 burst、缓冲浅），LPDDR6 的 WDP 达 10.40%（BL32 长burst）。
 
@@ -1555,7 +1592,56 @@ DRAM 颗粒模型（datasheet/协议 timing）
 | **颗粒模型** | DRAM 颗粒 timing 的来源模型；经软件脚本（ceil）换算为控制器周期后配置寄存器 |
 | **min gap 覆盖率** | 验证指标：每类命令对的实际最小间隔被真实激励覆盖，保证 timing 检查无遗漏 |
 
-**下一章建议**：第 3 章 DFI——8 章已多次把"序列时序"甩给它（self refresh 序列、init/training 握手、low power），正好接住。
+## 6.8 Perf 视角：timing constraint 如何限制持续带宽（Supply/Demand 模型）
+
+**链路位置**：6.2 的 counter 体系是约束的**执行者**；本节是约束如何转化为带宽上限的**归因口径**（perf 学习整理 [MODEL]，关联追踪清单 6-Q-02 / X-P1-07）。
+
+**三层流水**：把 DRAM 的持续带宽理解为 **Row Supply → Column Supply → DQ** 三层：
+
+- `tCCD` 限制已开 row 上 RD/WR column command 的发射速度 → 直接限制 **Column Supply**；
+- `tRRD` / `tFAW` 限制 ACT 的发射速度 → 限制 **Row Supply**（新 row 被打开的速度）。
+
+设一次 ACT 平均服务 \(H\) 个 column command（**H = row-hit 摊薄因子**，把 row hit 与 timing bottleneck 联系起来），每个 column command 搬运 \(D\) bytes，则持续带宽的一级近似：
+
+$$
+BW_{sustained}
+\le
+\min
+\left(
+BW_{DQ,peak},
+\frac{D}{tCCD_{eff}},
+\frac{DH}{tRRD_{eff}},
+\frac{4DH}{tFAW}
+\right)
+$$
+
+再计入单 bank 的 row recycle（`tRC`，\(B_{eff}\) 为真正能轮转使用的有效 bank 数）：
+
+$$
+BW_{sustained}
+\le
+\min
+\left(
+BW_{DQ,peak},
+\frac{D}{tCCD_{eff}},
+\frac{DH}{tRRD_{eff}},
+\frac{4DH}{tFAW},
+\frac{DHB_{eff}}{tRC}
+\right)
+$$
+
+**H 的两种 regime**：
+
+- 高 row-hit workload：一个 ACT 被很多 RD/WR 摊薄，\(H\) 很大 → `tRRD/tFAW` 通常被隐藏，带宽受 `tCCD` 或 DQ 限制；
+- 低 row-hit workload：\(H\approx1\)，需要不断 ACT 新 row → Row Supply 跟不上 Column Demand，ready RD/WR 不足，最终在 DQ 上形成 bubble。
+
+**用途定位**：这套公式不是精确预测 JEDEC 带宽，而是用于**性能归因**——tCCD 决定已有 open row 时数据多快被消费（Column Supply），tRRD/tFAW/tRC 决定新 open row 多快被生产（Row Supply）；谁的供给能力最低，谁就是 sustained bandwidth 的瓶颈。
+
+**计数口径（对齐 0.8 第五层量化）**：性能模型不应统计\"发生了多少次 tCCD/tRRD\"，而应统计\"**本来存在 useful command，但唯一因为该 timing constraint 无法发出**\"的 lost issue slot——互斥归因，与 4.6.4 的 refresh bubble 口径同构。
+
+> **待补数据（需补数据）**：timing blocker Top 5（tCCD/tRCD/tRRD+tFAW/tWTR+tRTW/tRFC）各自的 lost issue slot 占比 sweep——登记于追踪清单 6-Q-02。
+
+**下一章建议**：第 7 章 DFI——前文已多次把"序列时序"甩给它（self refresh 序列、init/training 握手、low power），正好接住。
 
 
 ---
@@ -1564,7 +1650,7 @@ DRAM 颗粒模型（datasheet/协议 timing）
 
 ## 7.1 频率架构：ratio 定标
 
-### 9.1.1 频率比配置
+### 7.1.1 频率比配置
 
 | 配置 | DFI : CK : WCK | DFI 实际频率 | 适用场景 |
 |---|---|---|---|
@@ -1573,7 +1659,7 @@ DRAM 颗粒模型（datasheet/协议 timing）
 
 HBM（ratio4）：CTRL 最高 **1200MHz @ 三星 SF4**，颗粒数据速率 9600，每拍一命令。
 
-### 9.1.2 定标哲学
+### 7.1.2 定标哲学
 
 > **控制器频率不能太高**——某些工艺 900MHz 以上难以收敛。ratio 的本质是**用 DFI 总线位宽换控制器时序**。
 
@@ -1593,7 +1679,7 @@ HBM（ratio4）：CTRL 最高 **1200MHz @ 三星 SF4**，颗粒数据速率 9600
 
 ## 7.3 Low Power：DEVMGR 与全链路排空（本章核心）
 
-### 9.3.1 覆盖状态与排空条件
+### 7.3.1 覆盖状态与排空条件
 
 低功耗状态：**SR（self refresh）、PD（power down）、DSME（LPDDR deep sleep）**。
 
@@ -1605,7 +1691,7 @@ HBM（ratio4）：CTRL 最高 **1200MHz @ 三星 SF4**，颗粒数据速率 9600
 | CQ | **CAM empty** |
 | 期间 | 反压 AXI 上游 |
 
-### 9.3.2 硬件触发流程（本章核心时序）
+### 7.3.2 硬件触发流程（本章核心时序）
 
 ```
 XMU 无新请求 → 告知 DEVMGR
@@ -1621,7 +1707,7 @@ XMU 无新请求 → 告知 DEVMGR
 
 保证状态机不撕裂：请求永远在"低功耗已确定退出、反压已确定撤销"之后才被接纳。
 
-### 9.3.3 软硬件触发的对称性
+### 7.3.3 软硬件触发的对称性
 
 - **硬件触发**：链路空闲时自动进入，来流量自动退出；
 - **软件触发**：**进入和解除都必须由软件完成**——软件发起的低功耗，硬件不擅自解除；
