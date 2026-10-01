@@ -18,22 +18,37 @@
 
 三个使用场景：
 
-1. **5 分钟快速复习**：只看 §0.5 一页总览 + §7 Generation Evolution + §8 Interview Review；
-2. **30~60 分钟系统复习**：按 §1→§6 顺序重建 DRAM physics → organization → interface → reliability → PHY → controller 完整模型；
-3. **面试追问**：从 §8 的问答跳转到对应章节的 Why / Controller Impact / Tradeoff / Evolution。
+1. **5 分钟快速复习**：只看 §0.5 一页总览 + §8 Generation Evolution + §9 Interview Review；
+2. **30~60 分钟系统复习**：按 §1 Physical Foundation → §2 Organization → §3 Interface → §4 Reliability → §5 Power/Operating State → §6 PHY Link Closure → §7 Controller/DFI Contract → §8 Generation Delta 顺序重建完整模型；
+3. **面试追问**：从 §9 的问答跳转到对应章节的 Why / Controller Impact / Tradeoff / Evolution。
+
+**§1~§8 是知识输入，§9 Interview Review 是最终验收出口**——所有重要正文主题都应能映射到至少一个 Q&A；答不出对应题目视为该主题未真正建立。
 
 本文**不是**：DRAM analog circuit 教材、SerDes/PHY analog 设计指南、JEDEC Spec 全文摘录、SI/PI 专著、Controller RTL microarchitecture 文档（后者见 `DDR_Controller_Architecture.md`）。
 
-### 0.2 六层分析模型
+### 0.2 知识组织链（八级）
 
-| 层 | 追问 | 关注度 |
-|---|---|---|
-| 1. Problem | 上一代遇到了什么问题？ | 入口 |
-| 2. Protocol Mechanism | 协议具体增加或改变了什么？ | 入口 |
-| 3. Physical Cause | 为什么物理上需要这样做？ | ★ 核心 |
-| 4. Controller Cost | Controller 需要新增什么状态机、counter、queue、sequence？ | ★ 核心 |
-| 5. PHY / Package Cost | PHY、信号、电源、封装需要新增什么？ | ★ 核心 |
-| 6. Tradeoff / Evolution | 获得了什么？付出了什么？下一代往哪个方向继续？ | ★ 核心 |
+每个 Feature 都沿这条链组织（章节编号即链的展开顺序）：
+
+```text
+Physical Constraint（§1）
+        ↓
+Protocol Mechanism（§1~§4）
+        ↓
+System / Interface Organization（§2~§3）
+        ↓
+PHY Link Closure（§6）
+        ↓
+Controller Requirement（§7.2）
+        ↓
+DFI Contract（§7.3~§7.7）
+        ↓
+Architecture Tradeoff（§5.5/§7.11/§8）
+        ↓
+Interview Answer（§9）
+```
+
+每个重要 section 读完后应能恢复：Problem → Physical Cause → Protocol Mechanism → Controller/PHY Impact → Tradeoff 五层因果链（不机械写五层标题，但链必须可重建）。
 
 ### 0.3 Source Discipline
 
@@ -53,7 +68,7 @@
 
 - **PHY 深度**：不设计 analog PHY，但要打通 `Protocol Feature → Physical Problem → Training / Calibration → DFI Handshake → Controller Responsibility`。PHY 概念统一要求：Concept → 破坏了什么 margin → 需要什么训练/校准 → Controller 是否感知。无法连接回 Protocol / PHY / Controller 三角的纯 SI 理论不属于主文。
 - **Controller 深度**：本文只讲"协议给 Controller 提出什么 requirement"（state / checker / sequence / 预算），不讲 CAM / Queue / 仲裁 / FSC 等 RTL microarchitecture（见 `DDR_Controller_Architecture.md`）。
-- **DFI 深度**：主文只保留 architecture meaning；signal-level 细节（rolling order、phase placement 等）在 Appendix D。
+- **DFI 深度**：主文只保留 architecture meaning（ratio/rolling 的架构含义已进 §7.4/§7.5 正文）；波形级时序不在本文范围。
 
 ### 0.5 一页总览
 
@@ -67,7 +82,7 @@
 | 突发长度 | BL8 | BL8 | BL8 | BL16 | BL16/BL32（MR 选择） | BL24/BL48 |
 | 容量 | 16/24 GB | 24/36/48 GB | ≤64 GB（4~16 die） | die 16/24/32Gb | 单封装 16~32 GB+ | 16Gb die 起，CAMM2 |
 | 电压 | core 1.1V / I/O 1.1V / Tx 0.4V | 同左 | core 1.05V / I/O 厂商自定 | 1.1V（+VPP） | VDD1/VDD2H/VDD2L/VDDQ | VDD2C 1.0V/VDD2D 0.875V/VDDQ 0.5V |
-| CKE | 无（命令式低功耗） | 无 | 无 | 有 | 无（CA 命令进低功耗） | 无 |
+| CKE | 无（命令式低功耗） | 无 | 无 | 有（CKE_t/CKE_c 差分；CKE LOW 进 PD，tCKE） | 无（CA 命令进低功耗） | 无 |
 | 刷新管理 | RAA+ARFM（可选） | 同左 | RFMpb/DRFMpb+BRC | REFab/REFsb + RFM/DRFM/ARFM | REFab/REFpb + RFM→ARFM | REFpb + PRAC + ABO |
 | ECC | On-die ECC + 接口 ECC + SEV 上报 | 同左增强 | 同左 + ECS 多 bit | ODECC 强制（128+8 SEC） | Link ECC（可选） | 突发内嵌 tag/ECC（288=256+32） |
 
@@ -75,6 +90,7 @@
 
 - **HBM**：带宽引擎——堆叠近存、超高带宽密度、容量天花板低；AI/HPC 专属。
 - **DDR5**：容量底座——插槽横向扩展、单位容量成本最低；服务器主存。
+- **LPDDR5/6**：能效引擎——低功耗近端内存、多频点 DVFS、细粒度电源管理，以更复杂的训练/切频换取移动与边缘场景的能效。
 
 ## 1. DRAM Common Foundation
 
@@ -115,11 +131,12 @@ ACT ──tRCD──> RD/WR ……突发…… ──PRE──> idle ──tRP�
 
 **tRASmin（ACT → PRE 最小驻留）**：限制"修复驻留"——SA 放大后的值必须回写 Cs；tRASmin ≥ tRCD + 突发 + 回写余量，同时也是激活电流占空约束之一（§2.3 墙 1）。提前 PRE → 修复中断、数据丢失。不可优化、可被调度隐藏（让该 bank 的等待与其他 bank 的服务重叠）。
 
-**tRASmax——现行标准已不定义**：'tRASmax' 在 DDR5 / LPDDR5 / LPDDR6 / HBM3 / HBM4 五标准中全部 **0 命中** [JEDEC 考据，Appendix D.9]。历史规范（LPDDR2/3 时代）定义 ≈9×tREFI [PROJECT ⚠️——旧标准不在库]，动机是防 open row 长期不关导致 REF 发不出去（REF 需要 bank precharge——HBM3 现行 NOTE 2 仍要求 "A bank must be in the idle state with tRP satisfied before it is refreshed"）。现代协议删除它的原因：**控制器自管 REF 发送**（postpone / pull-in / FGR / per-bank 预算，§4.3），标准层面无需再约束行开放时长——复杂度转移到控制器的又一实例。呼应观察 [INFERENCE]：历史 tRASmax ≈9×tREFI 与现代 postpone 预算 9×tREFIe（§4.4）数字同源——都是"刷新调度灵活度的外边界"。
+**tRASmax——现代标准不再定义独立符号，但行开放时长约束并未消失**：'tRASmax' 符号在五标准（DDR5/LPDDR5/LPDDR6/HBM3/HBM4）中均未出现 [JEDEC]；但 HBM3/4 的 AC 表在 tRAS 行 **MAX 列给出 9×tREFI**（AP 命令内部 precharge hold-off 的时钟数经 MR4 'RAS' 字段编程），tPD 行同样有 MAX=9×tREFI——"最长行开放/低功耗驻留"约束以 MAX 列 + 可编程字段的形式保留（对非 AP 流量是否强约束 ⚠️ [UNKNOWN]）。历史规范（LPDDR2/3 时代）定义 ≈9×tREFI，动机是防 open row 长期不关导致 REF 发不出去（REF 需要 bank precharged）。现代协议删除独立符号的原因：**控制器自管 REF 发送**（postpone / pull-in / per-bank 预算，§4.3），标准无需再约束行开放时长——复杂度转移到控制器。架构意义在 **refresh 与 open-row 的关系**：历史 tRASmax ≈9×tREFI 与现代 postpone 预算 9×tREFIe（§4.4）数字同源——都是"刷新调度灵活度的外边界" [INFERENCE]。
 
 **tRP（PRE → 下一次 ACT）**：DRAM 内部完成三件事（顺序关键）[PHYSICAL-EXPLANATION]：① **关闭字线**——WL 从 VPP 放到 0；修复值在 SA 保持期间已写回 Cs，关 WL 就是"落袋"动作本身，此后电荷重新封存；② **复位 SA**——撤除使能、节点回到高阻预充态；③ **位线均衡**——EQ 把 BL 与 /BL 短接均衡到 VDD/2，为下次电荷共享准备零基准（不均衡则残余差分污染下次判决）。PRE 命令本身只有半拍/1 拍——**等的是内部过程**。提前 ACT → 基准污染、判决出错。
 
-**tRC = tRAS + tRP**：同一 bank 两次 ACT 的最小间隔，由完整生命周期决定；是单 bank 吞吐的硬上限（row miss 密集时每次访问 ≈ tRC，§1.6 行开销算术）。
+**tRC = tRAS + tRP**：同一 bank 两次 ACT 的最小间隔，物理上覆盖 active + precharge 的完整 row lifecycle，因此 **tRCmin ≥ tRASmin + tRPmin——很多速度档取等号**（表列值 = tRAS + tRP）。**Controller 仍需独立检查 tRP、不能只查 tRC**：PRE 可能晚于 tRASmin 发出（等 tRTP/调度），若下一次 ACT 紧贴 tRC 边界，此时 ACT→ACT 的 tRC 已满足，但 PRE→ACT 的恢复过程（关字线/复位 SA/均衡，见上 tRP 三件事）尚未完成——tRC 只约束两个 ACT，不感知 PRE 的实际时刻。tRC 也是单 bank 吞吐的硬上限（row miss 密集时每次访问 ≈ tRC，§1.6 行开销算术）。
+*Interview anchor: §9.1 Q2/Q4、§9.2 W25*
 
 ### 1.4 Read / Write Specific Timing
 
@@ -141,7 +158,7 @@ ACT ──tRCD──> RD/WR ……突发…… ──PRE──> idle ──tRP�
 
 **tRTW（读 → 写）**：只需方向翻转，且写命令可提前发——写数据滞后是可利用余量：不冲突条件 **tRTW ≥ CL − CWL + BL/2**（DDR5 Table 43 公式核心项，其余为 DQS 对齐 / 读写沿的电气细节 [JEDEC]）。
 
-**W→R 比 R→W 贵的三面** [PHYSICAL-EXPLANATION]：① 电气——R→W 仅方向翻转（SA 正常），W→R = 方向翻转 + 覆盖传播 / SA 稳定；② 数值——tWTR_L(10ns) > tRTW(公式项) > tWTR_S(2ns)；③ 系统——写可缓冲解耦、读有 QoS 约束 → 调度器攒写、分组翻转，不对称被策略进一步放大（§6.2）。
+**W→R 比 R→W 贵的三面** [PHYSICAL-EXPLANATION]：① 电气——R→W 仅方向翻转（SA 正常），W→R = 方向翻转 + 覆盖传播 / SA 稳定；② 数值——tWTR_L(10ns) > tRTW(公式项) > tWTR_S(2ns)；③ 系统——写可缓冲解耦、读有 QoS 约束 → 调度器攒写、分组翻转，不对称被策略进一步放大（§7.2）。
 
 ### 1.6 Array-limited vs Interface-limited Timing
 
@@ -162,6 +179,7 @@ ACT ──tRCD──> RD/WR ……突发…… ──PRE──> idle ──tRP�
 | BL | 16 | 16 | 8 |
 
 - **相对值差异巨大**——行开销 ≈ 多少个 burst：HBM4 ≈ **28.6 个 BL8**、DDR5-8400 ≈ 9.2 个 BL16、LPDDR5-6400 ≈ 7.2 个 BL16。接口越快、行开销相对越重 → HBM 最依赖 bank 并行 + 行/列并行命令接口摊薄（§3.1）；**row hit 率就是命令放大率的倒数**（§3.4）。
+- **行开销与 bank 并行度同向排序** [JEDEC HBM3/HBM4 Table 4/5 + INFERENCE]：行开销最大的 HBM 恰好也是 bank 最多的一类——HBM3 每 PC 至多 **64 banks**（4 SID × 4 BG/SID × 4 bank/BG；Table 5 每 4 bank 一个 BG，64B 档共 16 个 BG）；HBM4 同为每 PC 至多 **64 banks 但 BG 减半**（每 SID 4→2 BG、单 BG 4→8 bank；§3.2.1 表列 2/4/6/8 BG 随 die 数 4/8/12/16）；DDR5 每子通道 **8 BG × 4 = 32 banks**；LPDDR5 每通道 **4 BG × 4 = 16 banks 起**（16B 模式无 BG 划分；bank 数随密度档 ⚠️ 以 JESD209-5B 为准）。**64 ≫ 32 > 16 的 bank 并行度与 28.6 > 9.2 > 7.2 的行开销排序一致——行开销越大，需要的并行 bank 越多来摊薄**（§1.7/§2.3 的量化印证）。
 - **约束形式差异**：LPDDR5 用 Max(ns, nCK) 双约束；HBM 用纯 CK 约束——速率上升时 ns 自动收缩、逼近阵列物理极限；温度升高让 ns 侧进一步恶化（§4.5）。
 
 ### 1.7 Bank Parallelism 的第一性来源
@@ -183,9 +201,9 @@ ACT ──tRCD──> RD/WR ……突发…… ──PRE──> idle ──tRP�
 【核心结论】各层扩展中**只有 Channel 层真正扩带宽**——因为它同时增加 CA 命令域与 DQ 数据引脚；rank / bank / die 只在既有接口后面堆资源。
 
 - 加带宽的路线只有加接口：DDR5 多 DIMM / 多通道横插、HBM 多 stack、LPDDR 多通道。
-- HBM 是 channel 路线的极致：HBM3 = 16ch×64-bit；HBM4 = 32ch×64-bit（2048-bit 总宽）——翻位宽而非提速率的功耗学依据见 §3.10 / §7.3。
+- HBM 是 channel 路线的极致：HBM3 = 16ch×64-bit；HBM4 = 32ch×64-bit（2048-bit 总宽）——翻位宽而非提速率的功耗学依据见 §3.10 / §8.3。
 - Channel 的定义性特征：独立 CA、独立 CK（可不同步）、独立刷新 / 时序状态。HBM 原文："each channel is independent…not necessarily synchronous" [JEDEC]。
-- Controller 代价：每个 channel 一套命令译码 / 状态机 / 训练实例；channel 数 × 请求路由压力（NoC / 地址映射，§6.1）。
+- Controller 代价：每个 channel 一套命令译码 / 状态机 / 训练实例；channel 数 × 请求路由压力（NoC / 地址映射，§7.2）。
 
 ### 2.2 Rank / SID：Capacity Expansion
 
@@ -234,18 +252,20 @@ ACT ──tRCD──> RD/WR ……突发…… ──PRE──> idle ──tRP�
 
 **三家 BG 时序对照**（S=Short=跨 BG / L=Long=同 BG；DDR5/HBM4 命名统一，LPDDR5 的 BL/n 语义同方向）[JEDEC]：
 
-| 列域命令间隔 | DDR5（BL16） | HBM4（Table 6） | LPDDR5（BL16，CKR 4:1，Table 330） |
+| 列域命令间隔 | DDR5（BL16） | HBM4（Table 6/108，JESD270-4A） | LPDDR5（BL16，CKR 4:1，Table 330） |
 |---|---|---|---|
-| 跨 BG R2R | tCCD_S = 8nCK（=突发占用） | tCCDS | BL/n_min = 2tCK |
-| 跨 BG W2W | tCCD_S_WR = 8nCK | tCCDS | — |
-| 同 BG R2R | tCCD_L = 8~16nCK（MR13 按速率档编程） | tCCDL（R2R 亦可标 tCCDR） | BL/n_max = 4tCK |
-| 同 BG W2W | Max(32nCK, 20ns) | — | tCCDMW = 4×BL/n |
-| W→R | 同 BG Max(16nCK,10ns) / 跨 BG Max(4nCK,2ns) | tWTRS / tWTRL | — |
-| ACT→ACT | tRRD_S / tRRD_L | tRRDS / tRRDL | 同方向 |
+| 跨 BG R2R | tCCD_S = 8nCK（=突发占用） | tCCDS = **2nCK**（=BL8 突发占用） | BL/n_min = 2tCK |
+| 跨 BG W2W | tCCD_S_WR = 8nCK | tCCDS = 2nCK（无缝读/写同参数，NOTE 16） | — |
+| 同 BG R2R | tCCD_L = 8~16nCK（MR13 按速率档编程） | tCCDL = **Max(4nCK, 2.5ns/tCK)**（@8G 档 tCK=0.5ns → 5nCK）；跨 SID 无缝连读改用 tCCDR（厂商自定，tCCDS+1~2nCK，NOTE 17） | BL/n_max = 4tCK |
+| 同 BG W2W | Max(32nCK, 20ns) | tCCDL 同参数（NOTE 14：同 BG 无缝 Write/Read 均适用）——对比 DDR5 的 20ns 写惩罚 | tCCDMW = 4×BL/n |
+| W→R | 同 BG Max(16nCK,10ns) / 跨 BG Max(4nCK,2ns) | tWTRS / tWTRL（表列值留白，厂商 datasheet） | — |
+| ACT→ACT | tRRD_S / tRRD_L | tRRDS / tRRDL（ns，表列值留白，厂商 datasheet） | 同方向 |
 
-（DDR5 tCCD_M 中间层、3DS _slr/_dlr 后缀与 PDF 提取警示见 Appendix D.3；LPDDR5 Table 330 NOTE 1 "BL/n is minimum column to column cycle time, tCCD(min)"、NOTE 6/7 同 BG=BL/n_max、跨 BG=BL/n_min；16B Mode（无 BG）BL16 也是 2tCK——跨 BG 交织只是把同 BG 惩罚恢复到总线极限。）
+（DDR5 tCCD_M 中间层、3DS _slr/_dlr 后缀与 PDF 提取警示见 §A.3；LPDDR5 Table 330 NOTE 1 "BL/n is minimum column to column cycle time, tCCD(min)"、NOTE 6/7 同 BG=BL/n_max、跨 BG=BL/n_min；16B Mode（无 BG）BL16 也是 2tCK——跨 BG 交织只是把同 BG 惩罚恢复到总线极限。）
 
-**Controller Impact**：BG-aware 排序（把连续请求按 BG 交织）直接抬高总线利用率；地址映射要 BG 交织防热点；timing checker 增加 S/L 双档参数（§6.3）。
+**HBM4 数值口径** [JEDEC JESD270-4A Table 108]：接口侧 CCD 族被标准钉死在总线极限（tCCDS=2nCK、tCCDL=Max(4nCK, 2.5ns/tCK)、tPPD=2nCK），而阵列侧 tRRDS/tRRDL/tFAW/tWTRS/tWTRL 及 tRC/tRAS(min)/tRCDRD/tRCDWR/tRP 在表中**留白、交厂商 datasheet**（tRFCab 等刷新参数则按密度/堆叠档给出）——"**接口参数标准化、阵列参数厂商化**"正是 §1.6 阵列受限 vs 接口受限判据在 AC 表结构上的投影。另注：JESD270-4A 表列速度档为 **4.8~8.0 Gbps/pin 共 9 档**，10~12.8G 属厂商扩展档。
+
+**Controller Impact**：BG-aware 排序（把连续请求按 BG 交织）直接抬高总线利用率；地址映射要 BG 交织防热点；timing checker 增加 S/L 双档参数（§7.2）。
 
 
 ### 2.5 Sub-channel / Pseudo-Channel / LPDDR6 SC
@@ -257,7 +277,7 @@ ACT ──tRCD──> RD/WR ……突发…… ──PRE──> idle ──tRP�
 完整因果链：DRAM 核心频率十年平坦 → 提速率只能加大预取（DDR4 8n → DDR5 **16n**，JESD79-5B："uses a 16n prefetch architecture **to achieve high-speed operation**…a single 16n-bit wide, eight clock data transfer at the internal DRAM core"）→ 预取决定最短突发（BL16）→ 若保持 64-bit 通道，一命令 = 64bit×16 = **128B = 2 条 cache line，过取一倍** → 拆成 2×32-bit 子通道 → **32bit×BL16 = 64B 正对齐一条 cache line**，同时命令并发 ×2。[JEDEC 预取原文 + PHYSICAL-EXPLANATION 算术]
 
 - 每 DIMM 2 个完全独立子通道：各 32-bit（ECC 模组 40-bit = 32 数据 + 8 side-band ECC）；各自 14-bit CA、CS、行列译码、时序状态机与刷新相位，可同时执行不同命令（一个在 tRFC、另一个满带宽读）。
-- **术语考据**：'sub-channel' 在 JESD79-5B 全文 **0 命中**——标准只定义单通道颗粒（x4/x8/x16，各自 CA[13:0]/CS_n）；双子通道是 **DIMM 级组织**（4 颗 x8 或 8 颗 x4 归一组、共享子通道 CA 布线，RDIMM 由 RCD 分组驱动）。说"子通道"是系统组织口径，不是标准术语 [JEDEC 0 命中考据]。
+- **术语口径**：'sub-channel' 在 JESD79-5B 全文 **0 命中**——标准只定义单通道颗粒（x4/x8/x16，各自 CA[13:0]/CS_n）；双子通道是 **DIMM 级组织**（4 颗 x8 或 8 颗 x4 归一组、共享子通道 CA 布线，RDIMM 由 RCD 分组驱动）。说"子通道"是系统组织口径，不是标准术语 [JEDEC 0 命中（spec 全文检索）]。
 - DDR5 并未完全砍掉 chop："a burst length of sixteen **or a 'chopped' burst of eight**"（BC8 OTF 保留，主粒度仍是 BL16）。
 - CL 与子通道没有直接关系（CL 随频率档标定，跨代绝对时间守恒）——子通道化改变的是**最小访问粒度与并发请求数**："用位宽换请求数"。
 - BG/bank：bank group 架构，16Gb 档为 8BG×4B=32 banks/子通道 ⚠️（以厂商 datasheet 为准）；BL16。
@@ -268,7 +288,7 @@ ACT ──tRCD──> RD/WR ……突发…… ──PRE──> idle ──tRP�
 - Channel 级动机：1024-bit 接口若做单通道，命令译码扇出、布线 / 凸点与调度耦合都不可行；拆成独立通道后每通道有独立 CA/CK/复位与自己的刷新状态，请求间零时序耦合、调度自由度最大 [JEDEC]。
 - **PC 级动机（"pseudo" 的含义）**：通道内阵列再对半分（2×32-bit DQ），两 PC **共享通道的 CK 与行 / 列命令总线**（省掉第二套命令接口与引脚），但各有独立 bank 阵列 / 译码 / 时序状态；**刷新以 PC 为单位**——真值表中 REFab/RFMpb/RFMab 编码携带 PC 位（REFab = 刷"该 PC 的全部 bank"）[JEDEC p49 Table 30]；HBM4 阵列时序逐 PC 独立计时。
 - **边界（重要修正）：电源管理是通道级，不区分 PC**——真值表中 **PDE 的 PC 位为定值 H、SRE 为定值 L**、PDX/SRX 为 H（地址位 Don't Care，Table 30 NOTE 4）；SRE 前提原文（§6.3.4.2）："only allowed when all banks in **both** pseudo channels are precharged with tRP satisfied"。物理因果 [PHYSICAL-EXPLANATION]：PC 的独立性止步于"**有时钟的域**"（阵列 / 译码 / 刷新 / 时序状态）；PD 期间 CK 可停止、SR 无外部时钟——时钟没了的领域，独立 PC 状态机无处安放，只能通道级同步。这也是"刷新做到 PC 级（打命令必须有时钟）、省电态做成通道级"的原因。
-- HBM4 保持 ch-2PC 同构：通道翻倍（16→32）走位宽而非核心提速，控制器对象模型（独立 64-bit 命令域 × 各 2PC）不变 [INFERENCE]——对象模型稳定才能横向复制（§6.1）。
+- HBM4 保持 ch-2PC 同构：通道翻倍（16→32）走位宽而非核心提速，控制器对象模型（独立 64-bit 命令域 × 各 2PC）不变 [INFERENCE]——对象模型稳定才能横向复制（§7.2）。
 - 页大小 1KB/PC（HBM4）；通道密度 3~16Gb；bank 数 16/32/48/64 随密度与 die 数变化。
 
 **LPDDR6 Sub-Channel：x24 = 2×SC**
@@ -304,9 +324,10 @@ ACT ──tRCD──> RD/WR ……突发…… ──PRE──> idle ──tRP�
 | 电源域 | 独立 SR/PD | 通道级同步 |
 | 命令引脚成本 | 2×14 = 28 pin | 18 pin 服务 2 PC——"pseudo" 的引脚预算动机 |
 
-Controller 视角：DDR5 两子通道 = 两套独立状态机 / checker 实例；HBM 通道内两 PC = 共享发射端口 + 每 cycle "发给哪个 PC" 的仲裁（§6.2）。
+Controller 视角：DDR5 两子通道 = 两套独立状态机 / checker 实例；HBM 通道内两 PC = 共享发射端口 + 每 cycle "发给哪个 PC" 的仲裁（§7.2）。
 
 **通道位置三级对照** [INFERENCE]：通道在 **die 外**（DIMM 分组）→ DDR5；通道在 **die 内**（一 die 多通道）→ LPDDR6 SC、HBM4 8ch/die；通道在 **stack 内跨 die 共享总线**（TSV + SID）→ HBM3/4。**独立 CA 在哪一层出现，并发就在哪一层发生。**
+*Interview anchor: §9.3 C1*
 
 ### 2.7 为什么现代 Memory 越来越 More / Narrower / More Independent
 
@@ -327,13 +348,13 @@ Controller 视角：DDR5 两子通道 = 两套独立状态机 / checker 实例�
 
 **三个反向项**（避免一边倒）：① 每通道流量变稀 → open row 局部性摊薄，对 row-buffer 型负载是负项；② 协议开销不降反升——LPDDR6 命令 2 周期 / ACT 4 周期（§3.2）、288-bit 突发仅 89% 有效（§3.5）；③ 刷新与激活的窗口竞争随实例数增长（§4.3）。
 
-**Controller / PHY 代价**：实例数翻倍 → 状态机 / 计时器 / checker / CAM 全线线性增长（§6.2）；调度算法与防热点映射（channel-first）复杂化；NoC 压力前移（§6.1）。PHY 侧：DQ 总引脚由带宽需求决定，省的是 **CA 引脚摊薄**（HBM 18 pin 服务 2 PC、LPDDR6 每 SC 4CA+2CS）与走线组规整（DDR5 RCD 分组、LPDDR PoH 可行）；代价转移到 bump 密度 / 封装布线（HBM4）。
+**Controller / PHY 代价**：实例数翻倍 → 状态机 / 计时器 / checker / CAM 全线线性增长（§7.2）；调度算法与防热点映射（channel-first）复杂化；NoC 压力前移（§7.2）。PHY 侧：DQ 总引脚由带宽需求决定，省的是 **CA 引脚摊薄**（HBM 18 pin 服务 2 PC、LPDDR6 每 SC 4CA+2CS）与走线组规整（DDR5 RCD 分组、LPDDR PoH 可行）；代价转移到 bump 密度 / 封装布线（HBM4）。
 
 ### 2.8 Capacity / Bandwidth / Parallelism 为什么逐渐解耦
 
 【核心结论】带宽需求与容量需求不同步增长 → 协议把三者拆成可独立配置的维度。
 
-- **HBM4（JESD270-4）**："HBM4 requires 4 DRAM dies to support 32 channels. Additional DRAM dies beyond 4 add additional capacity, SIDs and additional banks per pseudo channel"——4 die 即满 32 通道，第 5~16 die 只增加容量、SID 与 bank 数（16/32/48/64 banks per channel）[JEDEC Figure 1]。加 die 的本质是 **bank 维度扩展**：Table 4 的 Bank Address 字段随堆叠高度从 BA[3:0]（16 banks/channel）长出 SID[0]（32）再到 SID[1:0]（48/64；Table 5 中 bank 分 A~H 八个 BG 组，48B 档 SID[1:0]=11 invalid）——**SID 不是 CS 式选择子，而是并入 bank 地址的高位**，RA[13:0]/CA[4:0]/页大小 1KB 全部不动（细节 Appendix D.7）。因此**峰值带宽不变**（32ch×速率由接口决定，4 die 与 16 die 相同），**有效性能可提升**——每通道可开 row 数最高 ×4，row miss 率靠加 die 压低。
+- **HBM4（JESD270-4）**："HBM4 requires 4 DRAM dies to support 32 channels. Additional DRAM dies beyond 4 add additional capacity, SIDs and additional banks per pseudo channel"——4 die 即满 32 通道，第 5~16 die 只增加容量、SID 与 bank 数（16/32/48/64 banks per channel）[JEDEC Figure 1]。加 die 的本质是 **bank 维度扩展**：Table 4 的 Bank Address 字段随堆叠高度从 BA[3:0]（16 banks/channel）长出 SID[0]（32）再到 SID[1:0]（48/64；Table 5 中 bank 分 A~H 八个 BG 组，48B 档 SID[1:0]=11 invalid）——**SID 不是 CS 式选择子，而是并入 bank 地址的高位**，RA[13:0]/CA[4:0]/页大小 1KB 全部不动。因此**峰值带宽不变**（32ch×速率由接口决定，4 die 与 16 die 相同），**有效性能可提升**——每通道可开 row 数最高 ×4，row miss 率靠加 die 压低。
 - **LPDDR6**：x24 Normal 与 x12 Static Efficiency 混装（Mixed Package）——通道配置（带宽维度）与容量配置解耦 [JEDEC §2.2.2 / §7.8.29]。
 - **DDR5**：DIMM 承载解耦——通道数由平台走线决定，容量由槽数 × DIMM 密度决定（部署期可变）。
 - **扩展路径对比**（确定时机）：HBM 设计期锁死（TSV+键合良率、$/GB 最高、受良率/散热/厚度限制）；DDR5 部署期灵活插拔（代价：走线长、RCD/DB/PMIC 开销）；LPDDR 制造期焊死（CAMM2 后可换）。
@@ -354,17 +375,17 @@ Controller 视角：DDR5 两子通道 = 两套独立状态机 / checker 实例�
 
 **HBM 双命令总线（JESD238 §3.1.3）**：行总线专管 ACT/PRE/REF/RFM/PDE，列总线专管 RD/WR/MRS——ACT/PRE 可与 RD/WR **同窗口并行下发**，行管理开销被列数据流掩盖，这是 HBM 短突发（BL8）仍能维持满带宽的调度基础（对冲 §1.6 的 28.6 个 BL8 行开销）。
 
-- 量化论证：**tCCDS = 2 nCK = 4 WCK = BL8 突发占用**（Table 93："RD/WR bank A to RD/WR bank B command delay different bank group → tCCDS = 2"；同 BG tCCDL = Max(4, 2.5ns/tCK)）——列流背靠背正好填满列总线；行命令若共享此总线必偷列拍 [JEDEC]。精确化：分总线消除的是常规行命令（ACT/PRE）的竞争；REFab 是例外（Appendix D.2）。
+- 量化论证：**tCCDS = 2 nCK = 4 WCK = BL8 突发占用**（Table 93："RD/WR bank A to RD/WR bank B command delay different bank group → tCCDS = 2"；同 BG tCCDL = Max(4, 2.5ns/tCK)）——列流背靠背正好填满列总线；行命令若共享此总线必偷列拍 [JEDEC]。精确化：分总线消除的是常规行命令（ACT/PRE）的竞争；REFab 是例外（§4.2）。
 - 根因（引脚经济学换轨）：3D 堆叠 + TSV 把"增引脚"的边际成本降了一个量级，每通道养得起两条专用总线 [PHYSICAL-EXPLANATION]。
 
 **DDR5：14-bit CA + 1T/2T**：CA 从 DDR4 的 20+ 根压到 14 根（子通道化使引脚预算减半），本质是"引脚换拍数"——无地址命令（NOP/PRE/REF(REFab/REFsb)/RFM/MPC）1T，带地址命令（ACT/RD/WR/MRS）2T 共 28-bit（第 1 拍 opcode+BG/bank+行地址高位，第 2 拍列地址/行地址余位）。
 
-- **命令编码复用的演进终点**：SDRAM~DDR4 保留专用 RAS_n/CAS_n/WE_n（DDR4 约 20+ 根 CA/控制线 ⚠️），**DDR5 彻底删除——'RAS_n'/'CAS_n'/'WE_n' 在 JESD79-5B 全文 0 命中**，"CS is part of the command code"（p37）[JEDEC 0 命中考据]。
+- **命令编码复用的演进终点**：SDRAM~DDR4 保留专用 RAS_n/CAS_n/WE_n（DDR4 约 20+ 根 CA/控制线 ⚠️），**DDR5 彻底删除——'RAS_n'/'CAS_n'/'WE_n' 在 JESD79-5B 全文 0 命中**，"CS is part of the command code"（p37）[JEDEC 0 命中（spec 全文检索）]。
 - DFI 侧：2T 命令**原子不可拆**；训练/校准走 **MPC**（Multi-Purpose Command）承载子命令；模式寄存器 256 个 8-bit（CW 位区分 DRAM 与 RCD 寄存器组）。
 
 **LPDDR：7-bit（LPDDR5）/ 4-bit（LPDDR6）DDR CA**："LPDDR6 commands are two clock cycles long and defined by the states of CS at the 1st and 2nd rising edge (R1, R2) of clock and CA[3:0] at the 1st rising edge (R1), the 1st falling edge (F1), the 2nd rising edge (R2) and the 2nd falling edge (F2)…some operations such as ACTIVATE and MODE REGISTER WRITE require two commands"（Table 254 NOTE 1）；ACT-1 后必须跟 ACT-2（tAAD 窗口内仅 CAS/WRITE/READ/异 bank PRE/REF 可插入，NOTE 4）；CA 为 DDR 采样、CS 为 SDR（Table 1）——**CA 7→4 根的代价是命令带宽减半** [JEDEC]。
 
-**地址分时复用（更早的复用层）**：行/列地址分拍送上同一组引脚——自 SDRAM 第一代如此，是 DRAM 引脚经济学的起点：地址引脚数不随"行位宽+列位宽"线性增长。注意复用的两层含义演进时间不同：**地址分时复用**自 SDRAM 起就有；**命令编码复用**（控制线并入 CA）直到 DDR5 才彻底完成 [JEDEC 考据]。
+**地址分时复用（更早的复用层）**：行/列地址分拍送上同一组引脚——自 SDRAM 第一代如此，是 DRAM 引脚经济学的起点：地址引脚数不随"行位宽+列位宽"线性增长。注意复用的两层含义演进时间不同：**地址分时复用**自 SDRAM 起就有；**命令编码复用**（控制线并入 CA）直到 DDR5 才彻底完成 [JEDEC]。
 
 ### 3.2 Pin Budget vs Command Cycle
 
@@ -379,7 +400,8 @@ Controller 视角：DDR5 两子通道 = 两套独立状态机 / checker 实例�
 - **CA pin 少的好处** [PHYSICAL-EXPLANATION]：引脚/封装成本、走线组规整、SSO-skew 随位宽超线性——LPDDR 的 PoP/PoH 封装与 DDR5 RCD 分组都依赖窄 CA；HBM 的 CA 摊薄（18 pin 服务 2 PC）同理。
 - **代价**：**命令延迟与命令带宽**——同样命令速率下占用更多 CK 周期；ACT 载荷最大（行地址），所以 ACT 最先变多拍（§3.3）。
 - 对照记忆：LPDDR5 是"7-bit CA 但 DDR 传输"，DDR5 是"14-bit CA 但部分命令 2T"——同一命题（引脚预算 vs 命令带宽）的两种解；LPDDR6 两头都要省 → 命令 2 周期、ACT 4 周期。
-- Controller 代价：编码器区分 1T/2T、2T 原子性、双命令序列（ACT-1/2 + tAAD）状态机（§6.5）。
+- **为什么 LPDDR 的 CA 敢用 DDR 双沿、DDR5 反而用 SDR** [PHYSICAL-EXPLANATION + INFERENCE]：LPDDR5/6 虽然数据速率不低于 DDR5，但**高速数据走 WCK、命令走低速 CK**（CKR 4:1/8:1，同 6400 下 CA 每 pin 速率约为 DDR5 CA 的 1/2）——CA 的 UI 远宽于数据 UI，有足够 margin 用双沿传 CA，并借此把 CA pin 压到极限（7→4 根）；DDR5 的 CA 则跑在高频 CK 上（每 pin 速率=数据速率一半），且要经过长距离、多负载的 DIMM 通道（fly-by 拓扑、多 rank），为保 SI margin 采用 **SDR 单沿采样**，再用 2T 补足命令/地址 bit budget——**CA 传输方式是"命令/数据时钟是否分离 + 通道长度与负载"的函数，不是协议品味**。
+- Controller 代价：编码器区分 1T/2T、2T 原子性、双命令序列（ACT-1/2 + tAAD）状态机（§7.2）。
 
 ### 3.3 为什么 ACT Encoding 最复杂
 
@@ -402,7 +424,7 @@ Controller 视角：DDR5 两子通道 = 两套独立状态机 / checker 实例�
 
 1. 访问粒度——64B 粒度下 1 TB/s = 16 G 命令/s（纯列命令基线），粒度越小命令越多；
 2. **row miss 放大**——全 miss = ACT+RD/WR+PRE（≈3 条/请求），hit 多 = ACT+N×RD/WR+PRE（摊薄为 2+1/N 条）——**row hit 率就是命令放大率的倒数**（HBM 28.6:1 行开销的命令侧形态）；
-3. REF/RFM 占空——REFpb 命令速率 ∝ bank 数（tREFIpb，§2.3 墙 3）；REFab 期间整通道冻结（Appendix D.2）；
+3. REF/RFM 占空——REFpb 命令速率 ∝ bank 数（tREFIpb，§2.3 墙 3）；REFab 期间整通道冻结（§4.2）；
 4. ACT 编码膨胀——DDR5 2CK、LPDDR6 ACT-1/2 共 4CK（§3.3），行地址增长直接吃命令带宽。
 
 **供给侧**（统一公式反演）：CA 根数 × 沿数 ÷ 命令位宽——DDR5 单子通道每 2T 拍 1 条（4800 档 ≈1.2 G 命令/s）；HBM3 = R[9:0]+C[7:0] **18 根、每拍 1R+1C 双槽**（列域另受 tCCDS=2CK 限速）；LPDDR6 每 SC 4 CA、命令 2 周期、ACT 4 周期——三者供给相差一个数量级。
@@ -425,7 +447,7 @@ Controller 视角：DDR5 两子通道 = 两套独立状态机 / checker 实例�
 **LPDDR 三时钟域**（DDR5 单 CK 域的对照）[JEDEC]：
 
 - **CK**：命令域低速时钟；**WCK**：数据全速时钟，per-byte 门控。**CKR = WCK:CK 频率比**：CKR=2:1 → 533~3200 Mbps；CKR=4:1 → 533~6400 Mbps（>3200 必选 4:1）；典型 LPDDR5-6400 → WCK 1600MHz、CK 400MHz。CKR 可经 MRW 动态切换（§7.6.7）。
-- **WCK2CK Leveling**（§4.2.5，即 LPDDR4 write-leveling 的演化）：WCK 与 CK 异步，需锁定 DRAM/PHY 内同步 FIFO 的写读指针——进训练模式 → 施加已知 pattern → per-byte 扫 WCK 相位 → FIFO 指针锁定；**每次 DFS 后必须重做或从 training set 恢复**（§5.5/§5.10）。
+- **WCK2CK Leveling**（§4.2.5，即 LPDDR4 write-leveling 的演化）：WCK 与 CK 异步，需锁定 DRAM/PHY 内同步 FIFO 的写读指针——进训练模式 → 施加已知 pattern → per-byte 扫 WCK 相位 → FIFO 指针锁定；**每次 DFS 后必须重做或从 training set 恢复**（§6.6/§6.8）。
 - 控制器实现：CK/WCK/DFI 三异步域之间放弹性 FIFO；WCK 门控与突发对齐逻辑直接决定读写延迟（LPDDR5 读延迟比 LPDDR4 大且随 CKR 变化，QoS 需按档位建模）。
 - 为什么命令走低速 CK：CA 根数少、DDR 采样，引脚与 SI 压力小（§3.2）；数据走全速 per-byte WCK 与 source-sync（§3.7）。
 
@@ -435,11 +457,11 @@ Controller 视角：DDR5 两子通道 = 两套独立状态机 / checker 实例�
 
 【核心结论】高速数据不依赖 CK 采样——CK 与 DQ 路径不同，绝对误差占 UI 比例随速率变大；source-sync 让数据与选通同源、作为一个 timing group 传输，把绝对路径问题变成局部相对 skew 问题 [PHYSICAL-EXPLANATION]。
 
-- DQ 与 DQS 同源产生 → 时序问题缩小到组内相对 timing，training 再把采样点放到眼中心（§5.3）。
+- DQ 与 DQS 同源产生 → 时序问题缩小到组内相对 timing，training 再把采样点放到眼中心（§6.4）。
 - 三协议映射：LPDDR DQS/WCK、HBM WDQS/RDQS（per-byte/per-DWORD）、DDR DQS。
-- **Read gate 问题**：RDQS 只在 read burst 附近被 DRAM 驱动，其他时间无效——PHY 需用内部生成的 gate window 只放行有效 RDQS；训练前传播延迟未知：gate 开太早放 preamble/噪声、开太晚丢数据 → read gate training 的目的就是校准这个窗口（§5.6）。
+- **Read gate 问题**：RDQS 只在 read burst 附近被 DRAM 驱动，其他时间无效——PHY 需用内部生成的 gate window 只放行有效 RDQS；训练前传播延迟未知：gate 开太早放 preamble/噪声、开太晚丢数据 → read gate training 的目的就是校准这个窗口（§6.7）。
 - **DCD（Duty Cycle Distortion）**：占空偏离 50% → DDR 双沿采样两沿间隔不等 → 一沿 setup 变大另一沿变小，窄半边预算砍半——HBM3 有专用 WDQS Duty Cycle Correction 训练流程（Figure 80）[JEDEC]。
-- **Per-lane / per-bit delay**：不同 byte lane 物理路径不同 → eye center 各异——global delay 只能整体采样、补不了 lane-to-lane skew → per-lane delay；同一 byte 内还有 per-bit skew → 更高速 PHY 的 per-bit deskew（HBM4 per-pin DFE 同理，§5.9）。
+- **Per-lane / per-bit delay**：不同 byte lane 物理路径不同 → eye center 各异——global delay 只能整体采样、补不了 lane-to-lane skew → per-lane delay；同一 byte 内还有 per-bit skew → 更高速 PHY 的 per-bit deskew（HBM4 per-pin DFE 同理，§6.3）。
 
 ### 3.8 Read / Write Turnaround
 
@@ -447,38 +469,48 @@ Controller 视角：DDR5 两子通道 = 两套独立状态机 / checker 实例�
 
 - 根源：DQ 双向——读时 DRAM 驱动、写时控制器驱动，**方向切换必须等上一方向完成**。
 - R2W 便宜（方向翻转 + 写数据滞后余量）、W2R 贵（方向翻转 + 覆盖传播/SA 稳定）；ODT 档位切换也进入 turnaround 成本（切换需时间且改变阻抗环境——切换窗口总线不可用 + 瞬态反射）。
-- 调度含义：**攒写、分组翻转**——把同方向请求连续化，减少翻转次数并避开 tWTR_L 的同 BG 惩罚（§6.2 自由度 2）。
+- 调度含义：**攒写、分组翻转**——把同方向请求连续化，减少翻转次数并避开 tWTR_L 的同 BG 惩罚（§7.2 自由度 2）。
 - 三协议粒度：turnaround 按子通道（DDR5）/ 通道（LPDDR、HBM）/ SID（HBM 多 stack 共享通道总线）独立优化。
 
-### 3.9 ODT / DBI / DM / Masked Write
+### 3.9 ODT / DM / DBI / CAI
 
-**ODT（On-Die Termination）**：端接做进 die 内，吸收入射能量、抑制反射；档位经 MR 编程（DDR5 RTT_NOM/RTT_WR/RTT_PARK；LPDDR CA ODT/DQ ODT/NT-ODT——非目标 rank 端接）。**太弱（高阻）→ 反射残留/ISI；太强（低阻）→ 直流功耗大 + 驱动器负载加重 → 摆幅压缩 + 电源噪声**；最优 ODT = 与通道阻抗环境匹配，由 ZQ 校准与 training 确定（§5.8）[PHYSICAL-EXPLANATION]。
+**ODT（On-Die Termination）**：端接做进 die 内，吸收入射能量、抑制反射；档位经 MR 编程（DDR5 RTT_NOM/RTT_WR/RTT_PARK；LPDDR CA ODT/DQ ODT/NT-ODT——非目标 rank 端接）。**太弱（高阻）→ 反射残留/ISI；太强（低阻）→ 直流功耗大 + 驱动器负载加重 → 摆幅压缩 + 电源噪声**；最优 ODT = 与通道阻抗环境匹配，由 ZQ 校准与 training 确定（§6.3）[PHYSICAL-EXPLANATION]。
 
-**写路径字节粒度：DM（掩码）≠ DBI（反转）**——支持矩阵与演进原因 [JEDEC O11 考据]：
+**第一层：先分语义**——两个正交的问题：
 
-| 特性 | DDR5 | LPDDR5 | LPDDR6 | HBM3/4 |
-|---|---|---|---|---|
-| 独立 DM 引脚 | ✓ x8/x16（MR5:OP[5] 启用，DM_n LOW=掩码该 byte；x4 不支持） | ✗ | ✗ DMI 删除（Table 1 NOTE 2："There is no DMI in LPDDR6"） | ✗ |
-| MASKED WRITE 命令 | ✗（有 WR_Partial 标志配合 ODECC） | ✓（DRAM 内 RMW，同 BG tCCDMW=4×BL/n） | ✗（Table 254 仅 WR-S/WR-L；'Masked' 只剩 PASR Segment Mask=刷新分段，MR27） | ✗ |
-| Write/Read DBI | ✗（'DBI' 全文 0 命中——DDR5 删除了 DBI） | ✓（DMI 兼职反转） | ✓（MR3 OP[7:6]；无 DMI 故纯反转、无掩码语义） | ✓（DBI[3:0]/PC，DBI(ac)：charge count ≥4 → Inverted） |
-| 字节部分写出路 | DM 掩码 / 控制器 RMW | MASKED WRITE（写吞吐 1/4） | **控制器 RMW**（硬件不再兜底） | 无此需求（全突发流式写） |
+- **DM（Data Mask）= memory semantic**：决定哪些 byte 真正写进阵列——协议语义层功能；
+- **DBI / CAI = electrical / switching optimization**：决定线上 bit 用哪种编码传输更有利（减少同时翻转、降 SSO/供电扰动）——不改变语义。
 
-**演进逻辑** [JEDEC 事实 / INFERENCE 归因]：速率越高，DRAM 内 RMW 越贵 → **部分写责任逐步上移到控制器**。DDR5（服务器）写以整 line/整 burst 为主，引脚预算下 DBI 的省电收益让位给 DM 的字节掩码刚需（分散写/ECC 场景），ODECC 引入 WR_Partial 优化 ECC 读改写；LPDDR5（移动 SoC）字节粒度更新刚需 → MASKED WRITE 把 RMW 挪进 DRAM 换 SoC 简单（代价写吞吐 1/4）；LPDDR6 速率翻倍后 4× 列周期的 RMW 串行化不可接受 → 连 DMI 与 MASKED WRITE 一起删除；HBM（AI/图形全突发流式写）字节部分写需求不存在，引脚全给数据/训练，DBI(ac) 仅作动态反转省电。
+**第二层：协议矩阵** [JEDEC]：
 
-### 3.10 Bandwidth Scaling 的四条路线
+| 特性 | DDR4 | DDR5 | LPDDR5 | LPDDR6 | HBM3/4 |
+|---|---|---|---|---|---|
+| 独立 DM 引脚 | **复用**——DM 与 DBI 共享同一 pin，写路径两者互斥 | ✓ x8/x16（MR5:OP[5] 启用，DM_n LOW=掩码该 byte；x4 不支持） | ✗ | ✗ DMI 删除（Table 1 NOTE 2："There is no DMI in LPDDR6"） | ✗ |
+| MASKED WRITE 命令 | ✗（字节掩码全靠 DM pin） | ✗（有 WR_Partial 标志配合 ODECC） | ✓（DRAM 内 RMW，同 BG tCCDMW=4×BL/n） | ✗（Table 254 仅 WR-S/WR-L；'Masked' 只剩 PASR Segment Mask=刷新分段，MR27） | ✗ |
+| Write/Read DBI | ✓（与 DM 同 pin 复用，读/写 DBI 分别经 MR 使能） | ✗（'DBI' 全文 0 命中——DDR5 删除了 DQ-DBI；inversion 转移见下） | ✓（DMI 兼职反转） | ✓（MR3 OP[7:6]；无 DMI 故纯反转、无掩码语义） | ✓（DBI[3:0]/PC，DBI(ac)：charge count ≥4 → Inverted） |
+| 字节部分写出路 | DM 掩码（使能写 DBI 后 DM 不可用，退化为整突发写） | DM 掩码 / 控制器 RMW | MASKED WRITE（写吞吐 1/4） | **控制器 RMW**（硬件不再兜底） | 无此需求（全突发流式写） |
+
+**第三层：代际演进解释** [JEDEC 事实 / INFERENCE 归因]：速率越高，DRAM 内 RMW 越贵 → **部分写责任逐步上移到控制器**。DDR5（服务器）写以整 line/整 burst 为主、DM 刚需明确——保 DM 删 DQ-DBI，inversion 转移到 CA 侧（CAI）并配合 DFE/DCA/training 强化，构成 SI/power 复杂度的重分配（见下"重分配"段）；ODECC 另有 WR_Partial 优化 ECC 读改写；LPDDR5（移动 SoC）字节粒度更新刚需 → MASKED WRITE 把 RMW 挪进 DRAM 换 SoC 简单（代价写吞吐 1/4）；LPDDR6 速率翻倍后 4× 列周期的 RMW 串行化不可接受 → 连 DMI 与 MASKED WRITE 一起删除；HBM（AI/图形全突发流式写）字节部分写需求不存在，引脚全给数据/训练，DBI(ac) 仅作动态反转省电。
+
+**DBI / DM 的取舍判据** [JEDEC/VENDOR facts + INFERENCE]：**DBI 是否保留，主要看 I/O switching/energy 是否值得优化；DM 是否保留，主要看 workload 是否需要原生 partial write**。DDR5 偏 CPU 细粒度更新，因此保 DM 舍 DBI；HBM 偏 GPU/AI 全 sector 流式访问且接口极宽（同时翻转线数多、SSO/供电扰动收益大），因此舍 DM 保 DBI；LPDDR6 则进一步证明高速协议正在把 partial-write 责任上移 Controller，同时继续保留 DBI 做能效优化——**DDR5 是当前几类协议中少见的"删除 DQ-DBI 而保留 DM"的设计**。
+
+**DDR4→DDR5：从"DQ DBI"到"强化 DQ training/EQ + CA inversion"的重分配** [JEDEC/VENDOR facts + INFERENCE]：DDR4 的 DM/DBI 原本复用同一 pin，写路径两者互斥；早期 DDR5 draft 仍曾保留这一结构，但最终 JESD79-5B 将该 pin 固定为 DM，并把 bus-inversion 机制转移到 CA 侧的 CAI（Command/Address Inversion，Appendix B ⚠️ CAI 及早期 draft 细节待一手资料复核——DDR5 PDF 不在库）。与此同时 DDR5 为 DQ 引入 DFE、DQ/DQS DCA 与更完整的 training，而 CA 侧由于 14-bit 高复用、DIMM fly-by/多负载拓扑，新增 CA ODT、CA/CS training 与 CAI。由此可把 DDR4→DDR5 理解为 **SI/power optimization 从"DQ DBI"重新分配为"强化 DQ training/EQ + CA inversion"，而非 DBI 本身失去价值**。
+*Interview anchor: §9.1 Q12、§9.2 W10/W11*
+
+### 3.10 Bandwidth Scaling：路线 × 互连阶梯
 
 提高 bandwidth = 位宽 × 速率；四条路线各把复杂度转移到不同地方 [INFERENCE]：
 
 | 路线 | 例子 | 复杂度转移到哪里 |
 |---|---|---|
-| ① 加 rate | DDR4→5 3200→8800；LPDDR 6.4→14.4G | PHY/SI margin（UI 收缩，§5.2）、均衡/训练、pJ/bit、良率 |
+| ① 加 rate | DDR4→5 3200→8800；LPDDR 6.4→14.4G | PHY/SI margin（UI 收缩，§6.2）、均衡/训练、pJ/bit、良率 |
 | ② 加 pin | HBM 1024→2048 | 封装布线/bump 密度、PHY 面积功耗（CA 摊薄的收益） |
-| ③ 加 channel | DDR5 双子通道、HBM 16→32ch、LPDDR 多通道 | Controller state/NoC/实例化、地址映射（§2.7/§6.1） |
+| ③ 加 channel | DDR5 双子通道、HBM 16→32ch、LPDDR 多通道 | Controller state/NoC/实例化、地址映射（§2.7/§7.2） |
 | ④ 加 burst/reuse | BL16/BL24-48、预取 8n→24n | 访问粒度/过取（§3.5）、部分写更难（§3.9） |
 
 **HBM 的第五条路**：堆叠形态绕开整个预算——数据引脚大爆炸使 CA 占比稀释 + 行/列分总线 + TSV/中介层；CA 带宽问题不是被解决而是被**封装形态买断** [INFERENCE]。
 
-**HBM 实证**（速率阶梯与带宽公式，详见 §7.3）：
+**HBM 实证**（速率阶梯与带宽公式，详见 §8.3）：
 
 | 代际 | 接口位宽 | 通道组织 | 速率（基线→产品） | 单 stack 带宽 | 容量 |
 |---|---|---|---|---|---|
@@ -487,11 +519,25 @@ Controller 视角：DDR5 两子通道 = 两套独立状态机 / checker 实例�
 | HBM4 | 2048-bit | 32ch×64-bit | 8G 基线→10/11/12.8G→路线 16G | 2.048 TB/s→2.8/3.3 TB/s | ≤64 GB（4~16 die，24/32Gb） |
 
 - HBM3→3E：**纯速率演进**（6.4→9.6G，同位宽）；3E→4：**架构性翻倍靠位宽**——JEDEC 基线速率 8G 反而低于 3E 的 9.6G，总带宽增长全部来自位宽；产品竞争力由代内速率爬坡决定（三星 HBM4 官方 3,300 GB/s ≈12.8G；美光 >11G/>2.8TB/s [VENDOR]）。
-- 为什么翻位宽而不是继续提速率：中距离互连上持续提速率的边际成本（均衡、训练时间、pJ/bit、良率）急剧上升；翻位宽把压力转移到封装布线/bump 密度，换取时序裕量与能效——速率路线花 IO 功耗买带宽、位宽路线能效更好（§5.12）。衍生变化：PHY 向逻辑 base die / SoC 侧迁移、HBM4 I/O 电压开放厂商自定（§5.11）。
+- 为什么翻位宽而不是继续提速率：中距离互连上持续提速率的边际成本（均衡、训练时间、pJ/bit、良率）急剧上升；翻位宽把压力转移到封装布线/bump 密度，换取时序裕量与能效——速率路线花 IO 功耗买带宽、位宽路线能效更好（§3.10）。衍生变化：PHY 向逻辑 base die / SoC 侧迁移、HBM4 I/O 电压开放厂商自定（§5.1）。
 
 **LPDDR 速率阶梯**：LPDDR5 3200~6400 → 5X 8533/9600(=5T)/10700 → LPDDR6 10.6~14.4G；提升倍数 vs 5X-9600 = **1.5×**、vs 5X-8533 ≈ **1.69×**、vs LPDDR5 = 2.25×——引用时必须对齐档位；LPDDR6 有效带宽再打 89% 折（§3.5）。
 
 **结论口径** [INFERENCE]：实际协议是组合拳（LPDDR6 = ①+③+④；HBM = ②+形态）；根源是**命令位宽（行地址）与请求率随带宽一起涨，而 SI 预算不涨**。
+
+**互连距离决定可行的 rate×width 乘积** [PHYSICAL-EXPLANATION]：HBM 超宽、相对低 per-pin rate（中介层 mm 级）；DDR 窄、高速、长距离（PCB 十 cm 级，需均衡）；LPDDR 中间（PoP/PoH）——HBM 可以用非常宽的 interface 而 DDR 不可以（上文第五条路的物理根源；3D 展望见 §10）。
+
+**互连阶梯表**（量级 [PHYSICAL-EXPLANATION/常识]；加宽省的是 SI 预算、不省电——PHY 功耗仍随总引脚线性）：
+
+| 互连级 | 距离量级 | 可行 per-pin rate | 加宽的边际成本 | 典型选择 |
+|---|---|---|---|---|
+| PCB | cm~几十 cm | 低中（需均衡） | 高（pin/走线/匹配组/连接器；skew 容差 ∝ UI，宽而快双重恶化） | DDR：窄而快 |
+| Package substrate | mm~cm | 中 | 中 | — |
+| Silicon interposer | mm | 高（轻 EQ、低摆幅可行） | 低（走线/bump 密度高），**但 PHY 功耗仍随总引脚线性**（§7.2 分层 4） | HBM：宽而适中 |
+| TSV | 几十~几百 µm | 很高 | 堆叠内 | stack 内部 |
+| Hybrid bonding | µm 级 | 极高 | 最高密度 | HBM4+/3D 方向 |
+
+- energy/bit 维度：距离短 → 低摆幅可行（HBM Tx 0.4V、LPDDR6 Voh≈250mV）→ pJ/bit 低；PCB 长线需强驱动 + 端接 + 均衡 → pJ/bit 高——"HBM 是能效引擎"的物理根源。**加宽省的是 SI 预算，不省电**。
 
 
 ## 4. Refresh & Reliability Evolution
@@ -521,6 +567,7 @@ Controller 视角：DDR5 两子通道 = 两套独立状态机 / checker 实例�
 
 - 共同哲学：把刷新从"周期性全局停机"重构为"**可调度的后台工作**"，由控制器 QoS 决定何时还债；REFab 两者都保留（深空闲 / 进 SR 前最划算）。LPDDR5 连 REFab 也允许 postponed/pull-in——"REFab 哲学"在调度层已被预算制软化；LPDDR5 还定义 Optimized Refresh 组合（如 8×REFpb 完成一轮 bank 覆盖）。
 - 粒度差异根源 [INFERENCE]：LPDDR 通道窄、延迟敏感（手机）→ 单 bank 粒度；DDR5 子通道 bank 多、吞吐敏感 → BG 级批量刷新省命令带宽。HBM 把"全 bank"粒度直接定义在 PC 上（REFab 带 PC 位、REFpb 按 16-bank set 推进，p65 NOTE 3）[JEDEC]。
+- **HBM 的刷新例外** [JEDEC]：HBM 行/列双总线允许普通 row/column 命令 overlap，但 refresh 是重要例外——REFab 后需垫 CNOP、tRFCab 期间该 PC 的命令受冻结（bank availability restriction 比普通列命令更长）——"行列并行"框架里刷新是第一个被牺牲的（§3.1/§3.3）。
 
 ### 4.3 Refresh Debt（统一模型）
 
@@ -532,7 +579,7 @@ Refresh = Debt
 ```
 
 - 每条 REF 消除一份债；债的粒度随代际变细（REFab → REFsb → REFpb → RFMpb 定向，§4.7）。
-- Controller 需要：per-bank / per-PC 债账本、deadline 跟踪、机会式插空调度——**刷新债进 QoS 模型**（§6.4）。
+- Controller 需要：per-bank / per-PC 债账本、deadline 跟踪、机会式插空调度——**刷新债进 QoS 模型**（§7.2）。
 - Refresh 与 QoS 的天然冲突：还债占用命令窗口与阵列可用性——"可调度的后台工作"意味着调度器必须显式管理这笔债，而不是被周期性中断。
 
 ### 4.4 Postpone / Pull-in / Critical Deadline
@@ -546,9 +593,10 @@ Refresh = Debt
 - 压缩侧下界：相邻 REF 间隔 ≥ tRFC——补发不能无限压缩，与推迟上限共同夹出可行域；
 - 电流侧约束：DDR5 3DS 错峰刷新（tRFC_dpr ≈ tRFC_slr/3，限 IDD5B1 峰值电流）——协议自身限制刷新的电流聚集。
 
-**为什么必须有不可让步的 critical 边界** [协议口径]：QoS 让步牺牲的是**性能**（延迟/带宽，可协商）；刷新违约牺牲的是**正确性**（超过保持窗口 = 数据丢失，不可恢复）——正确性约束不能被性能约束无限覆盖。三家都以"最大间隔 / 强制执行"的形式内建 critical 语义；**保证最大间隔不被突破是协议强加给控制器的正确性义务**（§6.4）。
+**为什么必须有不可让步的 critical 边界** [协议口径]：QoS 让步牺牲的是**性能**（延迟/带宽，可协商）；刷新违约牺牲的是**正确性**（超过保持窗口 = 数据丢失，不可恢复）——正确性约束不能被性能约束无限覆盖。三家都以"最大间隔 / 强制执行"的形式内建 critical 语义；**保证最大间隔不被突破是协议强加给控制器的正确性义务**（§7.2）。
 
 **温度改变预算**：2x 档 tREFI 减半 → 同样 8+1 规则下窗口收紧（§4.5）。
+*Interview anchor: §9.2 W5/W20*
 
 ### 4.5 温度与 Refresh
 
@@ -556,7 +604,7 @@ Refresh = Debt
 - 协议的三层响应 [JEDEC]：① **DDR5 MR4**（Table 25）：刷新速率随温度档 1x（<80/85°C）→ 2x = tREFI/2（85°C 起，逐档 >95°C）；Wide Range 档（OP5=1）75°C 起跳、延伸 >100°C——**tREFI 倍频**形式（8192 过采样不变、保持窗口 32→16ms）；② **LPDDR 侧另有 4x 档**（移动封装温度极限与场景差异；DDR5 MR4 仅 1x/2x）；③ **HBM3 的 TEMP/CATTRIP 引脚**——温度告警的硬件级联动。
 - Controller 含义：高温 → 单位时间 REF 更多；**不能被 bank 并行隐藏的 REF 变成 unhideable bubble → sustained bandwidth 下降**；刷新占空（tRFC/tREFI）随倍频翻倍；与 DVFS 联动的自洽闭环（高温→高频→更高泄漏→更多刷新）。
 - **责任三分**：温度→refresh 是协议暴露给 MC 的 **correctness contract**（读到新档位必须满足新速率；热切换时 postpone 预算有协议约束——5B p306 NOTE 1 单调递减）；温度→PHY margin 归 PHY/vendor（MC 不判断 eye 好坏，只经 DFI error/alert/update 通道协调状态转换与流量安全）。**感知通道两型**：DDR5/LPDDR = 拉式（DRAM 自更新 MR 温度位，MC MRR 轮询）；HBM = 推式（TEMP/CATTRIP 硬件引脚异步告警）。REF 分布 / 是否收紧 postpone / 降频节流均属 [PROJECT] 策略。
-- **量化锚点**：Refresh Duty = tRFC / tREFI——2Gb 档 1x ≈ 3.3% → 2x ≈ 6.7% → 4x（仅 LPDDR）≈ 13.4%；同步翻倍的还有 REFpb 命令率（tREFIpb 488→244ns）与 drain/低功耗窗口撞刷新概率（§6.10）。[使用 §4.1 已核锚点]
+- **量化锚点**：Refresh Duty = tRFC / tREFI——2Gb 档 1x ≈ 3.3% → 2x ≈ 6.7% → 4x（仅 LPDDR）≈ 13.4%；同步翻倍的还有 REFpb 命令率（tREFIpb 488→244ns）与 drain/低功耗窗口撞刷新概率（§7.8）。[使用 §4.1 已核锚点]
 
 ### 4.6 Row Hammer
 
@@ -595,6 +643,7 @@ RFM / targeted maintenance（定向刷新管理）
 - **诚实边界**：协议可推导 RFM demand 与 bank-unavailable duty；固定 bandwidth tax 不能只靠协议——真带宽损失 = 维护窗口中无法被其他 bank traffic 隐藏的 useful-command bubble（隐藏能力取决于负载，系统属性）。多 bank aggregate 触顶时 aggregate tax 上界为组合式（tRRD_S/tFAW 约束下轮流触顶）。
 
 Controller Impact：per-bank 计数 / 信用表 + 刷新带宽预算进 QoS；安全场景（汽车）要验证最坏情况下刷新管理开销的上限。
+*Interview anchor: §9.2 W7、§9.4 A10、§9.6 Q6*
 
 
 ### 4.8 ECC Error Domain
@@ -624,7 +673,7 @@ Controller Impact：per-bank 计数 / 信用表 + 刷新带宽预算进 QoS；�
 
 关键推论：ODECC 透明纠错造成**可靠性遥测盲区**（已纠错不可见，只能从未纠错误率间接推断）；系统 RAS 必须依赖 side-band 层做 scrub 与日志。两层是**纵深防御**：ODECC 把原始错误率压低 1~2 个量级，side-band 兜底链路与残余阵列错误。
 
-**HBM 的片内自治组合**（JESD238 §6.9）[JEDEC]：**symbol-based On-die ECC + 读写 meta-data（MD）位 + 错误擦洗（scrubbing）+ 错误透明协议 + 接口传输 parity + 故障隔离限**——不是主机 side-band 模式，而是片内自治的纵深组合。
+**HBM 的片内自治组合**（JESD238 §7.6）[JEDEC]：**symbol-based On-die ECC + 读写 meta-data（MD）位 + 错误擦洗（scrubbing）+ 错误透明协议 + 接口传输 parity + 故障隔离限**——不是主机 side-band 模式，而是片内自治的纵深组合。
 
 ### 4.10 Error Reporting / Scrubbing / Retry / Isolation
 
@@ -632,19 +681,97 @@ Controller Impact：per-bank 计数 / 信用表 + 刷新带宽预算进 QoS；�
 - **ECS**：自动错误检查与擦洗（HBM/DDR5，错误日志寄存器 MR81/82；HBM4 支持多 bit 纠正记录 MR9）。
 - **Scrub**：side-band ECC 模式下控制器全责（patrol scrub 后台巡检）。
 - **Retry / Isolation**：HBM 错误透明协议 + 故障隔离限；链路级 Link ECC（LPDDR5 可选）。
-- Controller Impact：错误计数器、日志寄存器、告警路径（SEV/TEMP/CATTRIP）进 RAS 管理；side-band ECC 读改写对调度的占用（§6.2）；LPDDR6 把 tag/ECC 嵌入突发（288=256+32）——链路保护不占阵列但吃有效带宽（§3.5）。
+- Controller Impact：错误计数器、日志寄存器、告警路径（SEV/TEMP/CATTRIP）进 RAS 管理；side-band ECC 读改写对调度的占用（§7.2）；LPDDR6 把 tag/ECC 嵌入突发（288=256+32）——链路保护不占阵列但吃有效带宽（§3.5）。
 
 ---
 
-## 5. Power & PHY Evolution
+## 5. Power / Low-Power / Frequency Management
 
-本章深度边界（§0.4）：解释 `Protocol Feature → Physical Problem → Training/Calibration → DFI Handshake → Controller Responsibility`，不展开 analog 电路实现。
+本章只回答：**DRAM 当前处于什么 operating point / power state，Controller 如何管理状态与频率**。PHY 工作点在频点间如何保存/恢复见 §6.8；Controller 如何安全进入/退出这些状态见 §7.10；link closure 见 §6。
 
-### 5.1 PHY Minimum Mental Model
+### 5.1 Power Domain & Supply Partition（为什么分 rail）
+
+**供电轨对比** [JEDEC]：
+
+| 协议 | 供电轨与典型值 | 备注 |
+|---|---|---|
+| HBM3 | VDDC 1.1V（core）/ VDDQ 1.1V（I/O）/ Tx driver 0.4V / VDDQL / VPP | 上电顺序 VPP → VDDC=VDDQ → VDDQL（JESD238 Power Ramp） |
+| HBM4 | **VDDC 1.05V（core）/ Tx 0.4V / I/O 电压厂商自定** | 标准仅约束相对关系：VPP > VDDC+200mV、VDDC > VDDQ+VSP（JESD270-4） |
+| DDR5 | VDD=VDDQ=1.1V（PMIC 在模组，平台只供 bulk 5/12V）；VPP ⚠️1.8V | 上电/管理时序依赖模组 PMIC |
+| LPDDR5 | VDD1 / VDD2H / VDD2L / VDDQ | 上电顺序 VDD1≥VDD2H≥VDD2L≥VDDQ；VDD2 拆分**可选** |
+| LPDDR6 | VDD1 / **VDD2C 1.0V** / **VDD2D 0.875V** / VDDQ 0.5V（默认） | 顺序 VDD1≥VDD2C≥VDD2D≥VDDQ；Voh=0.5×VDDQ≈250mV；VDD2 拆分**强制** |
+
+演进方向相反 [INFERENCE]：HBM 把余量下放厂商（I/O 电压开放，换 PHY 工艺自由度、配合逻辑 base die）；LPDDR 把电源轨越拆越细——LPDDR6 的 VDD2C（接口侧）/VDD2D（阵列侧）强制双恒功率域：接口域与阵列域的最优电压、负载、di/dt 特性不同——拆分后独立稳压、隔离噪声、**CA 侧调频调压不再扰动阵列裕量**。
+
+**LPDDR6 DVFS 家族**（JESD209-6 §11 / MR19-21，每个模式绑定一条轨与一个目标区间）[JEDEC]：**DVFSC**（VDD2 core 域）/ **DVFSQ**（VDDQ 0.5→0.3V）/ **DVFSH**（VDD2C→1.025V 高速率）/ **DVFSL**（VDD2D→0.85V 低速率）/ **DVFSB**（VDD2D→0.90V 高速率）。Controller 代价：① DFS 序列变为**多轨时序编排**（各轨电压爬坡/跌落顺序与建立时间编进切换序列）；② 维护"模式 × 轨电压 × training set"三维表；③ 与 PMIC 的轨控握手时序成为软硬协同设计点。
+
+### 5.2 Low-Power State Model（五态 × 六问）
+
+入口分野——**无 CKE 的命令式低功耗（HBM / LPDDR）vs DDR5 CKE**：HBM 低功耗经**命令**进入/退出（PDE/SRE），粒度**通道级**（PC 位定值，§2.5）；LPDDR 同为 CA 命令式；DDR5 经 CKE_t/CKE_c 电平进 PD/SR。每个状态回答六个问题 [JEDEC 5B / HBM3-4] + [PROJECT]：
+
+| 状态 | ① 数据保留？ | ② banks | ③ refresh owner | ④ clock | ⑤ 进入前置 | ⑥ 退出成本 |
+|---|---|---|---|---|---|---|
+| Active PD | ✓（行开，SA 供电更高——功耗换就绪） | 可带 open row | **MC**——PD 期间发不了 REF，**驻留被刷新债封顶**（HBM tPD MAX=9×tREFI，§1.3） | 可停/浮空（tCMDPD 后） | 读写突发完成（tWR/tRDPDE），**不要求 idle** | ≈tXP（数十 ns）；计时器照走 |
+| Precharge PD | ✓（行关） | 全关 | **MC**（同上） | 可停/浮空 | 上者 + 全 bank precharged（tRP 满足） | tXP + tRCD |
+| Self Refresh | ✓ | 全关 | **DRAM** | 可停/可变 | **全 bank precharged**（open row 会干扰自刷新电路）；LPDDR5 另要求 SRX↔SRE ≥1 条 extra refresh | tXS（百 ns 级）+ 刷新计时 resume |
+| DSM（LPDDR5/5X） | ✓（retention） | 全关 | **DRAM** | 基本必停 | 专用 Deep Sleep 命令（深于 SR） | 深度恢复（CS toggle 退出；tDSM 数值 ⚠️） |
+| DPD（LPDDR2/3 历史） | **✗ 不保留**（破坏性深睡） | — | — | — | 掉轨 | re-init + 全量重训 |
+
+- **SRE 要求全 bank precharged 而 PDE 不要求**（进入前置分叉的物理原因）：SR 是"停时钟 + DRAM 自管刷新"，open row 会干扰自刷新；PDE 只是命令路径待命、内部过程照走，可带 open row 甚至进行中的刷新进入（HBM 显式分 active / precharge power-down 两态）。[JEDEC]
+- **postpone 债与 SR 的关系** [JEDEC]：协议不要求 postpone 的 REF 补刷完——进 SR 后 DRAM 自管刷新接管外部债（tCKSR 内自启动内部刷新）；LPDDR5 SR 期间刷新计时器 freeze-and-store、退出 resume（债保持）、bank 计数退出清零。
+- - DSM [JEDEC 5B 明文]：§7.5.8 独立成节且在 7.5 Refresh operation 家族下；官方状态图四态（Idle/PD/SR/DSM）；进入 = 专用 Deep Sleep Enable 命令（真值表含 MRS OT/NT 位段）；退出 = CS toggle。**勿与旧代破坏性 DPD 混称**。
+- 退出成本阶梯 = break-even 级联（idle 预测 > 阈值_PD < 阈值_SR < 阈值_DSM）——盈亏平衡模型的控制器实现；PD 是"有限驻留态"（债封顶），SR/DSM 才是"无限驻留态"。
+- Controller 责任：进低功耗前排空在飞命令（drain 判据见 §7.8）、进出时序由内部定时器管理、**唤醒延迟显式建模进 QoS**（预测空闲窗口提前唤醒——突发到达时的唤醒开销=延迟毛刺）。
+
+### 5.3 Self-Refresh = Refresh Ownership Transfer
+
+**全章核心 mental model**：
+
+```text
+Normal / Power-Down      Controller owns refresh
+        ↓ SRE（前置：全 bank precharged）
+Self Refresh             DRAM owns refresh（可停钟、可切频、可无限驻留）
+        ↓ SRX
+Normal                   Controller owns refresh（计时器 resume）
+```
+
+- **control ownership handoff ≠ refresh ownership handoff**：PDE 只交出**命令权**（Controller 仍拥有刷新义务却发不出命令——所以驻留被债封顶）；SRE 同时交出**命令权与刷新义务**（DRAM 自管刷新——所以可无限驻留、可在 SR 内停钟/切频）。这句话是理解本章与 §7.10 所有低功耗/切频时序的钥匙。
+- 该模型直接解释：为什么 PD 驻留上限 9×tREFI 而 SR 没有（§5.2）；为什么 HBM/DDR 切频要借 SR 而 LPDDR 不用（§5.4）。
+*Interview anchor: §9.2 W19、§9.5 O1*
+
+### 5.4 DFS / DVFS / FSP（切频 × 刷新：REF owner 框架）
+
+**切频 × 刷新：REF owner 框架** [INFERENCE/PROJECT 组织口径；证据 JEDEC]：
+
+| 协议 | 切频方式 | REF owner | 约束 |
+|---|---|---|---|
+| LPDDR5 | **非 SR 模式直切**（三组 FSP 预存（FSP0/1/2，MR16 OP3 [JEDEC 5B 明文]），MRW 切换） | **始终在 CTRL**——postpone 债随切频保留，不清债 | §7.6.7 六条件：tCK(abs)min；"**Refresh requirements apply during clock frequency change**"；"All banks are required to be idle state or during tRFCab/pb"；MRW/MRR 完成；tRCD/tWR/tWRA/tMRW/tMRR 满足；CS LOW |
+| HBM3/4 | **SR 下切频**（p97："may halt the external clock or change the external clock frequency tCKSRE **after self refresh entry**…stable tCKSRX before exit"） | 进 SR 即移交 **DRAM**（tCKSR 内自启动内部刷新；HBM3 无 postpone、无外部债概念） | SR 期间 CK 可停/可变；SRX 前 CK 稳定 tCKSRX |
+| DDR5 | 同 HBM 的 SR 路线（传统 DDR 手法 ⚠️ 无 DDR5 PDF 细节） | 同上 | 同上 |
+
+- 推论一：LPDDR 敢直切、HBM/DDR 要借 SR——LPDDR 有三组 FSP 预存（切频 = 寄存器组选组，快、可重入），移动场景需要频繁 DVFS；**owner 不移交才保得住 postpone 债与低延迟**。HBM/DDR 的 DRAM 侧无 FSP 预存，动时钟只能借 SR 让 DRAM 自管（顺便把刷新也移交）。
+- 推论二：切频窗口的刷新义务在**时间域连续**（deadline 不因切频重置）——调度器切频前确认 banks idle（条件②）恰好等价于"刷新债此刻无冲突"。
+- 切频在 tCMDPD/tFC/tZQPD 等窗口被 inhibit；PD 三态（idle/active/SR PD——SR PD 内部刷新照常）[JEDEC §7.5.7.1]。
+
+- **HBM 到底有没有 DFS？——有频率切换能力，但不是 LPDDR 式 DFS 体系** [JEDEC]：HBM3/4 支持在 Self-Refresh 中 halt 或 change external clock（上表原文）；但没有 LPDDR 那种以频繁 DVFS 为目标的多 FSP 预存 / 非 SR 直切 / 快速 operating-point 切换体系。mental model：**LPDDR DFS = 运行中换挡（gear shift）；HBM 切频 = 停机 → SR → 改钟 → 重启**。
+*Interview anchor: §9.2 W26、§9.3 C11、§9.5 O3*
+
+### 5.5 Cross-Protocol Power Philosophy（按优化目标，不按排名）
+
+- **LPDDR → energy proportionality**：负载突发、空闲多（手机/边缘）——频繁 DVFS + 细粒度低功耗态（五态全谱 + DVFS 族 + 温度倍率）是**核心功耗策略**；REFpb 后台债、DFS 多域、2x/4x 温度档三者叠加出最复杂的电源管理面。
+- **DDR5 → capacity / RAS / platform power balance**：频率基本固定（服务器时序确定性优先），复杂度在双子通道刷新错峰、RFM/DRFM/ARFM 配额、PMIC 模组化（平台只供 bulk）、side-band ECC RMW 占用。
+- **HBM → sustained bandwidth / energy-per-bit**：AI 负载持续满带宽——降频收益小，省电靠 per-PC 降活 + 热感知节流 + 低摆幅宽接口（pJ/bit 优先）；**频率切换能力存在（§5.4 SR 路线），但不构成 LPDDR 式以 DVFS 为核心的功耗策略**。
+- 功耗学补充 [VENDOR ⚠️ 建议以项目实测替换]：速率路线（3→3E）主要花 IO 功耗买带宽、pJ/bit 改善有限；位宽路线（3E→4）用更低 per-pin 速率跑更宽总线，能效更好——总功耗随带宽近线性，pJ/bit 每代降 ~20~30%。
+
+## 6. PHY Link Closure & Training
+
+本章只回答：**为什么高速 bit 传不过去，以及 PHY 如何把 eye 恢复到可靠工作点**——不展开 analog 电路（CTLE/DFE 实现、PLL/DLL、SI 仿真）。Controller 视角统一为一句话：**这些是 PHY 关闭 link 的内部 knob；Controller 通常只感知训练窗口、完成/失败状态与 operating-point 变化**（发起/编排/断流责任见 §7.6/§7.7）。
+
+### 6.1 PHY Minimum Mental Model
 
 每个概念按 **Concept → 破坏什么 margin → 需要什么训练/校准 → Controller 是否感知** 组织 [PHYSICAL-EXPLANATION]：
 
-- **UI（Unit Interval）**：一个数据 bit 的时间窗。速率翻倍 → UI 减半，而 jitter/skew/反射是绝对时间量不随之减半 → 有效窗口收缩比例超过 UI 减半——一切高速问题的放大器（§5.2）。
+- **UI（Unit Interval）**：一个数据 bit 的时间窗。速率翻倍 → UI 减半，而 jitter/skew/反射是绝对时间量不随之减半 → 有效窗口收缩比例超过 UI 减半——一切高速问题的放大器（§6.2）。
 - **Eye**：所有 UI 波形折叠叠加。Eye Width = 有效采样时间窗；Eye Height = 判决电压裕量。**training 的目标就是把采样点恢复到眼中心**。
 - **Setup / Hold**：接收锁存器的固有要求（沿前/沿后数据稳定最小时间）。写侧 tDS/tDH（相对 DQS 中心对齐）、读侧 tDQSQ（DQS-to-DQ skew 上限）+ tQSH/tQSL——margin 的消耗者：jitter/skew/ISI/温漂。
 - **Jitter**：RJ（随机、高斯、无界——热噪声/散粒噪声，只能按 BER 尾部预算）+ DJ（确定、有界——DCD/PJ(PLL 杂散、电源纹波)/DDJ(=ISI+DCD，码型相关)/BUJ(串扰的时域投影)）。总抖动（BER 级）≈ RJ_RMS×k + DJ_pp；直接吃 setup/hold。
@@ -652,16 +779,37 @@ Controller Impact：per-bank 计数 / 信用表 + 刷新带宽预算进 QoS；�
 - **Reflection / ISI**：传输线有特性阻抗 Zo；驱动器输出阻抗、过孔、bump、封装转换点、连接器——每个阻抗不连续点都是反射源（Γ=(ZL−Z0)/(ZL+Z0)）→ 过冲/下冲/振铃 → 前一位的振铃污染后一位的判决窗（ISI）→ 眼闭合。
 - **ODT**：die 内端接吸收入射能量；太弱反射残留、太强功耗+摆幅压缩（§3.9）。
 - **Crosstalk / SSN**：相邻线容性+感性耦合（侵略线翻转在受害线感应噪声；宽总线=更多同时翻转的侵略者）；多线同时翻转 di/dt×电源/地路径电感 → 电源/地弹跳（SSN 与激活电流 di/dt 同族，但发生在 IO/电源域）——都随总线宽度/速率/同时翻转数恶化，是"宽而快"吃光 SI 预算的原因。
-- **Vref**：接收判决阈值；偏移 → 眼垂直不对称收缩。误差来源：IR drop、温度漂移、码型相关偏移 → Vref training（§5.7）。
-- **PVT**：训练时的最优 delay/Vref 只是当时 PVT 点的最优——温度（泄漏/迁移率）、电压（IR drop）、制程/老化（NBTI/HCI 慢漂）都会漂移 → 周期性重校（§5.10）。
+- **Vref**：接收判决阈值；偏移 → 眼垂直不对称收缩。误差来源：IR drop、温度漂移、码型相关偏移 → Vref training（§6.7）。
+- **PVT**：训练时的最优 delay/Vref 只是当时 PVT 点的最优——温度（泄漏/迁移率）、电压（IR drop）、制程/老化（NBTI/HCI 慢漂）都会漂移 → 周期性重校（§6.8）。
 
-### 5.2 为什么 Data Rate 越高 Training 越复杂
+### 6.2 What Closes the Eye?（速率的代价结构）
 
 - 三段论 [PHYSICAL-EXPLANATION]：频率翻倍 → UI 减半 → 绝对时间量（反射/串扰/jitter/skew）占比翻倍 → static timing margin 不足 → 引入 per-lane deskew / Vref / equalization → PHY 完成实际 delay/Vref tuning → Controller 通过 DFI 发起并管理 training sequence。
 - 伴随现象：global 补偿失效（lane 间 eye center 各异 → per-lane、per-bit）；一次训练不再长期有效（PVT 漂移 → retraining/tracking）；训练时间本身成为可用性成本（开机时间、DVFS 切换延迟）。
 - 这也是"中距离互连提速率边际成本急剧上升"（§3.10）的微观解释：每翻一档速率，训练维度和重校频度都在增加。
 
-### 5.3 Training Unified Model
+### 6.3 PHY Compensation Toolbox（一个表回答"谁修什么"）
+
+| Physical problem | Margin 被吃掉 | PHY mechanism | 调整对象 |
+|---|---|---|---|
+| lane-to-lane / per-bit skew | Eye Width | per-lane / per-bit deskew（§6.7） | delay |
+| CK↔DQS/WCK 相位差 | sampling phase | Write Leveling / WCK2CK（§6.6） | phase |
+| duty 失真（rise/fall 不对称） | half-UI 对称性 | DCA | rise/fall timing |
+| Vref offset | Eye Height | Vref training（§6.7） | 判决阈值 |
+| 阻抗失配 → 反射/振铃 | 水平 + 垂直 | ZQ 校准 + ODT（§3.9） | impedance |
+| channel loss / ISI | 水平 + 垂直闭合 | CTLE / DFE | 频响 / post-cursor 响应 |
+| PVT 漂移 | 工作点移动 | retraining / tracking（§6.8） | 已存工作点 |
+
+- **ZQ**：- 校准对象：**driver impedance / ODT 阻抗**（随 PVT 漂）——以外部 240Ω 精密电阻为基准，校准 DRAM 驱动器/ODT 阻抗。
+- 不做 ZQ 的表现：阻抗失配 → 反射/ISI（太弱）或摆幅压缩/功耗（太强）→ 眼图劣化。
+- LPDDR6 后台校准：**完全不占 DQ**；完成后有变化则置位 **ZQUF** 标志，Core 在总线空闲发 **MPC ZQCal Latch** 把新阻抗码字安全应用到引脚、等 tZQLAT 后恢复传输；**DVFS 电压切换时需 MRW 设 ZQ Stop 暂停、切完解除**。
+- Controller 感知：管理后台校准窗口与 ZQ Stop 时序（切频序列的一部分，§7.10）。
+- **DFE**：用已判决的历史 bit 估算并抵消 post-cursor ISI（不放大噪声）；HBM4/DDR5 高速档依赖 per-pin DFE（LPDDR5X 起），LPDDR6 低摆幅（Voh≈250mV 级）尤其依赖。
+- **DCA**：修正 rise/fall 不对称导致的 duty-cycle distortion，恢复 half-UI 对称。
+- **CTLE**：对通道频率响应做补偿，减轻高频损耗（仅此一句，不展开电路）。
+*Interview anchor: §9.2 W17/W23/W24*
+
+### 6.4 Unified Training Model
 
 ```text
 Unknown Parameter（delay / Vref / 相位 / 阻抗）
@@ -679,142 +827,103 @@ Store / Restore（存 training set，按频点/电压/温度恢复）
 
 - 关键区分：**1D 训练**（只扫 delay：write leveling / read gate / WCK 相位）vs **2D 训练**（voltage×timing 眼中心：read/write eye center）——**delay 决定何时采样，Vref 决定什么是 1**。
 - 多次一维 sweep 是 2D 的工程近似（省训练时间）。
-- 训练失败表现：无 pass window（开路/短路/参数错）→ 需要分步隔离诊断——训练自举链（先 CA 后数据，§5.4~5.6）的意义就在于此。
+- 训练失败表现：无 pass window（开路/短路/参数错）→ 需要分步隔离诊断——训练自举链（先 CA 后数据，§6.5~6.7）的意义就在于此。
 
+三维视角：训练参数分三类——**Timing（delay/phase）**、**Voltage（Vref）**、**Channel response（EQ 系数）**；1D 训练只扫一维（write leveling / read gate / WCK 相位），2D = voltage×timing 眼中心（read/write eye）——工程上用多次一维 sweep 近似 2D。
+*Interview anchor: §9.2 W13*
 
-### 5.4 CA Training
+### 6.5 Command Path Training（CS / CA）
 
 - CA 与 CK 是两条不同物理路径、**不是 source-sync**——training 解决两件事：**CA-to-CK timing + VREF(CA)**（把采样点放到 CA eye 中心）。
 - **CA 错一 bit 比数据 bit 错误更严重**：改变命令或地址的语义（写错地址=破坏别的行，发错命令=状态机走错）→ CA 训练零容忍 + CA parity。
-- LPDDR6 CBT：CS 拉高、CA[3:0] 发 **PRBS16**，DRAM 内**同种子 PRBS 发生器**逐比特比对，偏差比特经 DQ[7:0] 输出 1（Fail）→ SoC 据此独立调每根 CA 线的发射延迟，循环"复位 LFSR→发 PRBS→读 DQ"直到全 0（详细流程 Appendix D.5）。
+- LPDDR6 CBT：CS 拉高、CA[3:0] 发 **PRBS16**，DRAM 内**同种子 PRBS 发生器**逐比特比对，偏差比特经 DQ[7:0] 输出 1（Fail）→ SoC 据此独立调每根 CA 线的发射延迟，循环"复位 LFSR→发 PRBS→读 DQ"直到全 0。
 - HBM/DDR5 的命令路径训练走专用机制（HBM 经 IEEE 1500/MISR 体系；DDR5 走 MPC/MRR）——两个协议殊途同归：**命令路径的可靠性都要专用训练机制**。
 
-### 5.5 Write Leveling / WCK2CK
+**LPDDR6 训练自举示例**（dependency chain [PROJECT 用户口径 / JEDEC 交核]）：
+
+```text
+低频 command bootstrap（UI 宽、未训练 CA 仍有 margin）
+    ↓
+CS / CA alignment（CBT：PRBS 同种子比对、DQ 回读偏差 bit）
+    ↓
+ZQ 阻抗校准
+    ↓
+WCK2CK phase alignment
+    ↓
+Read path（gate → eye）
+    ↓
+Write path
+    ↓
+Vref / DFE fine tuning
+    ↓
+save training set（按 setpoint；DFS 后恢复）
+```
+
+- **低频进/出，高频练**：初始 MR 与 CBT 在低频 f0 完成；FSP 切高频后做眼级训练；training set 保存/恢复是 DVFS 的前提（§6.8）。
+- **后一步只依赖已验证的前一步通路**——顺序不是协议品味，是可观测性自举（写训练靠读回比对：RX 未验证则 TX/RX fail 无法归因）。
+
+### 6.6 Clock / Strobe Alignment（Write Leveling / WCK2CK / DCA）
 
 - 问题：控制器无法确定发出的 DQS/WCK 到达 DRAM 的相对延迟（与 CK 路径不同）——**通过 DRAM feedback 闭环测量相对 skew，调控制器侧 strobe delay**。
 - LPDDR5 WCK2CK Leveling：锁 DRAM/PHY 内同步 FIFO 的写读指针（WCK 与 CK 异步）；每次 DFS 后必须重做或恢复（§3.6）。
 - LPDDR6 WFF：DRAM 生成 CK 锚定、宽 2tCK 的内部脉冲 → 分频后的 WCK 对其单次采样：相位错采样 0、对齐采样 1 → SoC 微调 WCK 发射延迟直至 DQ 上观察到 0→1 翻转——修正 WCK 1/2 分频器的初始相位不确定性（0°/180°）。
-- Controller 感知：DFI training handshake；切频序列中的必做步骤（§6.10）。
+- Controller 感知：DFI training handshake；切频序列中的必做步骤（§7.10）。
 
-### 5.6 Read Gate / Read Eye
+### 6.7 Data Eye Training（Read Gate / Read Eye / Write Eye / Vref）
 
 - **gate training ≠ eye training（两步串行）**：gate 解决"read strobe 什么时候到、何时开启捕获窗口"；eye training 决定"在 UI 的哪里采样数据"。
 - Read eye training = controller 自己找接收 eye：DRAM 提供已知 pattern（LPDDR6 RDC 命令 → DRAM 忽略 FIFO、直接从 **MR32/33/34** 输出固定已知码型）→ PHY 找 pass window 左右边界 → 采样点放中心。
 - **per-bit deskew**：同一 byte 内 per-bit skew 让眼中心各异——高速 PHY 逐 bit 补偿（HBM4 per-pin DFE/VrefDQ 同理）。
 
-### 5.7 Vref
-
-- Vref 决定判决阈值（"什么是 1"）；只扫 delay 不扫 Vref 只保证水平 margin——电压 margin 不对称时判决裕量下降。
+**Vref（电压维度）**：- Vref 决定判决阈值（"什么是 1"）；只扫 delay 不扫 Vref 只保证水平 margin——电压 margin 不对称时判决裕量下降。
 - 找 2D 眼中心（多次一维 sweep 近似）；LPDDR6 的 VREF(CS)/VREF(CA) 写入目标 **FSP 寄存器**（存 DRAM 侧）、delay 值存 PHY 内部。
 - DDR5 VrefDQ per-pin 训练（§3.5.71+）；温压漂移的眼偏移由周期性 retraining 调整 Vref 与 timing。
 
-### 5.8 ZQ
-
-- 校准对象：**driver impedance / ODT 阻抗**（随 PVT 漂）——以外部 240Ω 精密电阻为基准，校准 DRAM 驱动器/ODT 阻抗。
-- 不做 ZQ 的表现：阻抗失配 → 反射/ISI（太弱）或摆幅压缩/功耗（太强）→ 眼图劣化。
-- LPDDR6 后台校准：**完全不占 DQ**；完成后有变化则置位 **ZQUF** 标志，Core 在总线空闲发 **MPC ZQCal Latch** 把新阻抗码字安全应用到引脚、等 tZQLAT 后恢复传输；**DVFS 电压切换时需 MRW 设 ZQ Stop 暂停、切完解除**。
-- Controller 感知：管理后台校准窗口与 ZQ Stop 时序（切频序列的一部分，§6.10）。
-
-### 5.9 Equalization（深度边界控制）
-
-只讲系统含义，不展开电路：channel loss / ISI 随距离与速率增长 → 接收端需要均衡——CTLE 放大高频分量补偿通道衰减；DFE 用已判决 bit 的反馈消除码间干扰、不放大噪声。**对 Controller 的意义**：均衡是 PHY 内部自适应，Controller 只感知训练时间与 DFI 握手；HBM4/DDR5 高速档依赖 per-pin DFE（LPDDR5X 起 §7.7.7），LPDDR6 的低摆幅（Voh≈250mV 级）尤其依赖。本文不进一步展开 EQ 的 analog 实现机制。
-
-
-### 5.10 Retraining / PVT Tracking
+### 6.8 Retraining / PVT Tracking
 
 - training 的结果 = **特定频点/电压/温度条件下的最佳工作点**——这几个之一变化就要 retrain 或恢复（FSP 切换 / ZQ Stop / 温度越档）。
 - 机制组合：**training set 多频点保存**（LPDDR：低频 f0 初始化训练 → DFS 后按 setpoint 恢复，DVFSC/DVFSQ 低功耗模式依赖该机制）；ZQ 周期重校（后台）；**interval oscillator 持续追踪**（LPDDR 片内振荡器，标准名 tWCK2DQ Interval Oscillator，§7.6.14）；Vref 重训。
-- 静态补偿（训练修 skew=物理常量，Appendix D.5）+ 动态追踪（PVT 漂移）构成完整训练体系。
-- Controller 成本：training set 存储（"模式×电压×频点"三维表，§5.11）、重训时机调度（空闲窗口 vs 强制）、训练期间带宽不可用进 QoS。
+- 静态补偿（训练修 skew=物理常量，§6.5）+ 动态追踪（PVT 漂移）构成完整训练体系。
+- Controller 成本：training set 存储（"模式×电压×频点"三维表，§5.1）、重训时机调度（空闲窗口 vs 强制）、训练期间带宽不可用进 QoS。
 
-### 5.11 Power Domain / DVFS / Low Power
+### 6.9 Cross-Protocol Training Mechanisms
 
-**供电轨对比** [JEDEC]：
+三协议训练机制的根差异在**回读通道** [JEDEC]：
 
-| 协议 | 供电轨与典型值 | 备注 |
-|---|---|---|
-| HBM3 | VDDC 1.1V（core）/ VDDQ 1.1V（I/O）/ Tx driver 0.4V / VDDQL / VPP | 上电顺序 VPP → VDDC=VDDQ → VDDQL（JESD238 Power Ramp） |
-| HBM4 | **VDDC 1.05V（core）/ Tx 0.4V / I/O 电压厂商自定** | 标准仅约束相对关系：VPP > VDDC+200mV、VDDC > VDDQ+VSP（JESD270-4） |
-| DDR5 | VDD=VDDQ=1.1V（PMIC 在模组，平台只供 bulk 5/12V）；VPP ⚠️1.8V | 上电/管理时序依赖模组 PMIC |
-| LPDDR5 | VDD1 / VDD2H / VDD2L / VDDQ | 上电顺序 VDD1≥VDD2H≥VDD2L≥VDDQ；VDD2 拆分**可选** |
-| LPDDR6 | VDD1 / **VDD2C 1.0V** / **VDD2D 0.875V** / VDDQ 0.5V（默认） | 顺序 VDD1≥VDD2C≥VDD2D≥VDDQ；Voh=0.5×VDDQ≈250mV；VDD2 拆分**强制** |
-
-演进方向相反 [INFERENCE]：HBM 把余量下放厂商（I/O 电压开放，换 PHY 工艺自由度、配合逻辑 base die）；LPDDR 把电源轨越拆越细——LPDDR6 的 VDD2C（接口侧）/VDD2D（阵列侧）强制双恒功率域：接口域与阵列域的最优电压、负载、di/dt 特性不同——拆分后独立稳压、隔离噪声、**CA 侧调频调压不再扰动阵列裕量**。
-
-**LPDDR6 DVFS 家族**（JESD209-6 §11 / MR19-21，每个模式绑定一条轨与一个目标区间）[JEDEC]：**DVFSC**（VDD2 core 域）/ **DVFSQ**（VDDQ 0.5→0.3V）/ **DVFSH**（VDD2C→1.025V 高速率）/ **DVFSL**（VDD2D→0.85V 低速率）/ **DVFSB**（VDD2D→0.90V 高速率）。Controller 代价：① DFS 序列变为**多轨时序编排**（各轨电压爬坡/跌落顺序与建立时间编进切换序列）；② 维护"模式 × 轨电压 × training set"三维表；③ 与 PMIC 的轨控握手时序成为软硬协同设计点。
-
-**无 CKE 的低功耗（HBM / LPDDR）vs DDR5 CKE**：
-
-- HBM：低功耗状态经**命令**进入/退出（PDE/SRE），**粒度是通道级**（PC 位定值，§2.5）；LPDDR 同为无 CKE 设计（CA 命令进低功耗）。
-- **SRE/PDE 前置条件分叉** [JEDEC]：**SRE 要求全 bank precharged**（"only allowed when all banks in both pseudo channels are precharged with tRP satisfied"，HBM3 p97 / HBM4 p108 同文；LPDDR5 §7.5.2 另要求 **SRX↔SRE 之间 ≥1 条 extra refresh**）——因为 SR 是"停时钟 + DRAM 自管刷新"，open row 会干扰自刷新；**PDE 不要求 idle**——可带 open row 甚至进行中的刷新进入（HBM3 §6.3.4.1："can be issued while row activation, precharge, …or refresh are in progress"，仅要求读写突发完成 tWR/tRDPDE），HBM4 显式分 **precharge power-down / active power-down** 两态（p102）。
-- **postpone 债与 SR 的关系** [JEDEC]：协议**不要求 postpone 的 REF 补刷完**——进入 SR 后 DRAM 自管刷新接管外部债（HBM3："initiates a minimum of one internal refresh within tCKSR period once it enters self refresh mode"）；LPDDR5 SR 期间刷新计时器 **freeze and store / resume from saved value**（债保持）、bank 计数 SR 退出清零。
-- Controller 责任：进低功耗前排空在飞命令、进出时序由内部定时器管理、**唤醒延迟显式建模进 QoS**（突发到达时的唤醒开销 = 延迟毛刺，需预测空闲窗口提前唤醒）。
-
-**低功耗状态五态表**（[JEDEC 5B] + [PROJECT]；drain/静止判据与三轴模型见 §6.10）：
-
-| 状态 | 数据保留 | refresh owner | clock | 退出就绪（到首数据） | 债处理 | training set |
-|---|---|---|---|---|---|---|
-| Active PD | 保留（行开，SA 供电更高——功耗换就绪） | **MC**——PD 期间发不了 REF，**驻留被刷新债封顶** | 可停/浮空（tCMDPD 后） | ≈ tXP（数十 ns） | 计时器照走 | 保留 |
-| Precharge PD | 保留（行关） | **MC**（同上） | 可停/浮空 | tXP + tRCD | 计时器照走 | 保留 |
-| SR | 保留 | **DRAM** | 可停/可变 | tXS（百 ns 级）+ 债 resume | freeze/store（LPDDR） | 保留 |
-| DSM（LPDDR5/5X） | 保留（retention） | **DRAM**（§7.5.8 归在 Refresh operation 家族） | 基本必停 | 深度恢复（CS toggle 退出；tDSM 数值 ⚠️） | DRAM 内部 | ⚠️（视掉轨深度） |
-| DPD（旧代 LPDDR2/3） | **不保留**（破坏性） | — | — | re-init + 全量重训 | 重建 | 重建 |
-
-- DSM [JEDEC 5B 明文]：§7.5.8 独立成节且在 7.5 Refresh operation 家族下；官方状态图四态（Idle/PD/SR/DSM）；进入 = 专用 Deep Sleep Enable 命令（真值表含 MRS OT/NT 位段）；退出 = CS toggle。**勿与旧代破坏性 DPD 混称**。
-- 退出成本阶梯 = break-even 级联（idle 预测 > 阈值_PD < 阈值_SR < 阈值_DSM）——盈亏平衡模型的控制器实现；PD 是"有限驻留态"（债封顶），SR/DSM 才是"无限驻留态"。
-- 训练影响：CA 无 CKE 门控可用，命令路径训练走独立机制（§5.4）。
-
-**切频 × 刷新：REF owner 框架** [INFERENCE/PROJECT 组织口径；证据 JEDEC]：
-
-| 协议 | 切频方式 | REF owner | 约束 |
+| 维度 | HBM3/4 | DDR5 | LPDDR5/6 |
 |---|---|---|---|
-| LPDDR5 | **非 SR 模式直切**（三组 FSP 预存（FSP0/1/2，MR16 OP3 [JEDEC 5B 明文]），MRW 切换） | **始终在 CTRL**——postpone 债随切频保留，不清债 | §7.6.7 六条件：tCK(abs)min；"**Refresh requirements apply during clock frequency change**"；"All banks are required to be idle state or during tRFCab/pb"；MRW/MRR 完成；tRCD/tWR/tWRA/tMRW/tMRR 满足；CS LOW |
-| HBM3/4 | **SR 下切频**（p97："may halt the external clock or change the external clock frequency tCKSRE **after self refresh entry**…stable tCKSRX before exit"） | 进 SR 即移交 **DRAM**（tCKSR 内自启动内部刷新；HBM3 无 postpone、无外部债概念） | SR 期间 CK 可停/可变；SRX 前 CK 稳定 tCKSRX |
-| DDR5 | 同 HBM 的 SR 路线（传统 DDR 手法 ⚠️ 无 DDR5 PDF 细节） | 同上 | 同上 |
+| 命令/CA 训练 | IEEE 1500 测试口 + AWORD MISR 签名 | MPC 捕获 CA → MR → MRR 回读 | Command Bus Training |
+| 数据训练 | WDQS2CK 对齐 + DWORD 级 MISR/LFSR | MPC 模式读写均衡 + per-pin DFE/DCA/Vref | WCK2CK Leveling + Interval Oscillator 读均衡 + 写均衡 |
+| 回读通道 | 独立测试访问口（不依赖功能 DQ） | 数据总线（需先打通 DQ） | CBT/DQ 通道 |
+| 频率维度 | 单频点（设计期定） | 单频点 | **多 setpoint training set** |
 
-- 推论一：LPDDR 敢直切、HBM/DDR 要借 SR——LPDDR 有三组 FSP 预存（切频 = 寄存器组选组，快、可重入），移动场景需要频繁 DVFS；**owner 不移交才保得住 postpone 债与低延迟**。HBM/DDR 的 DRAM 侧无 FSP 预存，动时钟只能借 SR 让 DRAM 自管（顺便把刷新也移交）。
-- 推论二：切频窗口的刷新义务在**时间域连续**（deadline 不因切频重置）——调度器切频前确认 banks idle（条件②）恰好等价于"刷新债此刻无冲突"。
-- 切频在 tCMDPD/tFC/tZQPD 等窗口被 inhibit；PD 三态（idle/active/SR PD——SR PD 内部刷新照常）[JEDEC §7.5.7.1]。
+- 推论（复用边界口径，见 §7.11）：**训练编排的高层 skeleton 可复用，但具体 command sequence / 回读通道 / pass-fail 机制 / operating-point handling 必须协议化**——回读通道不同是训练必须分叉的根因。
+- 殊途同归的三件事：命令路径零容忍（专用训练机制）、数据路径 2D 眼、多频点 training set 保存/恢复。
+## 7. Controller & DFI Contract
 
-### 5.12 DDR vs LPDDR vs HBM 的设计哲学
+本章回答：**Controller 负责什么、PHY 负责什么、DFI 如何定义两者之间的 contract**。RTL microarchitecture（CAM/队列/仲裁/FSC）见 `DDR_Controller_Architecture.md`。
 
-- **功耗管理复杂度：LPDDR > DDR5 > HBM**。LPDDR：REFpb 后台债 + DFS/DVFS 多域切换 + 温度刷新倍率（2x/4x）三者叠加；DDR5：固定频率，复杂在双子通道刷新错峰、RFM/DRFM/ARFM 配额、side-band ECC RMW 占用；HBM：无 DFS、无 CKE，频率与电压设计期锁死，只有 per-PC 降活与热感知节流——**AI 场景要持续满带宽，省电靠降活不靠降频**（定位使然）。
-- **HBM 的功耗学**：速率路线（3→3E）主要花 IO 功耗买带宽、pJ/bit 改善有限；位宽路线（3E→4）用更低 per-pin 速率跑更宽总线，能效更好——总功耗随带宽近线性上涨，pJ/bit 每代降 ~20~30% [VENDOR ⚠️ 建议以项目实测/厂商 datasheet 替换]。这是 HBM4"降速翻宽"的功耗学解释（§3.10）。
-- **接口宽度 vs 距离** [PHYSICAL-EXPLANATION]：HBM 超宽、相对低 per-pin rate（中介层 mm 级）；DDR 窄、高速、长距离（PCB 十 cm 级，需均衡）；LPDDR 中间（PoP/PoH）。互连距离决定可行的 rate×width 乘积——HBM 可以用非常宽的 interface 而 DDR 不可以（§3.10 第五条路）。
-
-**互连阶梯表**（量级为 [PHYSICAL-EXPLANATION/常识]）：
-
-| 互连级 | 距离量级 | 可行 per-pin rate | 加宽的边际成本 | 典型选择 |
-|---|---|---|---|---|
-| PCB | cm~几十 cm | 低中（需均衡） | 高（pin/走线/匹配组/连接器；skew 容差 ∝ UI，宽而快双重恶化） | DDR：窄而快 |
-| Package substrate | mm~cm | 中 | 中 | — |
-| Silicon interposer | mm | 高（轻 EQ、低摆幅可行） | 低（走线/bump 密度高），**但 PHY 功耗仍随总引脚线性**（§6.1 分层 4） | HBM：宽而适中 |
-| TSV | 几十~几百 µm | 很高 | 堆叠内 | stack 内部 |
-| Hybrid bonding | µm 级 | 极高 | 最高密度 | HBM4+/3D 方向 |
-
-- energy/bit 维度：距离短 → 低摆幅可行（HBM Tx 0.4V、LPDDR6 Voh≈250mV）→ pJ/bit 低；PCB 长线需强驱动 + 端接 + 均衡 → pJ/bit 高——"HBM 是能效引擎"的物理根源。**加宽省的是 SI 预算，不省电**。
-- **一句话定位**（§0.5）：HBM=带宽引擎；DDR5=容量底座；LPDDR=功耗效率。
-
-
-## 6. Controller / PHY Boundary
-
-统一抽象：
+### 7.1 Responsibility Stack
 
 ```text
-Controller    What / When（事务→命令、时序合法性、QoS、预算）
+Controller   What / When——transaction→command、状态/合法性、QoS、refresh debt、sequence
     │
-DFI           Contract（命令/数据/训练/低功耗/切频的握手契约）
+DFI          Contract——transport、latency、phase、handshake、ownership
     │
-PHY           How Electrically（延迟/Vref/阻抗/均衡的实际调节）
+PHY          How Electrically——launch/capture、delay、Vref、ZQ、EQ、deskew
     │
-DRAM Pins
+DRAM         Protocol execution——阵列操作、反馈、内部刷新/维护
 ```
 
-本章只讲"协议给 Controller 提出什么 requirement"；RTL microarchitecture 见 `DDR_Controller_Architecture.md`。
+> **Controller 不应该判断 eye 是否够开；PHY 不应该决定 memory scheduler QoS。**——这是责任边界最重要的一句话。
 
-### 6.1 Protocol → Controller Requirement Mapping
+DFI 承载五类握手：命令/地址、读写数据、训练控制、低功耗、频率切换。Controller 通过 DFI 发起训练、等待 PHY 完成、按 **PhyRdLat / PhyWrLat** 对齐读写时序——**读延迟由 PHY 告知 Controller**（PHY 内部捕获链路深度决定，Controller 不能假设）。
 
-公共抽象：**bank/PC 状态表 + 时序检查器（timing checker）+ 策略层（QoS/仲裁）**；差异在实例规模与策略维度 [PROJECT]：
+### 7.2 Protocol → Controller State
+
+公共抽象：**bank/PC 状态表 + timing checker + 策略层（QoS/仲裁）**；差异在实例规模与策略维度 [PROJECT]。
+
+**7.2.1 调度对象与状态机**：
 
 | 维度 | HBM3/4 | DDR5 | LPDDR5/6 |
 |---|---|---|---|
@@ -826,6 +935,14 @@ DRAM Pins
 - HBM 调度器是"**横向复制 + 全局 QoS**"（对象多而轻）；DDR5/LPDDR 是"**少数深通道**"（单对象内 rank/BG/刷新/翻转策略复杂）。
 - 地址映射是三家共享的设计课题，只是维度数不同：HBM 用 channel-first striping（cache line 级打散到 32 通道，防止单通道热点吃掉翻倍带宽）；DDR5/LPDDR 在子通道/通道维度的 hash 同样决定热点分布——**映射失效 = 并发收益归零**。
 
+每个调度对象（bank/PC/子通道）的状态机至少含：open row 地址、tRCD/tRAS/tRP/tRC 计时器、刷新债 deadline、RAA/RFM 计数——寄存器成本随对象数线性增长（HBM4 64PC × 最多 64 bank 是极端值）[PROJECT + JEDEC 锚点]。
+
+**刷新债的 postpone 预算随 bank 数收紧**：截止时间 = 9×tREFI（§4.4）；到点冲刷 owed 刷新的时间 ∝ banknum × tRFCpb（REFpb 模式每 bank 至少一条债）——bank 越多，窗口内留给普通命令的松弛越少（§2.3 墙 3 的调度器视角）。
+
+**发射通路成本**：队列按 bank/tag 匹配 → bank filter → QoS filter → timing check——对象数增加直接加宽匹配表项与比较器阵列，发射路径的功耗与时序压力上升。
+
+**通道继续增加，瓶颈何时离开 DRAM（分层判据）** [INFERENCE]：
+
 **通道继续增加，瓶颈何时离开 DRAM（分层判据）** [INFERENCE]：
 
 1. **DRAM 是默认瓶颈**：实测带宽 << peak、命令槽在等 DRAM 时序（row miss / tRRD / tFAW / 刷新占空）——此时加通道/加 bank 才有效。
@@ -835,13 +952,7 @@ DRAM Pins
 
 典型转移顺序：DRAM（时序限额）→ Controller 全局层（映射/QoS）↔ NoC（crossbar/拥塞，谁先取决于拓扑与流量分布）→ PHY/封装（功耗预算）。负载类型决定卡在哪层：随机多核负载先考验 NoC/QoS，row-buffer 型负载先考验 DRAM 时序。设计含义：通道继续增加时，投资优先级从"DRAM 内部并行"转向"映射防热点 + NoC 容量 + 每通道实例化"——这也是 HBM4 通道翻倍而不动 ch-2PC 的原因之一。
 
-### 6.2 Scheduler State 由哪些协议 Feature 决定
-
-每个调度对象（bank/PC/子通道）的状态机至少含：open row 地址、tRCD/tRAS/tRP/tRC 计时器、刷新债 deadline、RAA/RFM 计数——寄存器成本随对象数线性增长（HBM4 64PC × 最多 64 bank 是极端值）[PROJECT + JEDEC 锚点]。
-
-**刷新债的 postpone 预算随 bank 数收紧**：截止时间 = 9×tREFI（§4.4）；到点冲刷 owed 刷新的时间 ∝ banknum × tRFCpb（REFpb 模式每 bank 至少一条债）——bank 越多，窗口内留给普通命令的松弛越少（§2.3 墙 3 的调度器视角）。
-
-**发射通路成本**：队列按 bank/tag 匹配 → bank filter → QoS filter → timing check——对象数增加直接加宽匹配表项与比较器阵列，发射路径的功耗与时序压力上升。
+**7.2.2 Scheduler 的七个自由度** [PROJECT]——协议不可改的时序墙（§1/§2）里重排时间线，把不可避免的开销移到伤害最小的位置：
 
 **Scheduler 的七个自由度** [PROJECT]——协议不可改的时序墙（§1/§2）里重排时间线，把不可避免的开销移到伤害最小的位置，并用地址映射预防它们发生：
 
@@ -851,13 +962,13 @@ DRAM Pins
 | 2 | batch 读写切换 | 攒写分组翻转，减少 tWTR/tRTW 次数与 tWTR_L 代价（§3.8） | 每通道实例内 |
 | 3 | 错峰 REF | 双子通道 / per-PC / per-bank 刷新债相位错开（§4.2） | 实例间协调（全局层） |
 | 4 | refresh postpone/pull-in | ±9×tREFIe 预算（§4.4） | 控制器↔DRAM 的预算协议（跨层） |
-| 5 | BG/通道交织地址映射 | BG-aware 排序 + channel-first 防热点（§2.4/§6.1） | 全局函数 |
+| 5 | BG/通道交织地址映射 | BG-aware 排序 + channel-first 防热点（§2.4/§7.2） | 全局函数 |
 | 6 | page open / auto-precharge 策略 | open-page 换 hit 率 vs close-page 省命令（§3.4） | 每通道实例内 |
 | 7 | QoS 带宽/延迟分配、防饿死 | 调度优先级骨架（下） | 全局仲裁 |
 
 调度优先级通用骨架：**刷新（含 RFM/ARFM/PRAC 配额）> 写排空（防写饥饿）> 读 QoS > 预充电合并/激活调度**。各协议附加维度：HBM = per-PC 状态错峰 + 行列并行窗口；DDR5 = 双子通道错峰 + side-band ECC RMW 占用；LPDDR = DFS 窗口 + 温度刷新倍率（2x/4x）。
 
-### 6.3 Timing Checker 的协议来源
+**7.2.3 Timing Checker 的协议来源**（每层参数都来自协议具体条款）[PROJECT + JEDEC]：
 
 checker 分层（每层参数都来自协议具体条款）[PROJECT + JEDEC]：
 
@@ -866,9 +977,9 @@ checker 分层（每层参数都来自协议具体条款）[PROJECT + JEDEC]：
 - **跨 SID/rank**：HBM 多 stack 共享通道总线的 turnaround；DDR5 R2R 翻转与错峰刷新——来源：共享接口（§2.2）；
 - **系统级**：tFAW 滑动窗口计数器、刷新预算、ODT/总线翻转——全局计数器而非本地比较器。
 
-bank 内 / 跨 bank 是本地比较器（随实例复制、成本低）；系统级是全局计数器（不复制、是共享瓶颈，§6.1）。**总线独立 ≠ 时序独立**（HBM 行/列双总线，跨域链 tRCD/tRTP/tRTW 照常约束行决策与列决策）。
+bank 内 / 跨 bank 是本地比较器（随实例复制、成本低）；系统级是全局计数器（不复制、是共享瓶颈，§7.2）。**总线独立 ≠ 时序独立**（HBM 行/列双总线，跨域链 tRCD/tRTP/tRTW 照常约束行决策与列决策）。
 
-### 6.4 Refresh / Row Hammer State
+**7.2.4 Refresh / Row Hammer 记账**（详见 §4）——协议强加给控制器的正确性义务：
 
 （详见 §4）协议强加给控制器的正确性义务：
 
@@ -877,8 +988,7 @@ bank 内 / 跨 bank 是本地比较器（随实例复制、成本低）；系统
 - 温度档切换（MR4）改变刷新预算——热管理联动；
 - 最坏情况带宽税验证（安全场景）：单 bank 税 = tRFCpb/(RAAIMT×tRC+tRFCpb)（§4.7）。
 
-
-### 6.5 Command Encoder
+**7.2.5 Command Encoder**——三家的命令编码格式正交、无法参数化统一 [INFERENCE]：
 
 三家的命令编码格式正交、无法参数化统一 [INFERENCE]：
 
@@ -888,25 +998,16 @@ bank 内 / 跨 bank 是本地比较器（随实例复制、成本低）；系统
 
 编码器还要处理：行/列总线 pin 重映射表（HBM 每通道有 remap）、CS 时序（DDR5 2T 的 CS_n 第二拍控制 non-target rank ODT）、广播 vs 定向 MRW（DDR5 "broadcast across all logical ranks"）。
 
-### 6.6 DFI 的存在意义
+### 7.3 Why DFI Exists
 
-为什么 Controller 不直接驱动 DRAM pin：PHY 需要独立时钟域（frequency ratio）、独立工艺（analog heavy）、独立训练状态机——DFI 把 **What/When（Controller）与 How Electrically（PHY）** 解耦为标准契约 [DFI]。
+- **Controller 为什么不直接驱动 DRAM pin？** MC digital timing domain ≠ PHY high-speed electrical domain——PHY 需要独立时钟域（frequency ratio，§7.4）、独立工艺（analog heavy）、独立训练状态机；直接驱动等于把三重异质性强耦合进控制器。
+- **DFI 解耦什么？** MC 掌 *which command / when*；PHY 掌 *how command/data physically appears at pins*——What/When 与 How Electrically 的标准分界。
+- **DFI 本身不是什么？** 不是 DRAM protocol、不是训练算法、不是 AXI、不替 Controller 做 scheduler——它是 **MC ↔ PHY digital contract**。
+- 附注 [VENDOR]：DFI 6.0（2026-05）首次官方支持 HBM，训练全面转 PHY-independent 模式。
 
-DFI 承载五类握手：命令/地址、读写数据、训练控制、低功耗、频率切换。Controller 通过 DFI 发起训练、等待 PHY 完成、按 **PhyRdLat / PhyWrLat** 对齐读写时序——**读延迟由 PHY 告知 Controller**（PHY 内部捕获链路深度决定，Controller 不能假设）。（ratio 与读写数据时序的完整模型见 §6.8；signal-level 细节见 Appendix D.4。）
+### 7.4 Frequency Ratio / Gearbox / Phase
 
-### 6.7 Controller vs PHY Responsibility
-
-**统一的是前端（事务/QoS/基础设施），分叉的是协议引擎** [PROJECT]：
-
-- **可复用（协议无关层）**：事务层（AXI/CHI 端口、QoS/仲裁/防饥饿、地址 hash 与 interleave 框架）、基础设施（性能计数、错误注入/记录框架、寄存器与诊断架构）、参数化引擎骨架（bank 状态表、时序检查器框架——时序参数 fully parameterized 时）。
-- **必须分叉（协议相关层）**：命令编码器（§6.5——格式正交）；训练状态机（回读通道不同，§6.9——骨架不可复用）；刷新管理（RFMpb/DRFM vs REFsb/RFM vs REFpb/ARFM/PRAC——策略与命令接口都不同）；低功耗（HBM 命令式无 CKE vs LPDDR CA 命令式 + DPD/DFS vs DDR5 CKE）；PHY/DFI 时序参数与手序列。
-- 工程结论：常见落地形态 = **共享前端 + 每协议独立 MC core + 统一 infra**。
-
-**训练责任三分** [PROJECT]："**Core 发命令，PHY 调延迟，DRAM 报结果**"——Controller 决定训练顺序/发起/判定通过，PHY 执行电气调节，DRAM 提供反馈通道（pattern/签名/引脚回读）。（例外：**PHY Master 模式**下连训练命令也由 PHY 发——见 §6.9 两模式。）
-
-### 6.8 Read / Write Data Timing
-
-**Frequency ratio：空间换频率**（[DFI] 证据见 Appendix D.4）
+**Frequency ratio：空间换频率**（[DFI] 证据见 §7.4）
 
 ```text
 f_MC = f_CK / ratio          Width_DFI(每方向) = 2 × ratio × DQ_width（2 = DDR 双沿）
@@ -917,40 +1018,66 @@ f_MC = f_CK / ratio          Width_DFI(每方向) = 2 × ratio × DQ_width（2 =
 - 为什么 ratio 不伤命令吞吐：现代 DRAM 自然命令率本来就 sub-CK（DDR5 tCCD_S=8nCK → 列命令率 ≤ 1/8CK），1:4 每 MC cycle 4 个 phase 槽绰绰有余 [INFERENCE]。
 - Timing checker 机制：**MC 域计数 + phase 子字段**——ns 级长参数（tRCD≈56CK=14 MC cyc）粗粒度足够，仅短参数（tCCD/tRRD/1T-2T 间距）需要 phase 级比较 [INFERENCE]。
 
+把两个容易混淆的旋钮钉死：
+
+- **DFI ratio** = MC/DFI 数字时钟 : PHY 高速时钟域——解决 "MC digital logic 跑不到 DRAM pin rate"（空间换频率）。
+- **CKR** = LPDDR 协议侧 CK:WCK——解决 "命令域与数据域时钟解耦"（§3.6）。
+- **两者完全不同、相互独立**：一个在 MC↔PHY 边界，一个在 PHY↔DRAM 边界。
+
+### 7.5 Read / Write Data Contract（deadline vs arrival）
+
+**写路径：deadline 驱动（必须提前交付）**
+
 **写路径：deadline 驱动（必须提前交付）**
 
 - DRAM 在 write command + **CWL**（nCK）处用 DQS/WCK 沿采样 DQ——数据必须在 pin-level deadline 前就位；PHY 在此之前要完成 DFI FIFO/gearbox、串化、strobe 生成。
 - 写 contract = **集成期协定的常数**：tphy_wrlat（WR command → dfi_wrdata_en）+ tphy_wrdata（wrdata_en → 首个数据）[DFI 5.1 Table 12]——MC 与 PHY 双方一致编程、**静态保证**：写晚到不可恢复（PHY FIFO underrun = 总线垃圾数据，协议无 retry）。
-- Write Leveling（§5.5）修的是 CK↔DQS/WCK 在 DRAM 引脚处的**亚周期** skew，不动 cycle 级 contract——两层正交。
-- 写数据**升序对齐**（"aligned in ascending order"，§4.10.3）；**rolling 只在读路径存在**（'rolling' 全文仅读数据节 + 读 DBI 节 2 处命中——考据）。
+- Write Leveling（§6.6）修的是 CK↔DQS/WCK 在 DRAM 引脚处的**亚周期** skew，不动 cycle 级 contract——两层正交。
+- 写数据**升序对齐**（"aligned in ascending order"，§4.10.3）；**rolling 只在读路径存在**（'rolling' 全文仅读数据节 + 读 DBI 节 2 处命中——spec 全文检索确认）。
+
+**读路径：到达驱动（事后对齐）**
 
 **读路径：到达驱动（事后对齐）**
 
 - **读写所有权不对称（本节核心）**：写方向 PHY 是时序**产生者**（source-sync——"谁发 data 谁发 strobe"），deadline 驱动、必须提前备好；读方向 PHY 是时序**接受者**，被动捕获、只能事后对齐（FIFO + rolling）[INFERENCE]。
 - **PhyRdLat（tphy_rdlat）**= dfi_rddata_en → dfi_rddata_valid 的 DFI cycle 数 [DFI 5.1 Table 15]。分段模型：transport(1~2) + 串化 + DRAM RL(nCK) + capture/FIFO + deser/跨时钟域。**PHY 拥有、MC 被告知**，按 (频率 setpoint × ratio) 配置且**确定性**——训练只修亚周期 margin，PhyRdLat 的变化发生在切频 / 换 setpoint，不随 setpoint 内训练结果变 [INFERENCE]。
-- rolling（Appendix D.4）：latency 解决"哪个 cycle"，rolling 解决"哪个 word 起点"——合起来才是完整读对齐；MC 侧 = 固定位置比较器 + 滚动重排逻辑。
+- rolling：latency 解决"哪个 cycle"，rolling 解决"哪个 word 起点"——合起来才是完整读对齐；MC 侧 = 固定位置比较器 + 滚动重排逻辑。
 - 主公式与算例：**PhyRdLat ≈ (RL_nCK + PHY_pipe_nCK) / ratio**；DDR5-6400、1:4 → CL 40nCK/4 + 2~4 ≈ 12~14 DFI cyc，粒度损失 1/4 CK≈78ps 对 ns 级 RL 无感 [INFERENCE 一级估算]。绝对 ns 读延迟近似与 ratio 无关（主导项是 DRAM RL）；ratio 增大主要加深 PHY pipeline 与对齐复杂度 [INFERENCE]。
 
-### 6.9 Training Responsibility
 
-三协议训练机制的根差异在**回读通道** [JEDEC]：
+- **rolling 只在读路径**：PhyRdLat 答"哪个 DFI cycle 数据回来"，rolling 答"cycle 内从哪个 word/phase 起始"——两者正交。写路径是 active sender：MC 主动投递、从 canonical word 起始、升序对齐；读路径是 passive receiver：arrival phase 由 DRAM RL 决定、不可强制 → rolling，MC 侧 rotator 重排。这一不对称是"为什么读可以晚到、写绝不能晚到"（§9.5 O8）的根源。
+*Interview anchor: §9.4 A11、§9.5 O8/O9*
 
-| 维度 | HBM3/4 | DDR5 | LPDDR5/6 |
-|---|---|---|---|
-| 命令/CA 训练 | IEEE 1500 测试口 + AWORD MISR 签名 | MPC 捕获 CA → MR → MRR 回读 | Command Bus Training |
-| 数据训练 | WDQS2CK 对齐 + DWORD 级 MISR/LFSR | MPC 模式读写均衡 + per-pin DFE/DCA/Vref | WCK2CK Leveling + Interval Oscillator 读均衡 + 写均衡 |
-| 回读通道 | 独立测试访问口（不依赖功能 DQ） | 数据总线（需先打通 DQ） | CBT/DQ 通道 |
-| 频率维度 | 单频点（设计期定） | 单频点 | **多 setpoint training set** |
+### 7.6 Training Ownership（两种模式）
 
-推论：**训练状态机不可跨协议复用**（回读通道不同）——多协议控制器必须每协议一套训练序列（§6.7 分叉的根因之一）。
+DFI 只定义握手与逃生协议，**不定义训练算法**。总模型：**训练算法可以住在 MC 或 PHY，但物理调节永远属于 PHY 域能力。**
 
-**训练控制两模式与失败路径**（DFI 5.1；证据 Appendix D.10）：
+- **MC-controlled training**：MC 掌 sequence / command / state control；PHY 调 delay / Vref / EQ；DRAM 出 pattern / status / feedback——"Core 发命令，PHY 调延迟，DRAM 报结果"描述的是**这种**模式（是常见缺省，不是普适规则）。
+- **PHY-master training**：PHY 暂时取得 command ownership，接管 DRAM 命令总线自主训练——**此时连命令也由 PHY 发**；接管前必须先 QOS Disconnect 断流握手（§7.7）。
+- 模式选择是集成决策：MC-controlled 要求 MC 维护训练编排；PHY-master 要求断流窗口与所有权交接机制。
 
-- DFI 只定义握手与逃生协议，**不定义训练算法**。两种控制模式：**MC-controlled**（MC 发训练序列命令、PHY 调延迟——"Core 发命令，PHY 调延迟，DRAM 报结果"）与 **PHY Master**（PHY 接管 DRAM 命令总线自主训练；接管前必须先走 **QOS Disconnect** 断流握手，TABLE 31/32、FIGURE 83）。
-- **失败上报在 DFI 层有协议**：**dfi_alert_n**（DRAM ALERT 引脚经 PHY 透传给 MC，ratio 下 per-phase 对齐，TABLE 43）；PHY-initiated update 的 **Error Disconnect Protocol**（FIGURE 78/82）+ **error_pN** 信号 + Message Interface 的 **Error Codes**（TABLE 44）。
-- **恢复策略非标准化**（retry 次数 / 降频重训 / safe mode 均为集成选择）。[PROJECT 案例范式——HW 最小动作 + SW 策略]：自主训练 PHY 内部带 retry，穷尽后经 **error 寄存器 + 中断**上抛；MC HW 只做两件事——**服从断流**（DFI bus 阻塞期间保持不发，直至 bus 归还 MC）与**存 error codes**；超时由 **PHY 侧**监测并经同一寄存器通路反馈（DFI 无标准 timeout）；fatal 判定在 SW。另一合法形态（HW 自主 retry、SW 只收 fatal）同样常见。
+### 7.7 Update / Error / Ownership Handoff
 
-### 6.10 Global State Transition / Low Power / Frequency Change / Init
+```text
+MC traffic running
+    ↓ PHY requests update / training ownership
+disconnect / quiesce（QOS Disconnect 或 Error Disconnect）
+    ↓
+ownership handoff（DFI 总线移交 PHY）
+    ↓
+PHY work（update / retrain / 修复）
+    ↓
+completion or error（error_pN / dfi_alert_n 透传 / Error Codes）
+    ↓
+ownership returned
+    ↓
+resume
+```
+
+- 机制族 [DFI]：ctrlupd（MC 起始更新）、PHY-initiated update（QOS Disconnect 协议）、Error Disconnect、**dfi_alert_n**（DRAM ALERT 引脚经 PHY 透传 MC、ratio 下 per-phase 对齐）、Message Interface **Error Codes**。
+- **失败上报有协议、恢复策略无标准**（retry 次数 / 降频重训 / safe mode 是集成选择）。典型分层 [PROJECT]：自主训练 PHY 内部 retry → 穷尽后 error 寄存器（带中断）上抛；MC HW 只做两件事——服从断流 + 存 error codes；超时由 PHY 侧监测（DFI 无标准 timeout）；fatal 判定在 SW。
+
+### 7.8 Drain & Quiesce（全局状态转换核心）
 
 **统一模型**（状态机 RTL 实现见 `DDR_Controller_Architecture.md`）：
 
@@ -976,31 +1103,66 @@ L4 DRAM 级：尾部时序履行（末写 +tWR、末读 +tRTP）+ banks 达目�
 ```
 
 - ctrlupd 停在 L3；PDE 到 L4 轻（允许 open row）；SR/DSM 到 L4 重（全 precharged）+ L1/L2 全排空。CAM 空 ≠ 静止——最后一条命令完成后尾部时序还在走。
-- **三轴坐标**（轴 1 接口处理：静默/移交/挂起 × 轴 2 DRAM 前置：无/有 × 轴 3 队列：保留/排空）：ctrlupd = 静默+无前置+保留（最快恢复）；PHY Master = 移交+视训练+保留；**DFS = 静默+全局前置+保留（hybrid——transient/global 二分的反例，证明三轴必要）**；SR = 挂起+全局前置+排空 [DFI 5.1 证据：TABLE 23/24/25、FIGURE 70/71/72/77、FIGURE 43 MC-Initiated Update + §4.9.2 PHY-Initiated Update；详见 Appendix D.10]。
-- 低功耗五态表（PD/SR/DSM/DPD 的保留/owner/退出）见 §5.11。
+- **三轴坐标**（轴 1 接口处理：静默/移交/挂起 × 轴 2 DRAM 前置：无/有 × 轴 3 队列：保留/排空）：ctrlupd = 静默+无前置+保留（最快恢复）；PHY Master = 移交+视训练+保留；**DFS = 静默+全局前置+保留（hybrid——transient/global 二分的反例，证明三轴必要）**；SR = 挂起+全局前置+排空 [DFI 5.1 证据：TABLE 23/24/25、FIGURE 70/71/72/77、FIGURE 43 MC-Initiated Update + §4.9.2 PHY-Initiated Update；详见 §7.7]。
+- 低功耗五态表（PD/SR/DSM/DPD 的保留/owner/退出）见 §5.2。
+*Interview anchor: §9.4 A13、§9.5 O2/O5/O6*
+
+### 7.9 Initialization（依赖链）
+
+> **每一步只能依赖前一步已验证过的通路**（自举原则）。
 
 **Init 依赖链（自举原则：每一步只用已验证的前置通路做判据）**：
 
 - Power 稳 → reset 才可信（轨未偏置完成时逻辑行为部分随机、reset 结果不可重复）[PHYSICAL-EXPLANATION]；**命令是第一个需要 clock 质量的消费者**（clock 可与 reset 并行启动，首命令前有最小等待 ⚠️ [UNKNOWN]）；
-- 初始 MR 序列在**低频**下执行（CK 慢 = UI 宽，未训练 CA 仍有 margin）→ 低频命令进训练模式 → FSP 切高频 → CBT/眼训练——"**低频进/出、高频练**"是 MR↔CA 鸡蛋问题（进训练模式本身需要 MRW）的协议解法（Appendix D.5）；
+- 初始 MR 序列在**低频**下执行（CK 慢 = UI 宽，未训练 CA 仍有 margin）→ 低频命令进训练模式 → FSP 切高频 → CBT/眼训练——"**低频进/出、高频练**"是 MR↔CA 鸡蛋问题（进训练模式本身需要 MRW）的协议解法（§6.5）；
 - 顺序的失败模式 [PHYSICAL-EXPLANATION]：ZQ 后移 → 阻抗未定、训出的是错误眼的中心；WCK2CK 未完成 → 相位不确定性未消除、眼位置漂移；读先于写 = 可观测性依赖（写训练靠读回比对，RX 未验证则 TX/RX fail 无法归因）；
 - MC/PHY ready（dfi_init_complete，FIGURE 3）之前 AXI 不放行——提前放行 = hang 或 corrupt；DFI 无标准 timeout，超时由 PHY 监测经 error 寄存器反馈 [PROJECT]；
 - 刷新债计时器起点随 init 完成生效（首笔 traffic 前可能需先还债）[INFERENCE；起点定义 ⚠️ [UNKNOWN]]；
 - 时间预算 [VENDOR/PROJECT 量级]：boot 全量训练 ≈10~100ms vs training set 恢复 µs~ms——**3~4 个数量级**差距是"低频练一次、以后恢复"的经济学。
 
+链式总结：
+
+```text
+Power credible → Reset credible → Clock/bootstrap command credible
+    → 低频 MR access → CA/command path → ZQ/impedance → strobe/phase
+    → read path → write path → high-frequency operating point（FSP）
+    → Controller logical state → traffic enable
+```
+
+- "低频进/出，高频练"；boot 全量训练（ms 级）vs training set 恢复（µs~ms 级）——3~4 个数量级差距是"低频练一次、以后恢复"的经济学。
+
+### 7.10 Low-Power / Frequency Transition（怎么安全切进去）
+
+Chapter 5 回答 state 是什么；本节只回答 Controller 如何安全切换。统一序列：
+
+```text
+Normal → stop admission → drain（§7.8 四层判据）→ satisfy tail timing
+    → precharge if required → DFI/PHY state coordination → SRE / PDE / DFS
+    → restore（FSP 选组 + training set 恢复）→ validate → resume
+```
+
 **切频参数失效模型**：
 
-- **变**：① DRAM MR/timing 档——**FSP 寄存器组预存切换**（CL/CWL/ODT/Vref 各频点一套，切频 = 选组而非逐条 MRW——"直切快"的机制地基）[JEDEC]；timing 按**三分法**处理：ns 守恒类（tRCD/tRP——绝对值不变、nCK 折算变）/ nCK 类（tCCD——绝对时间随 CK 变）/ **时间域类（tREFI/债——完全不变**，六条件的核心）；② DFI contract（tphy_rdlat/wrlat 换值；**ratio 亦可能随频点变**——低频 1:2、高频 1:4 合法 [INFERENCE]）；③ PHY training operating-point + ZQ 阻抗码字（电压轨变 → ZQ Stop，§5.8）。
+**切频参数失效模型**：
+
+- **变**：① DRAM MR/timing 档——**FSP 寄存器组预存切换**（CL/CWL/ODT/Vref 各频点一套，切频 = 选组而非逐条 MRW——"直切快"的机制地基）[JEDEC]；timing 按**三分法**处理：ns 守恒类（tRCD/tRP——绝对值不变、nCK 折算变）/ nCK 类（tCCD——绝对时间随 CK 变）/ **时间域类（tREFI/债——完全不变**，六条件的核心）；② DFI contract（tphy_rdlat/wrlat 换值；**ratio 亦可能随频点变**——低频 1:2、高频 1:4 合法 [INFERENCE]）；③ PHY training operating-point + ZQ 阻抗码字（电压轨变 → ZQ Stop，§6.3）。
 - **不变**：拓扑（地址映射/channel/bank）、数据内容、协议语义（命令编码/状态机）——**状态语义连续正是队列可保留（轴 3）的前提**。
 - 成本阶梯 [INFERENCE]：FSP 选组 + training set 恢复（µs）< MR 全量重写（十 µs 级）< 全量重训（ms 起）。
-- REF owner 两路线与切频六条件见 §5.11 表；DFI 频率切换的 signal-level 手序列不在本文范围（架构排序模型见本节）。
+- REF owner 两路线与切频六条件见 §5.4 表；DFI 频率切换的 signal-level 手序列不在本文范围（架构排序模型见本节）。
 
+### 7.11 Multi-Protocol Controller Reuse Boundary
 
-## 7. Generation Evolution
+**统一的是前端（事务/QoS/基础设施），分叉的是协议引擎** [PROJECT]：
 
-本章只记 **Delta**——不重教协议（机制见 §1~§6 对应章节）。每节末尾"我真正需要记住的 N 条变化"。
+- **可复用（协议无关层）**：事务层（AXI/CHI 端口、QoS/仲裁/防饥饿、地址 hash 与 interleave 框架）、基础设施（性能计数、错误注入/记录框架、寄存器与诊断架构）、**参数化引擎骨架**（bank 状态表结构、timing checker 框架、通用调度接口）。
+- **必须协议化（协议相关层）**：命令编码器（§7.2.5——格式正交）；刷新/RFM 语义（RFMpb/DRFM vs REFsb/RFM vs REFpb/ARFM/PRAC——策略与命令接口都不同）；低功耗/切频序列（HBM 命令式无 CKE vs LPDDR CA 命令式+FSP vs DDR5 CKE）；**训练编排——高层 orchestration skeleton 可复用，具体 command sequence / feedback channel / pass-fail 机制 / operating-point handling 必须协议化**（回读通道差异见 §6.9）；DFI 参数化与时序参数。
+- 工程结论：落地形态 = **shared transaction front end + protocol-specific memory core + shared infrastructure**。
+*Interview anchor: §9.4 A4*
+## 8. Generation Evolution
 
-### 7.1 DDR4 → DDR5
+本章只记 **Delta**——不重教协议（机制见 §1~§7 对应章节）。每节末尾"我真正需要记住的 N 条变化"。
+
+### 8.1 DDR4 → DDR5
 
 | Feature | Previous（DDR4） | Current（DDR5） | Pressure（上一代为什么不够用） | Controller Cost | PHY / Package Cost | Gain |
 |---|---|---|---|---|---|---|
@@ -1018,15 +1180,15 @@ L4 DRAM 级：尾部时序履行（末写 +tWR、末读 +tRTP）+ banks 达目�
 4. **PMIC 上移模组**是电源管理责任迁移（平台只供 bulk）；
 5. 刷新家族（REFsb/RFM/ARFM）+ tRASmax 删除 = 刷新管理复杂度全面转移到控制器。
 
-### 7.2 LPDDR5 → LPDDR5X → LPDDR6
+### 8.2 LPDDR5 → LPDDR5X → LPDDR6
 
 | Feature | Previous | Current | Pressure | Controller Cost | PHY / Package Cost | Gain |
 |---|---|---|---|---|---|---|
-| 速率 | LPDDR5 3200~6400；5X 至 10.7G | LPDDR6 10.6~14.4G | 带宽需求（AI 手机/边缘） | QoS 按新档位建模 | UI 收缩 → 训练/EQ 加重（§5.2） | ×1.5~1.69 |
+| 速率 | LPDDR5 3200~6400；5X 至 10.7G | LPDDR6 10.6~14.4G | 带宽需求（AI 手机/边缘） | QoS 按新档位建模 | UI 收缩 → 训练/EQ 加重（§6.2） | ×1.5~1.69 |
 | 通道组织 | 16-bit 通道 | x24=2×SC（12-DQ）+ x12 效率模式 | 细粒度 + 引脚效率（§2.5） | SC 独立状态机；x12 配置管理 | per-SC 4CA+CS+CK | 粒度细 / 混装容量 |
 | 命令编码 | 7-bit CA DDR | 4-bit CA、命令 2CK、ACT 4CK | 引脚预算再压缩（§3.2） | 编码器双命令序列（ACT-1/2+tAAD） | CA 眼图更紧 | 引脚最省 |
 | 突发 | BL16 | BL24/BL48（288=256+32） | 预取换速率（§3.5） | 89% 有效带宽建模；部分写 RMW 上移 | — | 数据/命令开销比 |
-| 电源 | VDD2H/L 可选拆分 | VDD2C/D 强制 + DVFS 族 | 能效管理精度（§5.11） | 多轨编排 + 模式×电压×训练集三维表 | 多轨 PMIC | 能效 |
+| 电源 | VDD2H/L 可选拆分 | VDD2C/D 强制 + DVFS 族 | 能效管理精度（§5.1） | 多轨编排 + 模式×电压×训练集三维表 | 多轨 PMIC | 能效 |
 | 写路径 | DMI + MASKED WRITE | 全删（DBI 保留） | RMW 串行化不可接受（§3.9） | 字节部分写 RMW 自己做 | — | 速率 |
 | 可靠性 | Link ECC 可选、RFM→ARFM | 突发内嵌 tag/ECC、PRAC+ABO | 链路速率↑、行锤演进（§4.7） | PRAC 风险 row 管理 + ABO 退避 | — | RAS |
 
@@ -1045,16 +1207,16 @@ L4 DRAM 级：尾部时序履行（末写 +tWR、末读 +tRTP）+ banks 达目�
 
 1. LPDDR6 的带宽提升是"速率 ×1.5 + die 内拆双 SC"，且**有效带宽打折**（288-bit 突发仅 256-bit 有效）；
 2. CA 7→4 根的代价 = 命令 2 周期、ACT 4 周期（命令带宽减半）；
-3. **VDD2 强制拆成接口域/阵列域 + DVFS 五模式**——电源管理复杂度冠军（LPDDR > DDR5 > HBM）；
+3. **VDD2 强制拆成接口域/阵列域 + DVFS 五模式**——电源管理面最复杂的一代（三家哲学对比见 §5.5）；
 4. 掩码路径全删：DM、DMI、MASKED WRITE 都没了——**部分写责任上移控制器**；
 5. **PRAC + ABO** 是行锤背压最显式的一代（DRAM 报风险 row、控制器管退避）。
 
-### 7.3 HBM3 → HBM3E → HBM4
+### 8.3 HBM3 → HBM3E → HBM4
 
 | Feature | Previous | Current | Pressure | Controller Cost | PHY / Package Cost | Gain |
 |---|---|---|---|---|---|---|
 | 接口 | HBM3 1024-bit/16ch @6.4G；3E 同位宽 @9.6G | HBM4 2048-bit/32ch，8G 基线→12.8G+ | 继续提速率边际成本过高（均衡、训练、pJ/bit、良率）→ 翻位宽（§3.10） | 32ch/64PC 状态表翻倍；channel-first 防热点 | bump 密度 / 中介层布线；PHY 迁向 base die | peak ×2（vs 3E 为 ×1.67，基线速率回落 9.6→8G） |
-| 电气 | I/O 1.1V 固定 | I/O 厂商自定、VDDC 1.05V | 把余量下放厂商，换 PHY 工艺自由度（§5.11） | 电气取公约数 | PHY 工艺选择自由 | 工艺自由度 |
+| 电气 | I/O 1.1V 固定 | I/O 厂商自定、VDDC 1.05V | 把余量下放厂商，换 PHY 工艺自由度（§5.1） | 电气取公约数 | PHY 工艺选择自由 | 工艺自由度 |
 | 容量/组织 | 通道与容量同步增长 | 4 die 满 32ch；5~16 die 只加容量/SID/bank | 带宽需求与容量需求不同步（§2.8） | bank 数可枚举配置（16~64/ch） | die 堆叠高度 / 散热 | 容量弹性、row hit 率 |
 | RAS | RAA + ARFM（可选） | RFMpb/DRFMpb + BRC、ECS 多 bit | 行锤定向化 + 带宽代价有界（§4.7） | 风险 bank 跟踪 / 有界刷新编排 | DRAM 内逻辑增加 | 定向防护 |
 
@@ -1072,14 +1234,14 @@ L4 DRAM 级：尾部时序履行（末写 +tWR、末读 +tRTP）+ banks 达目�
 
 - HBM4 把接口扩到 2048-bit 后，传统 host-side HBM MC/PHY 对 GPU 的 die area、shoreline、routing 和 I/O power 压力越来越大；与此同时 HBM4 的 Base Die 开始采用先进逻辑工艺 [VENDOR]，具备了承载复杂控制逻辑的条件。
 - 因此 custom HBM 可以把 MC 和 memory-specific PHY/management **下沉到 Logic Base Die**，把 stack 内的超宽 TSV/HBM interface 局部化，GPU 只通过较抽象的 **D2D transaction link** 访问内存。代价：多一级 D2D protocol/latency、Base Die 功耗与热密度、更强的系统协同设计 [INFERENCE]。
-- 架构意义：这是 Controller/PHY boundary 的"**第四级搬家**"（§6）——What/When 与 How-Electrically 的分界线从 on-chip DFI 移到 D2D link 上，调度状态（§6.2 七自由度）跟着进 memory stack。复杂度没有消失：杠杆换了，账单换了收款人（SoC 内 NoC/PHY 压力 ↔ D2D 延迟 + Base Die 热密度）。
+- 架构意义：这是 Controller/PHY boundary 的"**第四级搬家**"（§7）——What/When 与 How-Electrically 的分界线从 on-chip DFI 移到 D2D link 上，调度状态（§7.2 七自由度）跟着进 memory stack。复杂度没有消失：杠杆换了，账单换了收款人（SoC 内 NoC/PHY 压力 ↔ D2D 延迟 + Base Die 热密度）。
 
 
-## 8. Interview Review
+## 9. Interview Review
 
-> 用法：每题先看【30 秒】恢复结论；重点题带【2 分钟】因果链（Physical Cause → Protocol Mechanism → Controller Impact → Tradeoff）。数字锚点与完整推导在正文对应章节，不重复。
+> 正文是知识库，本章是**检验知识是否真正建立的出口**——所有重要正文主题至少映射一个 Q&A。六类：Foundation（9.1）/ Why（9.2）/ Cross-protocol（9.3）/ Architecture（9.4）/ Operational Scenario（9.5）/ Quantitative（9.6）。每题格式：Q →【30 秒】一句话结论+最短因果链 →（重点题）【2 分钟】四层因果链 →【Follow-up】2~4 追问。数字锚点与完整推导在正文对应章节，不重复。
 
-### 8.1 Foundation Questions
+### 9.1 Foundation Questions
 
 **Q1：DRAM 读出要经过哪些物理步骤？**
 【30 秒】位线预均衡到 VDD/2 → 行译码选中字线 → WL 升压到 VPP → 电荷共享（单元电容 vs 位线寄生 1:10~20 → 位线只摆 ~100mV）→ SA 正反馈放大到轨。tRCD 等的就是④→⑤。（§1.1）
@@ -1126,11 +1288,11 @@ L4 DRAM 级：尾部时序履行（末写 +tWR、末读 +tRTP）+ banks 达目�
 【Follow-up】WCK 与 CK 异步带来什么训练义务？（WCK2CK Leveling）
 
 **Q12：DM 与 DBI 的区别？**
-【30 秒】DM=写掩码（控制哪些 byte 落盘）；DBI=动态反转省电（不改变语义）。DDR5 只要 DM 删 DBI；LPDDR5 DMI 一线兼职两者 + MASKED WRITE；LPDDR6 全删掩码只留反转；HBM 只有反转。（§3.9）
+【30 秒】DM=写掩码（控制哪些 byte 落盘）；DBI=动态反转省电（不改变语义）。DDR5 保 DM 删 DQ-DBI、另增 CAI（W11）；LPDDR5 DMI 一线兼职两者 + MASKED WRITE；LPDDR6 全删掩码只留反转；HBM 只有反转。（§3.9）
 【Follow-up】为什么 LPDDR6 敢删？（速率越高 DRAM 内 RMW 越贵，责任上移控制器）
 
 **Q13：三家供电轨一句话？**
-【30 秒】HBM：core/I/O/Tx 分轨，HBM4 I/O 电压开放厂商；DDR5：VDD=VDDQ=1.1V+VPP，PMIC 上模组；LPDDR：越拆越细——VDD2C（接口 1.0V）/VDD2D（阵列 0.875V）/VDDQ 0.5V 强制分域。（§5.11）
+【30 秒】HBM：core/I/O/Tx 分轨，HBM4 I/O 电压开放厂商；DDR5：VDD=VDDQ=1.1V+VPP，PMIC 上模组；LPDDR：越拆越细——VDD2C（接口 1.0V）/VDD2D（阵列 0.875V）/VDDQ 0.5V 强制分域。（§5.1）
 【Follow-up】LPDDR 为什么反向于 HBM 越拆越细？（能效管理精度 vs PHY 工艺自由度）
 
 **Q14：ODECC 与 side-band ECC 的分工？**
@@ -1138,7 +1300,7 @@ L4 DRAM 级：尾部时序履行（末写 +tWR、末读 +tRTP）+ banks 达目�
 【Follow-up】HBM 的 RAS 信息怎么到控制器？（SEV 引脚随读带内上报）
 
 
-### 8.2 Why Questions（核心因果链）
+### 9.2 Why Questions（核心因果链）
 
 **W1：为什么 DDR5 要拆 Sub-channel？**（模板题）
 【30 秒】预取 16n 决定 BL16；若保持 64-bit 通道，一命令=128B=2 条 cache line，过取一倍 → 拆 2×32-bit：32×16=64B 正对齐一条 cache line，同时命令并发 ×2。不是带宽翻倍——引脚不变 peak 不变，买的是粒度与并发。
@@ -1154,7 +1316,7 @@ L4 DRAM 级：尾部时序履行（末写 +tWR、末读 +tRTP）+ banks 达目�
 【Follow-up】HBM 为什么是 1.5 拍而不是 2 拍？（ceil(24/10)×半拍粒度，无对齐浪费）
 
 **W4：为什么 tRASmax 在现代标准中被删除？**
-【30 秒】五标准 0 命中。历史动机 ≈9×tREFI 防 open row 阻塞 REF；现代控制器自管 REF 发送（postpone/pull-in/per-bank 预算），标准无需再约束行开放时长——复杂度转移到控制器。9×tREFI 与现代 postpone 预算 9×tREFIe 数字同源。（§1.3/Appendix D.9）
+【30 秒】五标准 0 命中（符号层面；HBM3/4 另在 tRAS MAX 列保留 9×tREFI 实质上限，见 §1.3）。历史动机 ≈9×tREFI 防 open row 阻塞 REF；现代控制器自管 REF 发送（postpone/pull-in/per-bank 预算），标准无需再约束行开放时长——复杂度转移到控制器。9×tREFI 与现代 postpone 预算 9×tREFIe 数字同源。（§1.3）
 
 **W5：为什么 refresh postpone 上限是 8+1（9×tREFI）？**
 【30 秒】tREFI 是平均值承诺——单条可滑动，但保持时间硬要求（32ms/8192）必须封顶：LPDDR5 最多推迟 8 条第 9 条强制；HBM3 直文"两 REF 最大间隔 9×tREFI"。压缩侧还有 tRFC 下界、3DS 还有错峰电流约束——四层共同夹出可行域。（§4.4）
@@ -1178,54 +1340,75 @@ L4 DRAM 级：尾部时序履行（末写 +tWR、末读 +tRTP）+ banks 达目�
 【30 秒】MASKED WRITE 是 DRAM 内 RMW（同 BG tCCDMW=4×列周期=写吞吐 1/4）；速率翻倍后串行化不可接受 → 连 DMI 一起删，部分写责任交回控制器（RMW 或整突发重排）。变迁主线：速率越高，DRAM 内 RMW 越贵。（§3.9）
 
 **W11：为什么 DDR5 删 DBI 留 DM？**
-【30 秒】服务器写以整 line/整 burst 为主——DBI 省电收益让位给 DM 的字节掩码刚需（分散写/ECC 场景）；引脚预算优先给掩码。ODECC 另有 WR_Partial 优化 ECC 读改写。（§3.9）
+【30 秒】[FACT] DDR4 的 DM/DBI 共 pin、写路径互斥；DDR5 最终保 DM、删 DQ-DBI，同时新增 CAI，并强化 DQ 侧 DFE/DCA/training。[INFERENCE] 更合理的代际理解：不是 DBI 失去价值（HBM/LPDDR 仍保留），而是 SI/power optimization complexity 重新分配——从 DQ-DBI 转向"CA inversion + 更强 DQ link closure"（演进细节 §3.9 三层结构）。
+【Follow-up】为什么 DDR4 能两者兼得？（共 pin 分时复用，代价是写路径互斥）为什么 HBM/LPDDR 仍保留 DBI？（超宽接口 SSO 收益大 / 能效优先）CAI 与 DBI 区别？（对象 CA 总线 vs DQ 总线，机制同族）（§3.9）
 
 **W12：为什么训练不能一次终身有效？**
-【30 秒】训练结果=特定频点/电压/温度的最佳点；PVT 漂移（温度泄漏/迁移率、电压 IR drop、老化 NBTI/HCI）让眼中心移走。对策=training set 多频点保存 + ZQ 后台重校 + interval oscillator 追踪 + 周期 retrain。（§5.10）
+【30 秒】训练结果=特定频点/电压/温度的最佳点；PVT 漂移（温度泄漏/迁移率、电压 IR drop、老化 NBTI/HCI）让眼中心移走。对策=training set 多频点保存 + ZQ 后台重校 + interval oscillator 追踪 + 周期 retrain。（§6.8）
 
 **W13：只做 delay 训练为什么不够、还要 Vref？**
-【30 秒】delay 决定"何时采样"、Vref 决定"什么是 1"——只扫 delay 只保证水平 margin；Vref 偏移让眼垂直不对称收缩。完整做法=2D（voltage×timing）眼中心，工程上用多次一维 sweep 近似。（§5.3/§5.7）
+【30 秒】delay 决定"何时采样"、Vref 决定"什么是 1"——只扫 delay 只保证水平 margin；Vref 偏移让眼垂直不对称收缩。完整做法=2D（voltage×timing）眼中心，工程上用多次一维 sweep 近似。（§6.4/§6.7）
 
 **W14：为什么 HBM4 翻位宽而不是继续提速率？**
-【30 秒】中距离互连提速率的边际成本（均衡/训练/pJ/bit/良率）急剧上升；翻位宽把压力转移到封装布线/bump 密度，换时序裕量与能效（位宽路线 pJ/bit 更优）。实证：JEDEC 基线 8G 反而低于 3E 9.6G，带宽增长全靠位宽。（§3.10/§7.3）
+【30 秒】中距离互连提速率的边际成本（均衡/训练/pJ/bit/良率）急剧上升；翻位宽把压力转移到封装布线/bump 密度，换时序裕量与能效（位宽路线 pJ/bit 更优）。实证：JEDEC 基线 8G 反而低于 3E 9.6G，带宽增长全靠位宽。（§3.10/§8.3）
 
 **W15：为什么不能无限加 bank？**
 【30 秒】四堵墙：① 供电（tRRD 限速+tFAW 限额——激活电流 di/dt）；② 面积布线（每 bank 一套译码/驱动/SA）；③ 刷新与激活抢 tRRD/tFAW 窗口（REFpb 速率∝bank 数）；④ IO 复用封顶（DQ 通路不随 bank 增长，收益止于 row hit 率）。（§2.3）
 
 **W16：为什么 LPDDR6 把 VDD2 强制拆成两个域？**
-【30 秒】接口域（VDD2C 1.0V）与阵列域（VDD2D 0.875V）的最优电压/负载/di/dt 特性不同——拆分后独立稳压、隔离噪声、CA 调频调压不扰动阵列裕量。代价：DVFS 变多轨编排 + "模式×电压×训练集"三维表。（§5.11）
+【30 秒】接口域（VDD2C 1.0V）与阵列域（VDD2D 0.875V）的最优电压/负载/di/dt 特性不同——拆分后独立稳压、隔离噪声、CA 调频调压不扰动阵列裕量。代价：DVFS 变多轨编排 + "模式×电压×训练集"三维表。（§5.1）
 
 **W17：为什么 ZQ 要后台校准 + ZQ Stop？**
-【30 秒**】**阻抗随 PVT 漂——ZQ 以外部 240Ω 基准校准驱动器/ODT；后台化不占 DQ 总线，完成后 ZQUF 置位、空闲时 ZQCal Latch 应用新码字；电压切换期间 MRW 设 ZQ Stop 暂停（切轨瞬间阻抗基准失效）。（§5.8）
+【30 秒**】**阻抗随 PVT 漂——ZQ 以外部 240Ω 基准校准驱动器/ODT；后台化不占 DQ 总线，完成后 ZQUF 置位、空闲时 ZQCal Latch 应用新码字；电压切换期间 MRW 设 ZQ Stop 暂停（切轨瞬间阻抗基准失效）。（§6.3）
 
 **W18：read gate training 与 read eye training 为什么是两步？**
-【30 秒】gate 解决"read strobe 何时到、何时开捕获窗"（RDQS 只在 burst 附近有效，早开放噪声、晚开丢数据）；eye 决定"在 UI 的哪里采样"。先 gate 后 eye，串行依赖。（§5.6）
+【30 秒】gate 解决"read strobe 何时到、何时开捕获窗"（RDQS 只在 burst 附近有效，早开放噪声、晚开丢数据）；eye 决定"在 UI 的哪里采样"。先 gate 后 eye，串行依赖。（§6.7）
 
 **W19：进 Self-Refresh 后 postpone 的刷新债要还清吗？**
-【30 秒】不要求——协议规定 SR 内 DRAM 自管刷新接管外部债（tCKSR 内自启动内部刷新）；LPDDR5 SR 期间刷新计时器 freeze-and-store、退出后 resume（债保持）；但 SRX↔SRE 之间必须 ≥1 条 extra refresh。（§5.11）
+【30 秒】不要求——协议规定 SR 内 DRAM 自管刷新接管外部债（tCKSR 内自启动内部刷新）；LPDDR5 SR 期间刷新计时器 freeze-and-store、退出后 resume（债保持）；但 SRX↔SRE 之间必须 ≥1 条 extra refresh。（§5.2）
 
 **W20：为什么 refresh 必须有不可让步的 critical 边界？**
 【30 秒】债有两态：soft（窗口内可重排——QoS 决定时机）与 critical（逼近 9×tREFI 必须 dead line 执行）。性能让步可协商、数据丢失不可恢复——正确性约束不能被性能约束无限覆盖，这条边界是协议强加给控制器的正确性义务。（§4.3/§4.4）
 
 **W21：上电初始化为什么是这个顺序？**
-【30 秒】自举原则——每一步只用已验证的前置通路做判据：Power 稳 → reset 才可信；命令是第一个需要 clock 质量的消费者；初始 MR 在低频执行（UI 宽，未训练 CA 仍有 margin）→ "低频进/出、高频练"（MR↔CA 鸡蛋问题的解法：进训练模式本身要 MRW）→ ZQ 先于眼训练（阻抗未定则训出错误眼的中心）→ WCK2CK 先于 DQ → 读先于写（写训练靠读回比对，RX 未验证则 fail 无法归因）→ init_complete 前 AXI 不放行。boot 全量训练 ms 级 vs setpoint 恢复 µs 级——预存是 init 经济学。（§6.10/D.5）
+【30 秒】自举原则——每一步只用已验证的前置通路做判据：Power 稳 → reset 才可信；命令是第一个需要 clock 质量的消费者；初始 MR 在低频执行（UI 宽，未训练 CA 仍有 margin）→ "低频进/出、高频练"（MR↔CA 鸡蛋问题的解法：进训练模式本身要 MRW）→ ZQ 先于眼训练（阻抗未定则训出错误眼的中心）→ WCK2CK 先于 DQ → 读先于写（写训练靠读回比对，RX 未验证则 fail 无法归因）→ init_complete 前 AXI 不放行。boot 全量训练 ms 级 vs setpoint 恢复 µs 级——预存是 init 经济学。（§7.9/§6.5）
 【Follow-up】1）clock 和 reset 谁先？2）DSM 与旧代 DPD 差别？3）为什么训练要"低频进出"？
 
 
-### 8.3 Cross-protocol Questions
+**W22：为什么 LPDDR5/6 的 CA 敢用 DDR 双沿，而 DDR5 的 CA 反而 SDR + 2T？**
+【30 秒】不是数据速率决定 CA 采样方式——是"命令/数据时钟是否分离 + 通道长度与负载"。LPDDR：命令走低速 CK（CKR 4:1/8:1，同数据速率下 CA 每 pin 速率约为 DDR5 的一半）+ 近端短互连 → CA UI 宽、margin 足，敢用双沿换引脚（7→4 根）；DDR5：CA 跑数据速率一半的高频 CK + DIMM 长距 fly-by 多负载 → 保 SI margin 用 SDR，2T 补 bit budget。核心公式 Pin × Edge × Cycle（§3.2）。
+【Follow-up】CKR 和 DFI ratio 是一回事吗？（不是——协议侧 CK:WCK vs MC/PHY 数字边界，§7.4）（§3.2/§3.6）
+
+**W23：DFE / DCA / Vref / ZQ 分别解决什么？**
+【30 秒】对着 Toolbox 表答、不背 acronym：DFE→post-cursor ISI（用已判决 bit 抵消）；DCA→rise/fall 不对称的 duty 失真；Vref→判决阈值（Eye Height）；ZQ→驱动/端接阻抗（反射/振铃）；per-bit deskew→lane 偏斜（Eye Width）；CTLE→通道高频损耗。一句话收束：**每个机制对应一种 margin 被吃掉的方式**。（§6.3）
+【Follow-up】为什么这些对 Controller 只是"训练窗口/完成失败/工作点变化"三件事？（§6.3/§7.6）
+
+**W24：Equalization 对 Controller 有什么意义？**
+【30 秒】EQ 是 PHY link-closure knob：Controller 不需要知道 tap/系数电路，只需知道——训练/retraining 什么时候占用链路（可用性窗口）、什么时候完成、是否失败（error 上报路径 §7.7），以及 operating-point 改变（切频/电压）是否需要重校。EQ 参数归属 PHY 域能力（总模型 §7.6）。（§6.3/§7.6）
+
+**W25：为什么有 tRC 还需要独立检查 tRP？**
+【30 秒】tRC=ACT→ACT、tRP=PRE→ACT——两条不同时间线。PRE 可能晚于 ACT+tRASmin 发出（等 tRTP/调度），此时下一次 ACT 紧贴 tRC 边界：tRC 已满足，但 PRE→ACT 的恢复（关 WL/复位 SA/位线均衡）未完成。checker = 两个独立比较：now−last_ACT ≥ tRC **AND** now−last_PRE ≥ tRP。
+【Follow-up】tRCmin 与 tRASmin+tRPmin 什么关系？（≥，很多速度档取等号——表列值常直接相加）（§1.3）
+
+**W26：HBM 到底有没有 DFS？**
+【30 秒】**有频率切换能力、无 LPDDR 式 DFS 体系**：HBM3/4 支持在 Self-Refresh 中 halt/change external clock（SRE 后 tCKSRE、SRX 前 tCKSRX 稳定）[JEDEC]；但没有多 FSP 预存、非 SR 直切、快速 operating-point 切换。mental model：LPDDR DFS=运行中换挡；HBM=停机→SR→改钟→重启。owner 视角：进 SR 即把刷新移交给 DRAM。（§5.4）
+【Follow-up】为什么 SR 内切钟安全？（DRAM 自管刷新、无外部命令依赖）LPDDR 为什么能非 SR 直切？（FSP 预存+债保留，§5.4）
+
+
+### 9.3 Cross-protocol Questions
 
 **C1：HBM PC、DDR5 Sub-channel、LPDDR6 SC 是一回事吗？**
 【30 秒】不是。三判据：①独立 CA 域（主判据）；②独立时钟/电源域；③命令带宽是否共享。DDR5 子通道/LPDDR6 SC 三条全过=真通道；HBM PC 共享行列总线与 CK、PD/SR 通道级=管理分区（刷新/时序分区）而非命令分区。量化：HBM 18 pin 服务 2 PC vs DDR5 2×14 pin。（§2.6）
 【Follow-up】"pseudo"省了什么、付出了什么？
 
 **C2：三协议 training 为什么不能复用？**
-【30 秒】根差异在回读通道：HBM 走 IEEE 1500 独立测试口（MISR 签名，不依赖功能 DQ）；DDR5 走数据总线（MPC→MR→MRR，需先打通 DQ）；LPDDR 走 CBT/DQ + interval oscillator。反馈通道不同 → 训练状态机骨架不可参数化统一。（§6.9）
+【30 秒】根差异在回读通道：HBM 走 IEEE 1500 独立测试口（MISR 签名，不依赖功能 DQ）；DDR5 走数据总线（MPC→MR→MRR，需先打通 DQ）；LPDDR 走 CBT/DQ + interval oscillator。反馈通道不同 → 训练编排的 skeleton 可复用，具体序列/回读通道/pass-fail 机制必须协议化。（§6.9/§7.11）
 
 **C3：同样带宽翻倍——加 pin / 加 rate / 加 channel 各把问题转移到哪里？**
 【30 秒】加 rate → PHY/SI margin、均衡/训练、pJ/bit、良率；加 pin → 封装布线/bump 密度、PHY 面积功耗；加 channel → controller 状态/NoC/地址映射；加 burst → 粒度失配、部分写更难。HBM3→3E 走 rate、3E→4 走 pin；LPDDR6 是 rate+channel+burst 组合拳。（§3.10）
 
 **C4："LPDDR5 是 DDR5 的移动精简版"——对吗？**
-【30 秒】不对。阵列语义同源，但接口/命令/电源/训练四层各自**独立演进**：三时钟域+CKR vs 单 CK；7-bit DDR CA vs 14-bit 1T/2T；多轨 DVFS 族 vs 固定频率；interval oscillator vs MPC/MRR。各有对方没有的东西（DDR5：ODECC 强制/双子通道/PMIC 模组化；LPDDR：DFS/DPD/更细低功耗态）——不存在谁是谁的子集。（§5.12/§7）
+【30 秒】不对。阵列语义同源，但接口/命令/电源/训练四层各自**独立演进**：三时钟域+CKR vs 单 CK；7-bit DDR CA vs 14-bit 1T/2T；多轨 DVFS 族 vs 固定频率；interval oscillator vs MPC/MRR。各有对方没有的东西（DDR5：ODECC 强制/双子通道/PMIC 模组化；LPDDR：DFS/DPD/更细低功耗态）——不存在谁是谁的子集。（§5.5/§8）
 
 **C5：同样面对 Row Hammer，为什么解法粒度不同？**
 【30 秒】粒度随"带宽代价有界"的需求演进：HBM3 RAA+ARFM（计数+自适应）→ DDR5 RFM/DRFM 信用制 → HBM4 DRFMpb+BRC（定向+有界覆盖）→ LPDDR6 PRAC+ABO（上报风险 row+显式退避）。共同骨架：DRAM 报计数、控制器还刷新债；粒度越细背压越显式。（§4.7）
@@ -1233,75 +1416,137 @@ L4 DRAM 级：尾部时序履行（末写 +tWR、末读 +tRTP）+ banks 达目�
 **C6：同样面对 refresh stall，谁更依赖 fine-grain refresh？**
 【30 秒】LPDDR（单 bank REFpb）>DDR5（BG 级 REFsb）>HBM（PC 级粒度+通道多可错峰）。根源：LPDDR 通道窄、延迟敏感（手机 QoS）；DDR5 吞吐敏感、批量刷新省命令带宽；HBM 靠通道并行天然错峰。（§4.2）
 
-**C7：三协议功耗管理复杂度排序与原因？**
-【30 秒】LPDDR > DDR5 > HBM。LPDDR：REFpb 后台债+DFS/DVFS 多域+温度倍率三者叠加；DDR5：固定频率，复杂在双子通道错峰/RFM 配额/side-band RMW；HBM：无 DFS 无 CKE、设计期锁死，只有降活+热节流——持续满带宽场景省电靠降活不靠降频。（§5.12）
+**C7：三协议功耗管理的复杂度与哲学差异？**
+【30 秒】按优化目标比、不按单一排名：LPDDR=energy proportionality（五态全谱+DVFS 族+温度倍率——管理面最复杂）；DDR5=capacity/RAS/platform balance（频率基本固定，复杂在双子通道错峰/RFM 配额/PMIC 模组化）；HBM=sustained bandwidth/energy-per-bit（per-PC 降活+热节流+低摆幅宽接口——**切频能力存在但走 SR 路线、非核心功耗策略**，见 W26）。（§5.5/§5.4）
 
 **C8：HBM 带宽这么高，为什么替代不了 DDR5 当主存？**
-【30 秒】① 容量：HBM 单封装 ≤64GB 且设计期锁死，服务器要 TB 级插槽扩展；② 成本：TSV+键合+中介层良率，$/GB 远高；③ 生态：RCD/DB/PMIC/RAS/热插拔成熟度。正确关系=层级化组合：HBM 作带宽引擎/末级缓存，DDR5 作容量底座。（§5.12/§2.8）
+【30 秒】① 容量：HBM 单封装 ≤64GB 且设计期锁死，服务器要 TB 级插槽扩展；② 成本：TSV+键合+中介层良率，$/GB 远高；③ 生态：RCD/DB/PMIC/RAS/热插拔成熟度。正确关系=层级化组合：HBM 作带宽引擎/末级缓存，DDR5 作容量底座。（§5.5/§2.8）
 
 **C9：HBM 能用超宽接口，DDR 为什么不能？**
-【30 秒】互连距离决定可行的 rate×width 乘积：HBM 走中介层（cm 级）——超宽（2048-bit）、相对低 per-pin rate 可行；DDR 走 PCB 十 cm 级——宽总线的 skew 匹配组、SSO、走线成本超线性，只能窄而快+均衡。（§5.12/§3.10）
+【30 秒】互连距离决定可行的 rate×width 乘积：HBM 走中介层（cm 级）——超宽（2048-bit）、相对低 per-pin rate 可行；DDR 走 PCB 十 cm 级——宽总线的 skew 匹配组、SSO、走线成本超线性，只能窄而快+均衡。（§3.10/§3.10）
 
 **C10：三协议命令带宽供给差一个数量级，各怎么缓解？**
 【30 秒】供给：HBM 18 pin 双槽/拍 > DDR5 2×14 CA（2T）> LPDDR6 4 CA（2CK/ACT 4CK）。缓解：请求合并/大粒度、page hit（放大率 2+1/N）、独立 CA 子通道、auto-precharge（省 PRE 但牺牲 row hit）。（§3.4）
 
 **C11：LPDDR 强调 DVFS、HBM 倾向固定高带宽工作点——为什么？**
-【30 秒**】**负载模型不同：手机负载突发、空闲多——多频点电源管理收益大（VDD2 分域+DVFS 族+training set）；AI 负载持续满带宽——降频没意义，省电靠 per-PC 降活+热节流。切频机制也不同：LPDDR 有三组 FSP 预存可直切（保刷新债）；HBM/DDR 借 SR 移交 owner。（§5.11/§5.12）
+【30 秒**】**负载模型不同：手机负载突发、空闲多——多频点电源管理收益大（VDD2 分域+DVFS 族+training set）；AI 负载持续满带宽——降频没意义，省电靠 per-PC 降活+热节流。切频机制也不同：LPDDR 有三组 FSP 预存可直切（保刷新债）；HBM/DDR 借 SR 移交 owner。（§5.4/§5.5）
 
 **C12：同样翻倍带宽，HBM4 为什么不复制 scheduler 就完事？**
-【30 秒】实例层可以横向复制（ch-2PC 同构）；但不复制的全局层是共享瓶颈：地址映射防热点（channel-first striping）、跨通道 QoS/功耗预算、NoC 容量——映射失效=单通道热点吃掉翻倍带宽。再往上是 PHY/封装功耗。（§6.1）
+【30 秒】实例层可以横向复制（ch-2PC 同构）；但不复制的全局层是共享瓶颈：地址映射防热点（channel-first striping）、跨通道 QoS/功耗预算、NoC 容量——映射失效=单通道热点吃掉翻倍带宽。再往上是 PHY/封装功耗。（§7.2）
 
-### 8.4 Architecture Follow-up Questions
+**C13：HBM 32-bit×BL8=32B 为什么重要？**
+【30 秒】32B 是 HBM PC 的 natural burst granularity，与 GPU memory system 的 sector/transaction 粒度高度契合（warp 访问 sector 化后按 32B 对齐）——"GPU 友好"的量化理由。口径注意：可以论证**契合**，不能声称 JEDEC"因为 GPU 32B transaction 才这么设计"（动机归因只能是 [INFERENCE]）。
+【Follow-up】DDR5 子通道 32×BL16=64B 对应什么？（CPU cache line，§9.6 Q2）（§2.5/§3.5）
+
+**C14：CPU 64B cache line 与 GPU 128B warp footprint / 32B sector 怎么理解？**
+【30 秒】CPU：64B coherence/cache line——DDR5 32-bit SC×BL16=64B 正好一条。GPU：32 threads×4B=128B warp footprint，但访存按 sector 切成 4×32B——HBM PC 32-bit×BL8=32B 正好一个 sector。粒度匹配决定过取/欠取与命令开销；**避免简单说"GPU cache line=128B"**（coherence 粒度与突发粒度是两件事）。（§3.5）
+
+
+### 9.4 Architecture Follow-up Questions
 
 **A1：DDR4→DDR5，控制器最大的架构变化是什么？**
-【30 秒】不是速率，是三件结构性的事：① 子通道化（双实例命令/训练/刷新/DFI）；② ODECC 强制（RAS 分层重构+遥测盲区）；③ PMIC 上移模组（电源管理责任迁移）。次级：1T/2T、FGR/REFsb、RFM/DRFM/ARFM、DFE。（§7.1）
+【30 秒】不是速率，是三件结构性的事：① 子通道化（双实例命令/训练/刷新/DFI）；② ODECC 强制（RAS 分层重构+遥测盲区）；③ PMIC 上移模组（电源管理责任迁移）。次级：1T/2T、FGR/REFsb、RFM/DRFM/ARFM、DFE。（§8.1）
 
 **A2：HBM3 → HBM4 架构连续性——双代际控制器要做什么？**
-【30 秒】① 枚举探测（ID/MR+IEEE 1500 WDR 识别代际/die 数/SID/密度）；② 配置切换（16ch vs 32ch 通道映射、bank 数 16~64/PC、时序档）；③ 电气取最低公约数（I/O 电压厂商自定）；④ 特性位探测（ECS/DRFM/BRC 按代际使能）。本质="协议骨架不变、代际参数可枚举"。（§7.3）
+【30 秒】① 枚举探测（ID/MR+IEEE 1500 WDR 识别代际/die 数/SID/密度）；② 配置切换（16ch vs 32ch 通道映射、bank 数 16~64/PC、时序档）；③ 电气取最低公约数（I/O 电压厂商自定）；④ 特性位探测（ECS/DRFM/BRC 按代际使能）。本质="协议骨架不变、代际参数可枚举"。（§8.3）
 【Follow-up】1）为什么说这是 architecture continuity 而非 drop-in 兼容？2）混合部署时“电气取公约数”指什么？
 
 **A3：通道继续加，瓶颈何时从 DRAM 转到 NoC / Controller / PHY？**
-【30 秒】分层判据按序转移：① DRAM（带宽<<peak、命令槽等时序）→ ② Controller 全局层（通道 ready 却无命令/部分饥饿——映射与 QoS 不随实例复制）→ ③ NoC（crossbar 端口/路由拥塞）→ ④ PHY/封装（功耗随总引脚线性）。负载类型决定卡层：随机多核先 NoC/QoS，row-buffer 型先 DRAM 时序。（§6.1）
+【30 秒】分层判据按序转移：① DRAM（带宽<<peak、命令槽等时序）→ ② Controller 全局层（通道 ready 却无命令/部分饥饿——映射与 QoS 不随实例复制）→ ③ NoC（crossbar 端口/路由拥塞）→ ④ PHY/封装（功耗随总引脚线性）。负载类型决定卡层：随机多核先 NoC/QoS，row-buffer 型先 DRAM 时序。（§7.2）
 
 **A4：统一多协议控制器，什么能复用、什么必须分叉？**
-【30 秒】可复用：事务/QoS/防饥饿/地址 hash 框架、性能计数/错误注入/寄存器 infra、参数化状态表与 checker 骨架。必须分叉：命令编码器（格式正交）、训练状态机（回读通道不同）、刷新管理（RFM 族/REF 族策略与接口都不同）、低功耗（命令式 vs CKE）、DFI 时序与手序列。落地形态=共享前端+每协议独立 MC core+统一 infra。（§6.7）
+【30 秒】可复用：事务/QoS/防饥饿/地址 hash 框架、性能计数/错误注入/寄存器 infra、参数化状态表与 checker 骨架。必须分叉：命令编码器（格式正交）、训练编排（skeleton 可复用，序列/回读通道/pass-fail 必须协议化）、刷新管理（RFM 族/REF 族策略与接口都不同）、低功耗/切频序列（命令式 vs CKE vs FSP）、DFI 参数化。落地形态=共享前端+每协议独立 MC core+统一 infra。（§7.11）
 
 **A5：bank 数增加，控制器的成本怎么涨？**
-【30 秒】四部件线性增长：状态机/计时器（open row+tRCD/tRAS/tRP/tRC+刷新债+RAA 计数）；刷新债预算随 bank 数收紧（冲刷时间∝banknum×tRFCpb）；checker 层级加深；发射通路匹配表加宽。HBM4 64PC×64bank 是极端值。（§6.2）
+【30 秒】四部件线性增长：状态机/计时器（open row+tRCD/tRAS/tRP/tRC+刷新债+RAA 计数）；刷新债预算随 bank 数收紧（冲刷时间∝banknum×tRFCpb）；checker 层级加深；发射通路匹配表加宽。HBM4 64PC×64bank 是极端值。（§7.2）
 
 **A6：时序都改不了，Scheduler 还能优化什么？**
-【30 秒】七个自由度：聚合重排、batch 读写切换、错峰 REF、postpone/pull-in 预算、BG/通道交织映射、open-page/AP 策略、QoS 分配——本质=在不可改的时序墙里重排时间线，把不可避免的开销移到伤害最小的位置+用映射预防发生。（§6.2）
+【30 秒】七个自由度：聚合重排、batch 读写切换、错峰 REF、postpone/pull-in 预算、BG/通道交织映射、open-page/AP 策略、QoS 分配——本质=在不可改的时序墙里重排时间线，把不可避免的开销移到伤害最小的位置+用映射预防发生。（§7.2）
 
 **A7：切频时刷新债怎么办？**
-【30 秒】REF owner 框架：LPDDR 非 SR 直切——owner 始终在控制器、postpone 债保留不清（六条件含"Refresh requirements apply during clock frequency change"——刷新义务时间域连续）；HBM/DDR 借 SR——owner 移交 DRAM 自管（tCKSR 内自刷新），退出后恢复。切频前确认 banks idle 恰好等价于债无冲突。（§5.11）
+【30 秒】REF owner 框架：LPDDR 非 SR 直切——owner 始终在控制器、postpone 债保留不清（六条件含"Refresh requirements apply during clock frequency change"——刷新义务时间域连续）；HBM/DDR 借 SR——owner 移交 DRAM 自管（tCKSR 内自刷新），退出后恢复。切频前确认 banks idle 恰好等价于债无冲突。（§5.4）
 
 **A8：DFI 为什么存在？读数据为什么是 rolling 的？**
-【30 秒】DFI 把 What/When（Controller）与 How Electrically（PHY）解耦为标准契约（独立时钟域/工艺/训练状态机）。读 rolling：PHY 被动捕获、突发起始相位由 RL 决定、无法对齐 w0 → 环绕推进无缝拼接；MC 侧 rotator 重排。写不 rolling（MC 主动投递、升序对齐）。rolling 只在读路径存在（考据）。（§6.6/§6.8）
+【30 秒】DFI 把 What/When（Controller）与 How Electrically（PHY）解耦为标准契约（独立时钟域/工艺/训练状态机）。读 rolling：PHY 被动捕获、突发起始相位由 RL 决定、无法对齐 w0 → 环绕推进无缝拼接；MC 侧 rotator 重排。写不 rolling（MC 主动投递、升序对齐）。rolling 只在读路径存在（spec 全文检索确认）。（§7.3/§7.5）
 
 **A9：训练责任在 Controller / PHY / DRAM 怎么分？**
-【30 秒】"Core 发命令，PHY 调延迟，DRAM 报结果"：Controller 发起/排序/判定，PHY 电气调节（delay/Vref/阻抗），DRAM 提供反馈通道（pattern/签名/引脚回读）+存 Vref（FSP 寄存器）。PhyRdLat/PhyWrLat 由 PHY 告知 Controller。（§6.7/§6.9）
+【30 秒】总模型：**训练算法可住在 MC 或 PHY，物理调节永远属于 PHY 域能力**。MC-controlled 模式="Core 发命令，PHY 调延迟，DRAM 报结果"（MC 发起/排序/判定，PHY 调 delay/Vref/阻抗，DRAM 出反馈通道 + 存 Vref FSP 寄存器）；PHY-master 模式=PHY 接管命令总线自主训练（先 QOS Disconnect 断流）。PhyRdLat/PhyWrLat 由 PHY 告知 Controller。
+【Follow-up】两模式怎么选？（MC 编排逻辑投入 vs 断流窗口+所有权交接代价的权衡）（§7.6/§7.11）
 
 **A10：最坏情况 Row Hammer 带宽税怎么算？**
 【30 秒】单 bank：税=tRFCpb/(RAAIMT×tRC+tRFCpb)，所需 RFM 速率=1/(RAAIMT×tRC)；RFMpb 目标 bank 占 tRFCpb、异 bank 按 tRREFD 穿插；aggregate 触顶受 tRRD_S/tFAW 组合约束。诚实边界：协议给出 demand 与 unavailable duty，真带宽损失=不可被其他 bank 隐藏的 bubble（负载相关）。（§4.7）
 
 **A11：DFI 1:4 ratio 意味着什么？MC 为什么能降频、代价是什么？**
-【30 秒】f_MC=f_CK/4、Width_DFI=2×4×DQ（带宽守恒：256-bit@800MHz=32-bit@6400MT/s）——调度逻辑不必追 DRAM CK 收敛时序。代价：总线加宽/phase 化、读侧 PhyRdLat+rolling rotator、写侧 contract 双方一致编程；命令槽不紧张的根源是 DRAM 自然命令率 sub-CK（tCCD_S=8nCK）。（§6.8/D.4）
+【30 秒】f_MC=f_CK/4、Width_DFI=2×4×DQ（带宽守恒：256-bit@800MHz=32-bit@6400MT/s）——调度逻辑不必追 DRAM CK 收敛时序。代价：总线加宽/phase 化、读侧 PhyRdLat+rolling rotator、写侧 contract 双方一致编程；命令槽不紧张的根源是 DRAM 自然命令率 sub-CK（tCCD_S=8nCK）。（§7.5/§7.4）
 【Follow-up】1）tphy_rdlat 配错 1 cycle 的表现？2）写数据为什么必须提前、晚到会怎样（与读晚到的区别）？3）DFS 时 PhyRdLat 谁更新、何时生效？
 
 **A12：训练失败时，谁发现、谁上报、MC 停不停 traffic？**
-【30 秒】DFI 只定握手与逃生、不定训练算法：boot 走 dfi_init_start/complete 握手；PHY Master 模式接管 DRAM 命令总线前必须先 QOS Disconnect 断流（MC traffic 必停）；失败上报有协议——error_pN、PHY-initiated Error Disconnect、dfi_alert_n 透传、Error Codes 可读；retry/降频/safe-mode 策略非标准——典型分层：HW 服从断流 + 存寄存器（带中断），SW 做策略，超时由 PHY 监测。（§6.9/D.10）
+【30 秒】DFI 只定握手与逃生、不定训练算法：boot 走 dfi_init_start/complete 握手；PHY Master 模式接管 DRAM 命令总线前必须先 QOS Disconnect 断流（MC traffic 必停）；失败上报有协议——error_pN、PHY-initiated Error Disconnect、dfi_alert_n 透传、Error Codes 可读；retry/降频/safe-mode 策略非标准——典型分层：HW 服从断流 + 存寄存器（带中断），SW 做策略，超时由 PHY 监测。（§7.6/§7.7）
 【Follow-up】1）MC-controlled 与 PHY-master 两模式怎么选、各自的代价？2）error_pN 与 dfi_alert_n 的语义差别？3）DFI 无标准 timeout，boot 挂死风险怎么兜底？
 
 **A13：进低功耗/切频前，drain 到哪一层才算安全静止？**
-【30 秒】四层判据：L1 系统级（AXI req/resp 收敛）→ L2 引擎级（CAM 空、backpressure 生效）→ L3 接口级（DFI 三流全空：命令/写数据/读数据——ctrlupd 的判据线）→ L4 DRAM 级（尾部时序 tWR/tRTP + banks 前置：SR 全 precharged、PDE 允许 open row）。写必须推到 DRAM 完成点（AXI 已接受不可撤销）；读可收完或 SLVERR、不可静默丢；drain 期间刷新债照走——**PD 驻留被债封顶，SR/DSM 才是无限驻留态**。（§6.10/§5.11）
+【30 秒】四层判据：L1 系统级（AXI req/resp 收敛）→ L2 引擎级（CAM 空、backpressure 生效）→ L3 接口级（DFI 三流全空：命令/写数据/读数据——ctrlupd 的判据线）→ L4 DRAM 级（尾部时序 tWR/tRTP + banks 前置：SR 全 precharged、PDE 允许 open row）。写必须推到 DRAM 完成点（AXI 已接受不可撤销）；读可收完或 SLVERR、不可静默丢；drain 期间刷新债照走——**PD 驻留被债封顶，SR/DSM 才是无限驻留态**。（§7.8/§5.2）
 【Follow-up】1）ctrlupd 为什么停在 L3 就够？2）排空最坏时间怎么估（max burst→命令数×服务时间+尾部时序）？3）DFS 在三轴（接口/DRAM 前置/队列）上怎么放？
 
 
-## 9. 3D Memory Outlook
+### 9.5 Operational Scenario Questions
+
+> 这一节检验"知识能不能变成操作判断"——每题先给结论，再给判据出处。
+
+**O1：进入 Self-Refresh 前到底要 drain 到哪？**
+【30 秒】到 L4 重前置：AXI 收敛（L1）+ 引擎静止（L2）+ DFI 三流空（L3）+ **全 bank precharged、tRP 满足、尾部时序走完**（L4）——SRE 的硬前置是"全 bank precharged"（open row 干扰自刷新）。对比：PDE 只需轻前置（允许 open row，仅要求读写突发完成）。（§7.8/§5.2）
+
+**O2：PHY 发起 training/update 时，Controller queue 留不留？**
+【30 秒】留（三轴模型轴 3=队列保留）：QOS Disconnect 只是断流 + 移交 DFI 所有权，已排队命令与刷新债全部保留，恢复时无缝续跑；AXI 层可继续接收（backpressure 由 MC 控制）。真正排空队列的是 SR/DSM。（§7.7/§7.8）
+
+**O3：DFS 时 refresh debt 怎么处理？**
+【30 秒】LPDDR 非 SR 直切：owner 不移交、postpone 债原样保留——切频六条件明确 "Refresh requirements apply during clock frequency change"（刷新义务时间域连续，deadline 不因切频重置）。HBM 借 SR：owner 移交 DRAM 自管，退出后计时 resume。（§5.4）
+
+**O4：温度突然越档、refresh multiplier 2x 生效，Controller 如何保证 deadline？**
+【30 秒】tREFI 减半 = 债累积率翻倍：调度器按新速率重排 REF 插空（错峰、REFpb 化），critical 边界（同 bank 最大 9×tREFI）不可让步——正确性优先于 QoS；代价是 drain/低功耗窗口撞刷新概率上升（§4.5 量化），极端时牺牲带宽。（§4.5/§7.2.4）
+
+**O5：最后一条 WR 已从 DFI 发出，是否已经可以进入 SR？**
+【30 秒】不——DFI 发出 ≠ DRAM 完成。写要推到 **DRAM 完成点**：WR 命令 + CWL + 突发 + tWR 全部走完，且全 bank precharge + tRP 满足后才能 SRE。（§7.8）
+
+**O6：CAM empty 是否等于 DRAM idle？**
+【30 秒】不等——CAM 空只是 L2 引擎级静止；L4 协议级还差尾部时序（末写 +tWR、末读 +tRTP）与目标 bank 态。**CAM empty ≠ DRAM quiescent** 是 drain 判据的核心反例。（§7.8）
+
+**O7：PHY training fail，谁检测、谁停 traffic、谁决定 retry/降频？**
+【30 秒】PHY 检测（物理层 pass/fail）；断流由协议保证（QOS/Error Disconnect——MC HW 服从）；失败经 error_pN / dfi_alert_n / Error Codes 上报；retry/降频/safe-mode 策略非标准——典型分层：PHY 内部 retry → error 寄存器（中断）上抛 → SW 判 fatal。（§7.7）
+
+**O8：读数据为什么可以"晚到"，写数据为什么绝不能"晚到"？**
+【30 秒】写：MC/PHY 是 timing producer，DRAM 在 deadline（WR+CWL）采样——晚到 = 采样错数据，协议无 retry、不可恢复。读：DRAM 是 timing producer，PHY 被动捕获 → FIFO 对齐 → MC 事后接收——"晚到"只表现为 PhyRdLat 变化、可被吸收。deadline-driven vs arrival-driven。（§7.5）
+
+**O9：DFI PhyRdLat 配错一个 cycle 会发生什么？**
+【30 秒】读数据在错误的 DFI cycle 被采样——整 burst 错位、rolling 起点也错 → 读数据 corrupt 且**稳定可复现**（PhyRdLat 是确定性常数、不随训练变）——这正是它按 (setpoint × ratio) 配置、切频必须同步换值的原因。（§7.4/§7.5）
+
+**O10：切频后哪些表必须换、哪些东西不能变？**
+【30 秒】必换三套表：① DRAM 侧 MR/timing 档（FSP 选组）；② PHY operating-point / training set / ZQ 阻抗码字；③ DFI latency / ratio / phase（tphy_rdlat/wrlat）。不能变：拓扑（地址映射/channel/bank）、数据内容、协议语义——**语义连续正是队列可保留的前提**。（§7.10）
+
+### 9.6 Quantitative / Whiteboard Questions
+
+**Q1：HBM 一个 PC 的 natural burst 粒度？** 32-bit × BL8 = **32B**——与 GPU sector 对齐（§2.5/§3.5、§9.3 C13）。
+
+**Q2：DDR5 子通道一条读命令搬多少？** 32-bit × BL16 = **64B**——正对齐一条 CPU cache line（§3.5）。
+
+**Q3：Refresh duty 怎么估？** tRFC / tREFI：2Gb 1x ≈3.3% → 2x ≈6.7% → 4x ≈13.4%；tRFCab 130→380ns 随密度（§4.1/Appendix A）。
+
+**Q4：1TB/s @ 32B 粒度 = 多少 transactions/s？** 10^12 / 32 = **31.25G/s**——理解命令带宽压力与请求聚合的必要性（§3.4）。
+
+**Q5：DFI 1:4 带宽守恒算例？** 256-bit @ 800MHz = 32-bit @ 6400 MT/s——rate × width 守恒（§7.4）。
+
+**Q6：Row Hammer 最坏带宽税？** 单 bank：tRFCpb / (RAAIMT × tRC + tRFCpb)；多 bank aggregate 触顶受 tRRD_S/tFAW 组合约束（§4.7）。
+
+**Q7：tFAW 滚动窗口的"边界套利"示意？** 分段窗口下 8 个 ACT 可挤在跨窗边界连续发（每窗各 4 个）；滚动窗口使**任意连续 tFAW 内 ≤4 ACT**——无套利空间（§1.5）。
+
+**Q8：LPDDR6 ACT 命令 payload 预算？** pins × edges × cycles：4 pin × 2 edge × 4 CK = 32 slot，扣 opcode/标记后装行地址——所以 ACT 拆两条命令共 4 周期（§3.2/§3.3）。
+
+
+## 10. 3D Memory Outlook
 
 > 本章只汇总前文已建立的结论，作为 forward-looking architecture conclusion；不展开 PIM / Near-Memory Compute 实现与制造工艺。
 
-**互连距离 → 超宽接口的可行性**（§5.12 互连阶梯表）：
+**互连距离 → 超宽接口的可行性**（§3.10 互连阶梯表）：
 
 ```text
 TSV / Interposer / Hybrid Bonding（几十~几百 µm → µm 级）
@@ -1313,7 +1558,7 @@ pin density ↑ / energy-per-bit ↓（低摆幅可行）
 HBM bandwidth scaling = 位宽杠杆（§3.10：3E→4 靠 2048-bit 而非提速率）
 ```
 
-**HBM4 之后的下一跳：MC / PHY 下沉**（§7.3 趋势段）：
+**HBM4 之后的下一跳：MC / PHY 下沉**（§8.3 趋势段）：
 
 ```text
 HBM4 2048-bit
@@ -1323,7 +1568,7 @@ advanced logic base die [VENDOR]
 custom HBM：MC / memory-specific PHY / management 下沉 Base Die，
 stack 内局部化超宽接口
     ↓
-GPU 经抽象 D2D transaction link 访存 —— Controller/PHY boundary 的下一跳（§6）
+GPU 经抽象 D2D transaction link 访存 —— Controller/PHY boundary 的下一跳（§7）
 ```
 
 代价与边界：多一跳 D2D protocol/latency、Base Die 功耗与热密度（热是 3D 的第一约束候选，§4.5）、更强的系统协同设计 [INFERENCE]。
@@ -1360,9 +1605,10 @@ GPU 经抽象 D2D transaction link 访存 —— Controller/PHY boundary 的下�
 - DDR5：tRRD_S=8nCK、tRRD_L=Max(8nCK,5ns)、tFAW(1K)=Max(32nCK,20~16ns)、tFAW(2K)=Max(40nCK,25~20ns)、tCCD_S=8nCK、tCCD_L=8~16nCK（MR13 编程）、同 BG W2W=Max(32nCK,20ns)、tWTR_L=Max(16nCK,10ns)/tWTR_S=Max(4nCK,2~2.5ns)。
 - LPDDR5（8B 模式）：tRRD=Max(10ns,2nCK)、tFAW=40ns；BG 模式 Table 330：跨 BG BL/n_min=2tCK、同 BG BL/n_max=4tCK、tCCDMW=4×BL/n。
 - HBM3：tCCDS=2nCK（=4WCK=BL8）、tCCDL=Max(4, 2.5ns/tCK)；tRRD/tFAW/RAA 同表（JESD238 p175）。
+- HBM4（JESD270-4A Table 108）：tCCDS=2nCK、tCCDL=Max(4nCK, 2.5ns/tCK)、tPPD=2nCK、tCCDR=tCCDS+1~2nCK（厂商自定，跨 SID 无缝连读）；tRC/tRAS/tRCD/tRP/tRRD/tFAW/tWTR 表列留白（厂商 datasheet）；tRAS MAX=9×tREFI（§1.3）。
 - 刷新：tREFW=32ms、R=8192、tREFI=3.906µs、tREFIpb=488ns、tRFCab=130~380ns、tRFCpb=60~190ns（随密度，LPDDR5 Table 235）；postpone/pull-in ±9×tREFIe。
 
-**A.4 电压域**（详见 §5.11 表）——HBM3 1.1/1.1/0.4V；HBM4 1.05V+厂商自定 I/O；DDR5 1.1V+VPP ⚠️；LPDDR5 VDD1/VDD2H/VDD2L/VDDQ；LPDDR6 VDD2C 1.0/VDD2D 0.875/VDDQ 0.5V。
+**A.4 电压域**（详见 §5.1 表）——HBM3 1.1/1.1/0.4V；HBM4 1.05V+厂商自定 I/O；DDR5 1.1V+VPP ⚠️；LPDDR5 VDD1/VDD2H/VDD2L/VDDQ；LPDDR6 VDD2C 1.0/VDD2D 0.875/VDDQ 0.5V。
 
 ## Appendix B. Glossary
 
@@ -1381,12 +1627,14 @@ GPU 经抽象 D2D transaction link 访存 —— Controller/PHY boundary 的下�
 | Prefetch (8n/16n/24n) | 内部一次读出的宽度与 I/O 拍数之比——核心频率平坦下提速率的手段 |
 | UI | Unit Interval：一个数据 bit 的时间窗 |
 | Eye | 所有 UI 波形折叠叠加——Width=时间裕量、Height=电压裕量 |
+| SI | Signal Integrity，信号完整性：研究"这个 0/1 经过真实互连后还能不能被可靠判出来" |
 | Jitter (RJ/DJ) | 随机抖动（高斯无界）/ 确定抖动（DCD/PJ/DDJ/BUJ，有界） |
 | Skew | DQ-to-DQ（组内到达差）/ DQ-to-DQS（相对选通）两类 |
 | ISI | 码间干扰：反射振铃/衰减污染后续 bit 判决窗 |
 | SSN | 同时翻转噪声：di/dt×电源路径电感 |
 | ODT | 片内端接（档位经 MR 编程，ZQ 校准） |
 | DM / DBI / DMI | 写掩码 / 动态反转 / LPDDR5 兼职两者的引脚（LPDDR6 已删） |
+| CAI | Command/Address Inversion，命令/地址总线反转：减少不利 bit pattern、降低切换噪声/供电扰动 |
 | CKR | LPDDR 的 WCK:CK 频率比（2:1/4:1） |
 | WCK2CK Leveling | WCK 与 CK 的同步 FIFO 指针对齐训练 |
 | CBT | Command Bus Training（LPDDR 命令总线训练） |
@@ -1400,9 +1648,11 @@ GPU 经抽象 D2D transaction link 访存 —— Controller/PHY boundary 的下�
 | ECS | 自动错误检查与擦洗 |
 | ODECC | DDR5 片上 ECC（128 数据+8 校验 SEC） |
 | BRC / tDRFM | HBM4 Bounded Refresh Configuration 及其时序 |
-| DVFSC/Q/H/L/B | LPDDR6 DVFS 模式族（§5.11） |
+| DVFSC/Q/H/L/B | LPDDR6 DVFS 模式族（§5.4） |
+| DCA | Duty Cycle Adjustment，占空比校正：把 CK/DQS/DQ 相关波形因上升沿/下降沿不对称造成的 50% duty distortion 修回来 |
+| DFE | Decision Feedback Equalization，判决反馈均衡：用已判决过的 bit 抵消前面 bit 对当前 bit 的 ISI |
 | DFI | DDR PHY Interface——Controller/PHY 标准契约 |
-| tRASmax | 历史时序参数（现代五标准已删除，Appendix D.9） |
+| tRASmax | 历史时序参数（现代五标准不再定义独立符号；HBM 以 tRAS MAX 列保留 9×tREFI 实质上限，§1.3） |
 
 ## Appendix C. JEDEC / DFI Sources
 
@@ -1410,7 +1660,7 @@ GPU 经抽象 D2D transaction link 访存 —— Controller/PHY boundary 的下�
 |---|---|---|
 | JESD238 | HBM3 DRAM | 2022.01 |
 | JESD238A | HBM3E | 9.6 Gbps |
-| JESD270-4 | HBM4 DRAM | 2025.04；32ch/2048-bit；DRFM/BRC/SEV/ECS |
+| JESD270-4 | HBM4 DRAM | 2025.04；32ch/2048-bit；DRFM/BRC/SEV/ECS；一手复核采用修订版 JESD270-4A（2025.11，AC 表 4.8~8.0G 9 档） |
 | JESD79-5 / -5A / -5B / -5C | DDR5 SDRAM | 2020.07 起；速率档至 8800 |
 | JESD209-5 / -5B / -5C | LPDDR5 / LPDDR5X | 2019.02 起；8533/9600/10700 档 |
 | JESD209-6 | LPDDR6 | 2025.07.09；x24/x12 效率模式；PRAC+ABO；DVFS 族 |
@@ -1423,112 +1673,6 @@ GPU 经抽象 D2D transaction link 访存 —— Controller/PHY boundary 的下�
 - `DDR\JESD79-5B_v1-2_DDR5_SDRAM.pdf`、`DDR\JESD209-5B.pdf`
 - `LPDDR6\JESD209-6_LPDDR6 Standard.pdf`
 - `LPDDR6\eetop.cn_DDR_PHY_Interface_Specification_v5_2.pdf`（DFI；另备 DFI 5.1 PDF）
-
-
-## Appendix D. Deep-dive Notes
-
-> 有长期研究价值但不适合主阅读路径的细节。均为从旧版正文迁移的已验证内容，source label 保留。
-
-### D.1 HBM ACT 位预算与命令编码细节 [JEDEC JESD238 Table 30, p49]
-
-- ACT 三拍位分配：R 拍 = opcode 前缀(L,H,H) + PC(1) + SID(2) + BA[3:0]；F 拍 = 标记(H,H) + RA[14:8]；R 拍 = 标记(H,H) + RA[7:0]——ACT 载荷 ≈24 bit / 30 slot；PRE ≈7 bit（PC+BA+AB）、NOP=0（半拍命令）。
-- 行命令 half-cycle（PDE/SRE 为 1 cycle）；列命令 1 cycle（C[7:0]，DDR 双沿 2 beat × 8 bit = 16 bit，编码显式携带 PC + SID + BA[2:0] + CA[4:0]，Table 31 p50）。
-- NOTE 9（p49）："ACT is a 1.5 cycle command and another command is not allowed during ACT command"；Table 32（p51）行命令沿配对表含 "Different PC, Any Bank" 列——跨 PC 行/列配对合法。
-- ACT 奇偶校验按全 30 bit 计算（MR0 OP6 启用，p53）。
-- 地址演进：HBM3 RA[12:0]（8/12/16Gb）→ RA[13:0]（24/32Gb）（p20 地址表）；HBM4 预留 RA15（p254 DEVICE_ID NOTE 2："if additions to the addressing table increase the row address to include RA15"）。DDR5 对照：Table 311（p466）Row Address [17:0]、Column Address [10:0]、BA[1:0]、BG[2:0]、CID[2:0]。
-
-### D.2 HBM REFab 的 CNOP 例外与通道级冻结 [JEDEC JESD238 §6.3.2.5 + NOTE 1/2]
-
-- REF 命令拍列域必须垫 CNOP："The REFRESH command also requires a CNOP command on the column command inputs C[7:0], unless the column command is for the other pseudo channel"——REFab 是行/列双总线的唯一例外（常规行命令可被列流掩盖，REFab 不行）。
-- NOTE 1（p61/页 47）："Only RNOP and CNOP commands are allowed after a REFRESH command until tRFCab has expired"——tRFCab 期间整个通道的停顿窗口；NOTE 1 字面未按 PC 限定（REFab 编码带 PC 位与该冻结的关系 [UNKNOWN] 待深挖）。
-- NOTE 2：两条 REF 最大间隔 9×tREFI（§4.4 critical 边界的 HBM 写法）。
-- CNOP 定义（§6.3.3 p70/页 56）：1-cycle，"prevents unwanted column commands from being registered"；SRE 同样要求 CNOP（p97）。
-- 双 PC 的隐藏价值：细粒度路径（REFpb/RFMpb，异 bank 走 tRREFD）与错峰调度才能填回这些空洞。
-- HBM4（JESD270-4 p73）刷新约束同构。
-
-### D.3 DDR5 tCCD 家族与 3DS 后缀 [JEDEC JESD79-5B]
-
-- tCCD_M（同 BG 跨 bank）只存在于 §13.3 速度档表：3200~4000 档 = tCCD_L（三级合一，此时 S=M=L=8nCK）；高速档展开为中间层 Max(8nCK, ~4ns)——构成 跨BG < 同BG跨bank < 同BG同bank 三级。
-- 3DS 表同族参数带 _slr/_dlr 后缀（如 tCCD_S_slr = 跨 BG 同 logical rank = 8nCK，p483）；错峰刷新 tRFC_dpr ≈ tRFC_slr/3（§4.13.5，p206，限 IDD5B1 峰值刷新电流）。
-- 同 BG W2W = Max(32nCK, 20ns)（Figure 52 图注："back to back BL16 writes to same bank group using a timing of tCCD_L_WR"）。
-- **PDF 提取警示**：JESD79-5B 的 From/To 多列表（p173-175）PDF 文本提取后行会错位，曾致 tCCD_S/L 的 BG 归属误读（tCCD_S 实为跨 BG）——参数与 BG 归属的对齐以**图注散文**与**速度档定义行**（"…delay for different bank group"）为权威。
-
-### D.4 DFI Notes：frequency ratio / rolling order / 2T 原子性 [DFI]
-
-**ratio 系统的 spec 结构（DFI 5.1）**：
-
-- §4.10.1 *Frequency Ratio Clock Definition*（含 Phase Definition 图）；§4.10.2 *Interface Signals with Frequency Ratio Systems*（明文可见 "Example 1:2 Frequency Ratio Command Stream"、"Example 1:4 Frequency Ratio Command Stream"）；§4.10.3 *Write Data Interface in Frequency Ratio Systems*（"1:2 Frequency Ratio Write Data Example"）；§4.10.4 *Read Data…*——**command / write / read 三条路径均有 ratio 专门节**。
-- ratio 档位：明文示例 **1:1 / 1:2 / 1:4**（图注：LPDDR2/3 用 1:1、LPDDR4 用 1:2）；具体档位由集成配置，DFI 不限定。
-- **tphy_wrlat / tphy_wrdata**（Table 12 *Write Data Interface Timing Parameters*）与 **tphy_rdlat**（Table 15 *Read Data Interface Timing Parameters*）为可编程参数；图注直接给值（"tphy_wrlat = 3"、"DRAM Burst of 8: tphy_wrlat = 4"、"tphy_wrdata = 1"）。
-- 写交错证据：图例 "Write Commands Utilizing **dfi_wrdata_cs**"（DRAM Burst of 4）——独立写可经 per-CS 门控交错。
-- 相关章节：§4.4 *Frequency Change*；§4.12 *CA Parity and CRC Errors in Frequency Ratio Systems*；**DDR5 1N / 2N Read/Write Timing 专节**（1T/2T 命令编码在 DFI phase 上的映射规范——DFI-3 素材）。
-- 注：v5.1 正文为 CID 编码（未解码），可读明文来自 TOC / 图注 / 章节标题；ratio 的 spec 级精确定义措辞 [UNKNOWN] ⚠️。
-
-**数据字与 rolling**：
-
-- **frequency ratio 与 DFI 数据字**：一个 DRAM 突发拆成 N 个 DFI 数据字（dfi_rddata_w0~w3，每字 = 一次 DQS 上升+下降沿的数据）；32-bit DRAM × 1:4 → 4×64-bit DFI 字。
-- **读数据 rolling**（DFI 5.1 §4.10.4 p116/页 102；v5.2 p150 同文）："On a DFI clock, the PHY is permitted to assert any number of consecutive dfi_rddata_valid_wN signals…the read data must be returned in a **rolling order** of DFI data words."——1:4 原文例子：上一事务返回 w0/w1 → 下一事务必须从 w2 开始；2 字事务用 w2/w3；4 字事务用 w2/w3/w0/w1——环绕推进。DBI 读信息同拍同规则（§4.8.2 p105）。
-- **写数据不 rolling**（§4.10.3 p113）："The write data must be delivered with the DFI data words **aligned in ascending order**"（从 w0 升序）——读被动捕获不能对齐、写主动投递可对齐，故 rolling 只在读路径存在（'rolling' 全文仅 2 页命中：p105/p116——考据）。
-- MC 侧代价：读数据路径需滚动重排逻辑（read data rotator——按事务长度与起始 w 位旋转回 w0 起）；收益：PHY 侧任意突发流无缝拼接（连续读流无对齐气泡）。
-- DDR5 2T 命令在 DFI 侧原子不可拆；训练/校准走 MPC 承载子命令。
-
-### D.5 LPDDR6 Training 六阶段详细流程 [PROJECT 用户口径；与 JESD209-6 §4.2.1.7 / Table 254 / MR30-34 交叉验证一致]
-
-顺序由自举依赖决定（后一步依赖前一步打通的通路；CA→WCK2CK→读均衡→写均衡→Vref/DFE→频点 training set）：
-
-1. **① CS Training（CSTM）——片选对齐**：低频进 CSTM 模式 → DQ[11] 拉高触发 FSP 切高频 → CS 线发 1010 翻转波形，DRAM 用 CK 采样 CS 脉宽、采样 32 CK 周期 → 高/低脉宽 Pass/Fail 经 DQ[7:6] 异步反馈 → SoC 逐步微调 CS 发射延迟直至全 Pass → 低频退出、VREF(CS) 写入目标 FSP 寄存器。核心目标：让 DRAM 在正确时刻抓到 CS 上升沿，作为命令解析起点。
-2. **② ZQ Calibration——阻抗匹配**：后台校准（完全不占 DQ）；完成后有变化则置位 ZQUF，Core 在总线空闲发 MPC ZQCal Latch 把新阻抗码字安全应用到引脚、等 tZQLAT 后恢复传输；DVFS 电压切换时 MRW 设 ZQ Stop 暂停、切完解除。以外部 240Ω 精密电阻为基准校准驱动器/ODT 阻抗。
-3. **③ CBT——命令总线对齐**：高频下拉高 CS、CA[3:0] 发 PRBS16，DRAM 内同种子 PRBS 发生器逐比特比对，偏差比特在 DQ[7:0] 输出 1（Fail）→ SoC 独立调每根 CA 线发射延迟；循环"复位 LFSR→发 PRBS→读 DQ"直到 DQ[7:0] 全 0。核心目标：CA 时序 + VREF(CA) 阈值逐比特对齐。
-4. **④ WCK2CK Leveling——写时钟相位对齐**：修正 DRAM 内部 WCK 1/2 分频器的初始相位不确定性（0°/180°）。Core 发 WFF 命令 → DRAM 生成 CK 锚定、宽 2tCK 的内部脉冲 → 分频后的 WCK 对其单次采样：相位错采样 0、对齐采样 1 → SoC 微调 WCK 发射延迟直至 DQ 上观察到 0→1 翻转。
-5. **⑤ WCK-DQ Training——数据眼图对齐（读先写后）**：读训练：RDC 命令 → DRAM 忽略 FIFO、直接从 MR32/33/34 输出固定已知 pattern → SoC 比对并调接收端每根 DQ 延迟找眼中心；写训练：WFF 写自定义 pattern 进 FIFO + RFF 读出比对 → 调发射端 WCK-to-DQ 延迟，循环至无损；最后可再跑 RDC 对读路径精细复扫。
-6. **⑥ 频率维度**：低频 f0 初始化训练 → DFS 后用 training set 保存/恢复（多 frequency setpoint）；DVFSC/DVFSQ 等低功耗模式依赖该机制。
-
-全局总结："**低频进/出，高频练**" + "**Core 发命令，PHY 调延迟，DRAM 报结果**"；VREF 值存 DRAM 的 FSP 寄存器、delay 值存 PHY 内部；流程 = CS 粗对齐 → CA 精对齐 → WCK 相位锁定 → DQ 眼图居中，层层递进打通高频信号闭环。
-
-
-### D.6 SRE/PDE 前置条件与切频原文引证 [JEDEC]
-
-- HBM3 SRE 条件（p97/页 83）："only allowed when all banks in both pseudo channels are precharged with tRP satisfied…tRDSRE…tMOD"。
-- HBM3 PDE 条件（p91/页 77）："must not be issued when read or write operations are in progress…**can be issued while row activation, precharge, auto precharge, or refresh are in progress**"；PD 期间 CK 可停止（NOTE 6）。
-- HBM3 SR 内刷新（p97）："initiates a minimum of one internal refresh within tCKSR period"；SR 切频原文："may halt the external clock or change the external clock frequency tCKSRE after self refresh entry…stable tCKSRX before exit"。
-- HBM4（JESD270-4）：p108 SRE 同文；p102 **precharge power-down**（all banks idle）/ **active power-down** 两态显式命名。
-- LPDDR5（JESD209-5B）：§7.5.2（p308/页 280）："Between SRX and SRE at least one extra refresh command is required…minimum of one extra Refresh command prior to Self-Refresh Entry"；postpone 章节（§7.5.1 p305-309）无 SRE 清债条款（考据：postponed 相关规则仅上限 8 条 / extra 计数 / 热切换单调递减 p306 NOTE 1）。
-- LPDDR5 p309：SR 期间刷新计时器 **freeze and store / resume from saved value**（债保持）；bank 计数 SR 退出清零；incomplete per-bank set 不计入 Optimized Refresh。
-- LPDDR5 切频六条件（§7.6.7 p425/页 397）原文要点：tCK(abs)min；"Refresh requirements apply during clock frequency change"；"All banks are required to be idle state or during tRFCab/pb"；MRW/MRR 完成；tRCD/tWR/tWRA/tMRW/tMRR 满足；CS LOW。切频在 tCMDPD/tFC/tZQPD 等窗口 inhibit（§7.5.7.1 p320/页 292）；PD 三态（idle/active/SR PD——SR PD 内部刷新照常）。
-- REF owner 框架（LPDDR 非 SR 直切保债 / HBM·DDR 借 SR 移交 owner）为 [INFERENCE/PROJECT] 组织口径。
-
-### D.7 HBM4 SID / bank / 地址映射细节 [JEDEC JESD270-4]
-
-- §1/§2 原文："HBM4 requires 4 DRAM dies to support 32 channels. Additional DRAM dies beyond 4 add additional capacity, SIDs and additional banks per pseudo channel"（每 die 8ch×2PC，4 die 凑满 32 通道，Figure 1）。
-- Table 4 Bank Address 字段演进：BA[3:0]（16 banks/channel）→ SID[0]+BA[3:0]（32）→ SID[1:0]+BA[3:0]（48/64）；RA[13:0]/CA[4:0]/页大小 1KB 不动。
-- Table 5：bank 分 A~H 八个 BG 组；48B 档 SID[1:0]=11 invalid。
-- Table 6：tRRDS/tRRDL、tCCDS/tCCDL（R2R 亦可标 tCCDR）。
-
-### D.8 Row Hammer 带宽税推导细节 [PROJECT 协议组合推导]
-
-- 公式：单 bank 带宽税 = tRFCpb / (RAAIMT × tRC + tRFCpb)；所需 RFM 速率 = 1/(RAAIMT × tRC)；RAAIMT 非任意值——厂商提供离散档位。
-- RFMpb 占用规则：目标 bank 占 tRFCpb（不叠加 tRREFD）；不同 bank 的 RFMpb 按 tRREFD 穿插（tRREFD 管 RFM 后到下一 ACT 的间隔）。
-- ACT 极限两层：单 bank hammer 受 tRC；多 bank aggregate 受 tRRD_S/tFAW——aggregate 触顶时 tax 上界为组合式。
-- HBM3 p65 刷新约束表（tRFCpb/tRREFD/tRC）与 RAAIMT/RAAMMT/RAADEC 术语为 [JEDEC]；公式组合为用户推导。
-
-### D.9 tRASmax 考据 [JEDEC 0 命中考据]
-
-- 'tRASmax' 在 JESD79-5B / JESD209-5B / JESD209-6 / JESD238 / JESD270-4 五标准全文 0 命中——现行协议族不定义 tRASmax。
-- 历史动机 ≈9×tREFI（防 open row 阻塞 REF）标 [PROJECT ⚠️——旧标准不在库]（LPDDR2/3 时代厂商 datasheet）。
-- "9×tREFI 与 LPDDR5 postpone 预算 9×tREFIe（Figure 136/137）数字同源"的观察为 [INFERENCE]。
-- HBM3 NOTE 2（p65/页 51）："A bank must be in the idle state with tRP satisfied before it is refreshed"。
-
-### D.10 DFI 训练控制与错误逃生——spec 证据（DFI 5.1）
-
-- **训练算法不在 DFI 范围**；DFI 只定义握手与逃生协议。
-- **Init 握手**：FIGURE 4 "System Setting Signals — dfi_init_start Asserts Before dfi_init_complete"；FIGURE 3 "Dependency on dfi_init_complete"（多数接口信号依赖该完成标志）。
-- **PHY Master 接口**：FIGURE 83 "PHY Master Interface QOS Disconnect Protocol"；TABLE 31 *Disconnect Protocol Signals*；TABLE 32 *Disconnect Protocol Timing Parameters*——PHY 接管 DRAM 命令总线前必须与 MC 完成断流握手。
-- **错误逃生**：FIGURE 81 "PHY Update Request, QOS Disconnect Protocol"；FIGURE 82 "PHY Update Request, Error Disconnect Protocol"；FIGURE 78 "Example of Error Condition"；TABLE 44 *Error Codes*（MC-to-PHY Message Interface，TABLE 34/35）；接口块图含独立 **error_pN** 信号。
-- **dfi_alert_n 透传**：TABLE 43 *dfi_alert_n Signal With Matched and Frequency Ratio System*；FIGURE 69 "dfi_alert_n with 1:2 Frequency Ratio"——DRAM ALERT 引脚经 PHY 上报 MC，ratio 下 per-phase 对齐。
-- **低功耗控制接口**（低功耗握手时序证据，对应 §6.10）：TABLE 23 *Low Power Control Interface Signals*；FIGURE 70 *Low Power Control Handshaking Timing Diagram*。
-- **项目策略范式 [PROJECT]**：自主训练 PHY 内部 retry → 穷尽后 error 寄存器（带中断）上抛；MC HW = 服从断流 + 存 error codes；PHY 侧监测超时（DFI 无标准 timeout）；fatal 判定在 SW。
-- **DFI 6.0（2026-05）** [VENDOR：官方发布]：首次官方支持 HBM；训练全面转 PHY-independent 模式（PHY 独立训练，不经控制器）；增强 fault identification/recovery 与 power-saving；移除 legacy 协议支持。
-
 
 
 ---
