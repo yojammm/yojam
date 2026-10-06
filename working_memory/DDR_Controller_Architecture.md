@@ -329,9 +329,9 @@ Symptom → Observable → Bottleneck Hypothesis → Architecture Cause → Desi
 
 **高价值展示题（追问引导首选追问点）——M3 refresh deadline 双层机制**：
 - **20s**："在当前适用的 protocol/mode 下，REFpb 的硬期限是 same-bank consecutive refresh interval 不超过 9×tREFI（适用范围确认 → RF-P1-09 [TODO-SPEC]）。RTL 的实现是 per-bank pending bitmap（refpb_req[63:0]）——REFpb 执行清对应 pending 位，SID lock/progression 控制 bitmap 清扫推进；两个错相时间 watchdog 作为 bitmap 清扫进度的 deadline 兜底，到项目设置的 early-warning threshold（8×tREFI [RTL]）提前拉 critical，给 drain/PRE/REF 留余量。硬协议期限仍是 protocol/mode scoped；bitmap 全清即本轮 pending 集完成，不依赖字面 round_complete 信号。"
-- **90s**：pending bitmap（每 bank 一个 pending 位）+ SID 扫描推进；watchdog = 两个错相时间 watchdog（bitmap 清扫进度的 deadline 兜底，不是 round-pair 数学压缩）；threshold 8×tREFI = early-warning / critical escalation；9×tREFI = hard deadline（protocol/mode scoped → RF-P1-09）；early-warning 与 hard deadline 两层分离。
+- **90s**：pending bitmap（每 bank 一个 pending 位）+ SID 扫描推进；watchdog = 两个错相时间 watchdog（bitmap 清扫进度的 deadline 兜底）；threshold 8×tREFI = early-warning / critical escalation；9×tREFI = hard deadline（protocol/mode scoped → RF-P1-09）；early-warning 与 hard deadline 两层分离。
 - **Deep-Dive**：→ M3（Ch7）→ Ch15（watchdog 计数起点、bitmap 清扫与 SID progression、精确 cycle 接线 [TODO-RTL-local]）→ PPA（bitmap 64 bit + 2 watchdog）。
-- **展示链**：Protocol Requirement → RTL State Representation（pending bitmap + 时间 watchdog）→ Early-warning escalation → PPA / Performance Tradeoff。（历史 round-pair 数学推导已退役，见 git recovery-branch 历史版本。）
+- **展示链**：Protocol Requirement → RTL State Representation（pending bitmap + 时间 watchdog）→ Early-warning escalation → PPA / Performance Tradeoff。（[HISTORICAL / RETIRED MODEL] 早期数学推导已退役，见 git recovery-branch 历史版本。）
 
 **Deep-Dive Node Links**：M1~M5（Ch7）→ S2（FSC 维护优先级序）→ T2（禁 ACT）→ G1（进 LP 强制 AB）。
 
@@ -401,11 +401,11 @@ Symptom → Observable → Bottleneck Hypothesis → Architecture Cause → Desi
 
 | 段 | 内容 | 纪律 |
 |---|---|---|
-| **C**onclusion | 先给架构结论 | 不从 RTL 细节讲起 |
-| **M**odel | 因果模型：为什么影响 BW / Latency / PPA | 尽量公式或链条 |
-| **T**radeoff | 得到什么、牺牲什么、alternatives | 至少一个 alternative |
-| **P**roof（证据）| counter / simulation / synthesis / sweep | 区分 observable vs attributable；无 证据方法则该结论 PARTIAL |
-| **H**ook | 主动留下一个值得追问的接口 | 优先引向自己熟悉方向 |
+| Conclusion | 先给架构结论 | 不从 RTL 细节讲起 |
+| Model / Reasoning | 因果模型：为什么影响 BW / Latency / PPA | 尽量公式或链条 |
+| Tradeoff | 得到什么、牺牲什么、alternatives | 至少一个 alternative |
+| Evidence / Validation | counter / simulation / synthesis / sweep | 区分 observable vs attributable；无证据方法则该结论 PARTIAL |
+| Follow-up Direction | 主动留下一个值得追问的接口 | 优先引向自己熟悉方向 |
 
 完整范例见 1.4（RQ3/CAM=64）。旧文档的"金句"各章就地保留，作为 追问点素材。
 
@@ -606,7 +606,7 @@ scheduler 每拍只能从 CAM 内容里提名候选——visibility 不足时，
 
 #### ⑦ Alternatives
 - **credit per command** [MODEL]：可能提供更精细的容量 / 公平控制；其 RTL complexity / counter width / compare cost / PPA impact 当前未量化——OPEN [TODO-DESIGN]（必要时 [TODO-MEASURE]），不预设"代价翻倍"；对照 **per entry**（本项目 [RTL]，已知代价 = ⑧ 的容量不均 [OPEN：3-P1-06]）；
-- **pure ready/valid handshake（无 credit）**：合法 alternative，是否适合当前 PA↔CQ 接口尚未完成系统分析——OPEN [TODO-DESIGN]；
+- **pure ready/valid handshake（无 credit）**：合法 alternative，是否适合当前 admission 接口尚未完成系统分析——OPEN [TODO-DESIGN]；
 - 多套独立 credit（per-class）：与 QoS 交叉后的复杂度影响 [MODEL]；当前用共享 credit + QoS 提名序解决 [RTL]。
 
 #### ⑧ Tradeoff & Saturation Point
@@ -616,7 +616,7 @@ scheduler 每拍只能从 CAM 内容里提名候选——visibility 不足时，
 #### ⑨ 证据与验证（含诊断闭环）
 - 运行时 [RTL O1]：credit（dbg_obv）、fifo_full 电平、exp_gpr/gpw 饥饿健康度（应 ≈0）；
 - sweep：水线阈值 × GSC 参数联合 sweep（→D1 复用）[TODO-MEASURE→X-P1-07]；
-- 断言：credit 守恒（grant 消耗 + 归还 = 常数；conservation 检查 → 各 Node 证据）；
+- 断言：credit 守恒（accepted 消耗 + return = 常数；conservation 检查 → 各 Node 证据）；
 - 诊断闭环：Symptom（admission 类 blocked 高）→ Observable（credit 0 / fifo_full）→ Hypothesis（下游不放行 → V2 出口堵塞 or WDP 满）→ Knob → Experiment → Conclusion。
 
 #### ⑩ 追问展开
@@ -1511,7 +1511,7 @@ maintenance 与 traffic 争抢 bank、CA 槽、tRFC 窗口：插队太狠伤 tra
 
 #### ② Core Conclusion
 [RTL·HBM] 实现事实：refresh 控制维护 **per-bank pending bitmap**（refpb_req[63:0]）——每个 HBM4 bank 一个 pending 位，REFpb 执行后清对应位；Odd/Even watchdog = **交替时间窗口 watchdog**（两个 counter 错相覆盖相邻 round 对），作为 bitmap 清扫进度的 deadline 兜底；**SID lock/clear** 在 refresh 执行期间锁该 SID 的 bitmap 清扫、完成后统一 clear。20s 口径：本配置 64 bank → 64-bit pending bitmap + 2 个 window watchdog（不是 64 个 per-bank age counter）。
-[标签分层] Δt 推导 [历史 MODEL·已退役——RTL 证据为 pending bitmap + window watchdog 结构]；max interval [SPEC, scope→RF-P1-09]；counter 机制（计数/复位/threshold/起点）[RTL]。
+[标签分层] 早期数学推导 [HISTORICAL / RETIRED MODEL——RTL 证据为 pending bitmap + window watchdog 结构]；max interval [SPEC, scope→RF-P1-09]；counter 机制（计数/复位/threshold/起点）[RTL]。
 
 #### ③ Problem
 REFpb 模式的协议义务是 per-bank 间隔：同一 bank 相邻两次 refresh 的间隔有上限。需要 RTL 直接表达"哪些 bank 还欠 REFpb"（pending 集），并对其清扫进度设 deadline 兜底。
@@ -1519,8 +1519,8 @@ REFpb 模式的协议义务是 per-bank 间隔：同一 bank 相邻两次 refres
 #### ④ Performance & Correctness Model
 - [RTL·HBM] **per-bank pending bitmap**（refpb_req[63:0]）直接表示 pending 集：REFpb 执行 → 清对应 pending 位；**SID lock/progression** 控制扫描顺序与清扫推进（执行期间锁该 SID 的清扫、完成后统一 clear）；**bitmap 全清 = 本轮 pending 集完成**——不依赖独立 round_complete 信号；
 - [RTL·HBM] **两个错相时间 watchdog** 作为 bitmap 清扫进度的 deadline 兜底：≥8×tREFI → critical escalation（early-warning）；9×tREFI 硬期限为 protocol/mode scoped（→ RF-P1-09）；
-- [口径] **early-warning（8×，留 drain/PRE/REF 余量）vs hard deadline（9×，protocol/mode scoped）两层分离**；watchdog 是时间窗口语义，不是 round-pair 数学压缩。
-- [历史注] 早期版本的 adjacent-round-pair 数学推导（Δt_bank=(Tn−xn)+x(n+1) ≤ Tn+T(n+1)、round-complete invariant 依赖）已随 RTL 结构确认退役——现行模型以 bitmap + watchdog 为准。
+- [口径] **early-warning（8×，留 drain/PRE/REF 余量）vs hard deadline（9×，protocol/mode scoped）两层分离**；watchdog 为时间窗口语义。
+- [HISTORICAL / RETIRED MODEL] 早期数学推导模型（round 配对推导 + 完成信号依赖）已随 RTL 结构确认退役——现行模型以 bitmap + watchdog 为准。
 
 #### ⑤ Current Design
 [RTL·HBM]（以下各条均为当前项目实现事实）
@@ -1554,7 +1554,7 @@ REFpb 模式的协议义务是 per-bank 间隔：同一 bank 相邻两次 refres
 - redesign：exact tracking 什么时候值得？（N_bank 小到 counter 便宜 / 需要精确 deadline 的场景）
 
 #### ⑪ 追问点
-**测量追问点（展示链）**："这是一道完整的 Protocol Requirement → Mathematical Sufficient Bound → Scheduler Invariant → RTL State Compression → PPA/Performance Tradeoff 链条题——20 秒讲结论，或从 Δt 推导讲起，取决于你想往哪层走。"
+**测量追问点（展示链）**："这是一道完整的 Protocol Deadline → Pending Bitmap → Sweep Progress → Early-warning Watchdog → Critical Escalation → Refresh Completion 链条题——20 秒讲结论，或从 bitmap + watchdog 结构讲起，取决于你想往哪层走。"
 
 
 ## 7.4 M4 — Activation Maintenance / RFM（LEAF）
@@ -2217,7 +2217,7 @@ RAS 的本质约束来自 C3：**PNR 之后错误只能 containment**——所�
 | **write B outstanding FIFO** | XMU | AXI B 通道 | 按 grant 序 push/pop |
 | **exclusive monitor ×1~16** | XMU（独立模块） | BRESP EXOKAY/OKAY 判定 | monitor 模块 |
 | **AW/W 汇聚 + resize 状态** | XMU | PA | XMU |
-| **PA credit 检查点** | PA（credit 本体 owner = PA↔CQ 协议，→Ch13） | PA 仲裁 | grant 消耗/CAM 归还 |
+| **admission credit 检查点** | UIF/credit manager（owner，→V3） | source/class 反压 | request accepted 消耗 / issue·leave-CAM 归还 |
 
 ## 12.3 Key Data Structures
 
@@ -2230,9 +2230,9 @@ RAS 的本质约束来自 C3：**PNR 之后错误只能 containment**——所�
 
 ## 12.4 Critical Pipeline
 
-**写**：AW/W 到达 → resize 64B → ostd 分配【allocation point】→ 数据收齐（RMW 另加 resize/BE 处理）→ 送 PA → **PA grant【BRESP 生成点 = master-visible completion；mapping 执行点；credit consume 点】** → BRESP 入 FIFO 按序发出 → ostd 释放【free point】。
+**写**：AW/W 到达 → resize 64B → ostd 分配【allocation point】→ 数据收齐（RMW 另加 resize/BE 处理）→ 送 PA → **PA grant【BRESP 生成点 = master-visible completion；mapping 执行点】**（credit 已在 request accept 点由 UIF/credit manager 消耗，与 PA grant 是两个事件）→ BRESP 入 FIFO 按序发出 → ostd 释放【free point】。
 **读**：AR → burst 判定 → link node 分配【allocation point；node 耗尽 = 读流控点（不向 PA 发请求）】→ PA grant → 命令+node index 下行 → （→DP2 返回：head-only【free point】→ RDATA 组装）。
-**PA 四层仲裁** [RTL]：①读写方向 → ②优先级（expired HPR/GPW、port aging）→ ③port priority（AXI QoS / port aging）→ ④RR；**每拍只 grant 一个 read/write request——这是本 controller 的 ingress/arbitration policy**（DDR/LPDDR DQ 为共享双向 half-duplex bus，单 grant 是 controller 侧策略而非总线物理属性）；**PA grant 拍 = mapping + credit consume + BRESP（写）三事件同拍**。
+**PA 四层仲裁** [RTL]：①读写方向 → ②优先级（expired HPR/GPW、port aging）→ ③port priority（AXI QoS / port aging）→ ④RR；**每拍只 grant 一个 read/write request——这是本 controller 的 ingress/arbitration policy**（DDR/LPDDR DQ 为共享双向 half-duplex bus，单 grant 是 controller 侧策略而非总线物理属性）；**PA grant 拍 = mapping + BRESP（写）两事件同拍；credit consume 在 request accept 拍（UIF/credit manager）——二者是不同事件**。
 
 ## 12.5 Resource / Backpressure Lifetime
 
@@ -2267,7 +2267,7 @@ ostd/AFIFO → **V1**；link node 公式 → **V1④**；XMU 反压/fifo_full �
 
 ## 13.1 Module Boundary
 
-- **输入**：PA grant 后命令（**物理地址 + 属性；AXI txn 信息已在 grant 点剥离**——冲突检测与 ID 无关的结构前提）；credit 状态（PA↔CQ 协议）；
+- **输入**：PA grant 后命令（**物理地址 + 属性；AXI txn 信息已在 grant 点剥离**——冲突检测与 ID 无关的结构前提）；credit 状态（admission quota，owner=UIF/credit manager →V3）；
 - **输出**：CCT 候选（per-bank，RD/WR 各一张）→ CS；fetch 请求 → WDP（写数据搬运）；水线 → GSC；
 - **时钟域**：DFI clk（core）；**负责**：CAM 存储、burst packing、入口冲突检测（RAW/WAR/WAW/RMW/exclusive-RMW 防护）、三层提名 filter、CCT 维护、CamAging、credit 归还（issue/leave-CAM 事件归还 UIF 侧 admission quota；CAM/CQ 不持有 credit）、IPROC Pending；
 - **不负责**：timing legality（BSC，→Ch14/15）、最终仲裁（FSC，→Ch14）、policy 设计决策（→S2，本层只执行双模式）、数据存储与编码（→WDP/DP1）、AXI 保序（→C1/XMU）。
@@ -2280,7 +2280,7 @@ ostd/AFIFO → **V1**；link node 公式 → **V1④**；XMU 反压/fifo_full �
 | **burst entry 合并态**（4 条共享 priority/aging/credit/lifetime） | CQ | CCT 提名 | CQ |
 | **CamAging 计数**（burst 从首条进入起算） | CQ | priority filter（expired GPR 晋升标记） | CQ 递减/打标 |
 | **CCT（RD/WR per-bank 单槽）** | CQ | CS（BSC 相与 → FSC） | 上表写入；发送后由 CS 回报释放 |
-| **credit 计数** | PA↔CQ 协议（owner=信用机制本身，→V3） | PA | grant 消耗 / 离开 CAM 归还 |
+| **credit 计数** | UIF/credit manager（→V3） | source/class 反压 | request accepted 消耗 / issue·leave-CAM 归还 |
 | **IPROC Pending** | CQ 入口 | 后续入队阻塞 / RMW flush 提权 | 入口检测写 / 放行清 |
 | **水线 set/clr** | CQ | GSC | 占用越线 |
 
@@ -2294,7 +2294,7 @@ ostd/AFIFO → **V1**；link node 公式 → **V1④**；XMU 反压/fifo_full �
 ## 13.4 Critical Pipeline
 
 ```
-PA grant（credit consume【allocation point】；mapping 后物理地址）
+request accept（credit consume【admission point】）→ PA grant（mapping 后物理地址；CAM allocation 另计）
 → 入口冲突检测【compare point——分拍：深度 64 单拍可收敛，后续版本分拍、识别延迟 1~2 拍 [RTL]】
    ├─ 冲突 → IPROC Pending【backpressure point：阻塞全部后续入队】
    │          + 冲突对象提权 / 对侧 → GSC 切换动机 / RMW → flush 提权
@@ -2315,7 +2315,7 @@ PA grant（credit consume【allocation point】；mapping 后物理地址）
 
 | 资源 | Acquire | Hold while | Release | Backpressure 后果 |
 |---|---|---|---|---|
-| **A. Credit reservation** | PA grant（Pending 已消耗） | IPROC Pending **或** CAM residence | 对应 entry/request 离开 credit ownership domain（entry 级 = burst 末条离开 CAM；精确拍 [TODO-RTL]） | credit==0 → PA 停 grant（→V3） |
+| **A. Credit reservation** | request accept（UIF/credit manager 消耗） | 自 accept 至对应命令 issue/leave-CAM（不与 CAM allocation 混同：CAM entry 有独立 lifetime） | 对应命令 issue / leave-CAM 事件归还（精确拍 [TODO-RTL-local]） | credit==0 → 该 source/class 停止 accept（→V3） |
 | **B. Physical CAM entry** | conflict resolve 后 new-entry allocation，或 **merge into existing entry（不产生新 entry）** | entry residence + 逐条下发进度 | burst 末条离开 CAM（与末条 issue / credit return 同拍 [RTL：3.4.1]；独立 free 信号确认 [TODO-RTL]） | entry 耗尽 → 反压上游（间接，经 credit） |
 | **IPROC Pending（独立 lifetime）** | 入口冲突检出 | 冲突对象在 CAM | 冲突对象离开 CAM | 阻塞全部后续入队（HOL，→C2） |
 | CCT slot | 上表 | 到命令发送 | 发送 | 单槽占用 = bank 内第二候选等待（→S1） |
@@ -2478,7 +2478,7 @@ command issue event（act/pre/rd/wr/rda/wra/ref/rfm…）
 → ready 输出 → BSC 相与 → 可发 CCT（→Ch14）
 inline 分支：上行计数 → 阈值比较 → 事件（FORCE_PRE 等）
 window 分支：错相 slot 轮流 load → 全有效 → forbid（tFAW）
-watchdog 分支：round-pair 累计 → 阈值 → critical 事件（→M2）
+watchdog 分支：time-window count → threshold → critical 事件（→M2）
 ```
 
 **Command Type → Counter Class 映射（素材明示项）**：ACT issue → tRCD/tRCDWr/tRRD/tRC/tRASmin load + tFAW slot load + tRASmax inline 启动；RD → tWR2RD（及 col 类 s/l）；WR → tWRA/tWR2RD 方向项；RDA/WRA（AP）→ tRD2PRE/tWR2PRE + 内部 precharge 序列；PRE → tRP；REFpb → tRFCpb；REFab → tRFCab（rank）；RFMpb → tRFMpb；SRX → tXRS；PD 退出 → tXP；DRFM → tDRFM_act2pre/tDRFMPB/tDFRMI + tDRFMmax inline。**其余细粒度映射 [TODO-RTL]**——不按协议 timing 名自动生成不存在的 counter。
@@ -3051,12 +3051,12 @@ arbiter+worker/四 idle/drain → **G1**；transition-entry point 执行端 → 
 **RF-P1-06 · round-complete invariant 的 RTL 保障**（M3-INV-01）
 - Question：Normal REFpb 三层 tier 准入下，是否存在某 bank 整个 round 不满足准入而被跳过、从而破坏 Tn+T(n+1) bound 的场景？critical 是否为唯一兜底？
 - Why：Odd/Even watchdog 的正确性前提 = "每 bank 每 round 必完成一次 REFpb"；该前提本身需要 RTL 保障证据。
-- Need：[TODO-RTL] | Affected：Ch7 M3 | Status: OPEN
+- Affected：Ch7 M3 | Status: **RESOLVED BY RTL STRUCTURE / CLOSED at structure level**（残余：watchdog↔bitmap exact cycle wiring = [TODO-RTL-local]）
 - **RESOLVED BY RTL STRUCTURE（HBM 集成复核）**：refresh 控制维护 per-bank pending bitmap（refpb_req[63:0]）——REFpb 执行后清对应位， Odd/Even watchdog 为 bitmap 清扫进度的 deadline 兜底 [RTL·HBM current config]；round-complete 语义由 bitmap 全清提供，不依赖某 bank 单点信号；**M3 = CLOSED at structure level**（watchdog-bitmap 联动的精确 cycle 拍点仍可 [TODO-RTL-local]）
 
 **RF-P1-07 · 固定 bank 顺序 vs 固定 phase 的 safety margin**（M3）
 - Question：REFpb 始终按 bank 递增时是否存在额外 safety margin？固定 order 与固定 phase 的区别？
-- Need：[TODO-RTL]（round 内顺序语义确认）| Affected：Ch7 M3 | Status: OPEN
+- Affected：Ch7 M3 | Status: **CLOSED / CONFIRMED**
 - **CLOSED/CONFIRMED（HBM 集成复核）**：SID 内 rolling-set 锁定 + SID0→1→2→3 固定顺序切换 [RTL·HBM current config]——round 内顺序语义确认；每 bank 每 round 至多一次由 bitmap 保证
 
 **RF-P1-08 · DRFM protocol-side target handoff 序列**（M5-B）
@@ -3124,10 +3124,11 @@ arbiter+worker/四 idle/drain → **G1**；transition-entry point 执行端 → 
 | bank open/closed（row 状态，含 open-row 地址） | BSC（per-bank FSM，Ch14） | CQ hit 判断（只读） | ACT/PRE issue | PRE 收尾/WRA_RDA 内部收口 → IDLE | [RTL] |
 | AC timing ready | Timing Enforcement counter（Ch15）——与 BSC 相与 | BSC/FSC | 命令 issue load | 归零自动 | [RTL] |
 | 读写方向 | GSC（Ch14/Ch6 D1） | BSC/FSC | 切换完成 | 切换反转 | [RTL] |
-| refresh debt/credit/档位/ab-pb 模式/critical 态 | 独立 refresh 模块（Ch7 M1/M2） | CQ/GSC（优先级调节） | tREFI 到期/REF 完成/档位切换 | REF 完成清账；SR 期冻结 | [RTL] |
-| RFM 激活债（per-bank ACT 计数） | refresh/RFM 模块（Ch7 M4） | FSC（达限禁 ACT） | ACT 计数 | RFM 清账（REF 冲销语义 OPEN→RF-P1-02） | [RTL] |
+| refresh debt/credit/档位/ab-pb 模式/critical 态 | DEVMGR bookkeeping（refresh control/ref_gen 生成 request；accounting/state 归 DEVMGR；Ch7 M1/M2） | CQ/GSC（优先级调节） | tREFI 到期/REF 完成/档位切换 | REF 完成清账；SR 期冻结 | [RTL·HBM] |
+| RFM 激活债（per-bank RAA counter / rfm_bit） | refresh/RFM logic（Ch7 M4） | FSC（达限禁 ACT） | ACT 计数 | rfm_bit 置位 / RFM 完成清位 | [RTL·HBM] |
+| RFM completion accounting / debt amortization | DEVMGR bookkeeping（Ch7 M1/M4） | — | RFM 完成 | debt 摊销 | [RTL·HBM] |
 | DRFM 命令生成 | DEVMGR（地址 = csrBakNDrmRowAddr，Ch7 M5） | FSC / timing counter | DEVMGR 触发生成 | tDRFM 生命周期（三寄存器） | [RTL] |
-| credit（PA↔CQ） | credit 机制（PA grant 消耗） | PA 仲裁 | PA grant | 命令离开 CAM（burst 末条） | [RTL] |
+| credit（admission quota） | UIF/credit manager（→V3） | source/class 反压 | source/class request accepted | command issue / leave-CAM 事件归还 | [RTL·HBM] |
 | write-data complete（XMU 侧：数据收齐/retention） | XMU（→V1/DP1；XMU-P1-01） | PA / WDP fetch 通路 | W 数据收齐（txn data complete） | WDP fetch（internal buffer ownership transfer） | [RTL] |
 | WDP data-ready（WDP 侧：entry 数据就绪） | WDP（→DP1） | FSC（WR 可发前提）/ DFI write-data path | WDP fetch 完成、数据入 SRAM/merge 完成 | DFI 取走数据 / WDP entry 释放 | [RTL] |
 | WDP entry 生命周期 | WDP（→DP1） | DFI 取数 | fetch 受理 | DFI 取走（ownership transfer） | [RTL] |
