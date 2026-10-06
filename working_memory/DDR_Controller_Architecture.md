@@ -74,14 +74,25 @@ Host/NoC → AXI/CHI → XMU → PA(含 Address Mapping @ grant 点) → Command
 
 横向 plane 的共同形态是"正常 traffic 如何**停、让、恢复**"——**admission / issue hold 是 transition-specific 的**（DFS/clock gate 停 front-end；LP 只 hold CS/command issue、XMU 照常接受 host request，新请求可成为唤醒源；ctrlupd/phyupd 只阻塞命令侧）：traffic control → drain required in-flight state → transition-safe quiesce → ownership/device transition → restore → validate → resume（详见 G1/Ch11）。
 
-## 0.4 Performance Loss Model（全文统一语言）
+## 0.4 Bandwidth Efficiency & Performance Attribution（带宽效率与性能损失归因）
 
-**定义**：Peak DQ BW（协议 × 位宽理论上限）；Effective BW（useful data / 时间）；**Efficiency = Effective / Peak**。分析单位 = **useful issue slot / lost issue slot**——只统计"本来有 useful work、唯一因某原因没有 issue"的 cycle。
+### 0.4.1 理论带宽 / 有效带宽 / Efficiency
 
-**统一机会链（Design View，RQ1 主链）**：
-Demand → Visibility → Locality/Parallelism → Candidate → Timing → Direction → Maintenance → Data Delivery → **Useful DQ Transfer**。每一环断掉都表现为同一症状：这一拍 DQ 空转。
+**Peak DQ BW** = DQ_width × DataRate_per_pin / 8——单 channel / PC 的理论 DQ 带宽；多 channel / PC 总带宽按真实并行实例数累加；protocol overhead 不在此讨论。
+**有效带宽口径**：本文只统计 **full read / full write**——正常完整数据包的 RD / WR command。parity write、RMW 及其他特殊数据路径**不纳入**本文 efficiency 计算（其性能代价单独分析，不混入 full RD/WR efficiency 定义）。
+**BW_effective** = 单位时间内实际发送的 full RD/WR command 数 × 单条 command 对应数据包大小 = N_full_RD_WR / T × Bytes_per_command。
+**Efficiency = BW_effective / BW_peak**。
 
-**Blocked reason taxonomy（v2，12 类）**：
+### 0.4.2 Command-count Example
+
+当 full RD/WR command 数据包大小固定、理论 command issue rate 已知时，可直接用 command count 计算：**Efficiency = 实际 full RD/WR command 数 / 理论最大 full RD/WR command 数**。
+例：tCCD_S = 2 cycle，观察窗口 10 cycle → 理论最多 10 / 2 = 5 条 full RD/WR command；实际发送 4 条 → **Efficiency = 4 / 5 = 80%**。（该例仅说明 efficiency 定义。）
+
+### 0.4.3 Performance Loss Attribution（blocked reason）
+
+blocked reason 是对"**为什么实际 full RD/WR command 数低于理论最大值**"的工程归因框架——不是严格的数学 accounting theory。
+
+**Blocked reason（12 类）**：
 
 ```
 total cycles = issued_useful
@@ -93,18 +104,16 @@ total cycles = issued_useful
              + blocked_timing         （BSC / counter 未 ready）
              + blocked_direction      （GSC 在对侧 / 切换中）
              + blocked_maintenance    （REF / RFM / DRFM / tRFC 期间）
-             + blocked_policy         （eligible 且 timing-ready 但仲裁未选）
+             + blocked_policy         （CCT 已通过 BSC/GSC 检查，但 FSC 本拍未选择）
              + blocked_data           （WDP fetch 等待 / link node 未就绪）
              + blocked_DFI_PHY        （DFI / PHY 不可用）
 ```
 
-**归因原则**：目标是 **mutually-exclusive attribution**（互斥归因、避免重复计数）。**但 taxonomy ≠ closed accounting**：同一 cycle 同时满足多个 blocker 时如何归因（precedence / ownership rule）尚未定义 = **X-P1-08 [TODO-DESIGN]**（候选：earliest causal blocker / closest-to-issue / hierarchical attribution，均未定稿）；该规则定义并验证前，不宣称上述恒等式已实现严格 cycle-level 闭合（Audit Invariant 18），Performance Attribution 保持 **PARTIAL**。
+total_cycle = issued + Σ blocked 仅作为带宽下降原因的**抽象表达**——不要求证明每个 cycle 都严格 mutually-exclusive accounting；多种 blocker 同时存在时，实际 debug 按 counter / state / trace 判断主因（X-P1-08 已 RETIRED / OUT OF SCOPE）。
 
-**Issue loss ≠ 全部 BW loss**：blocked-cycle taxonomy 当前主要刻画 **issue opportunity loss**（为什么这一拍没有 useful issue）；**payload / transfer efficiency loss**（已有命令 / DQ activity 但 useful bytes < raw transferred bytes——如 partial write、RMW amplification、burst utilization、无效 byte、协议/数据粒度放大）仍需单独闭环（**O2-P1-01 [TODO-DESIGN]**）。Peak → Effective 的完整 loss model 不等同于 Σ lost issue slots。
+### 0.4.4 Measurement Boundary
 
-**Observable ≠ Attributable**：有 counter ≠ 能直接证明唯一 root cause（互斥归因须另行成立）；无 RTL counter ≠ 不能归因（trace / performance model 可补齐）。RTL 落地形态 [RTL]：互斥归因不进 RTL——RTL 只提供命令计数 / 水位电平 / 状态观测（dbg_obv），归因在模型 / 验证环境侧完成；能推 / 不能推边界 → Ch18（O1）。
-
-**BW drop 定位链与 65% 案例 → Ch1 RQ2（O2 Playbook，本节不展开）。**
+RTL counter / state 可以直接看到一部分原因（命令计数、水位电平、状态）；没有 counter 的原因需要 trace / model 补齐；observable inventory → Ch18。debug 定位链 → Ch1 RQ2。
 
 ## 0.5 四个 Architecture View
 
@@ -192,48 +201,55 @@ Physical/System Problem → Protocol Constraint → MC Requirement → Architect
 
 ## 1.2 RQ1 — 如何设计一个高性能 Memory Controller？（Design View）
 
-**20s**：MC 性能问题只有一个统一形式——这一拍 DQ 为什么没传 useful data。我的方法是把 Peak 到 Effective 之间每一类 lost issue slot 逐一封堵：request 供给、scheduler 可见性、locality/并行度、timing 供给、方向切换、maintenance、data path。归因上我区分 observable 和 attributable：RTL counter 直接支撑的用 counter，其余用 trace / performance model 补齐。
+**20s**：高性能 MC 的目标，是让 full RD/WR command 尽可能连续发出，使持续 issue rate 接近当前 workload 下的可达上限——但不是简单堆 buffer。首先 CAM、reorder buffer、write data buffer 等资源要用尽量小的代价覆盖目标并发，正常情况下不能成为瓶颈；然后通过 address mapping、page policy 和 reorder 提高 page hit 和 bank/BG 并行度；再优化读写方向、scheduler 和 refresh 等不可避免的开销；最后保证 data/DFI path 跟得上。哪个环节先限制 command rate，就优化哪个环节。
 
-**90s Skeleton**：
-- **C**：Efficiency = Effective/Peak，由 lost issue slot 结构决定；高性能 MC = 机会链每一环都不空转。
-- **M**：Demand→Visibility→Locality/Parallelism→Candidate→Timing→Direction→Maintenance→Data Delivery 十级机会链（Ch0.4），每环对应一个或多个 Architecture Node，并使用 RTL counter / trace / model 中当前可获得的证据（并非每环已有直接 counter）。
-- **T**：每个机制都有代价——CAM 深 ↔ compare 面积/时序（非线性）；batch 大 ↔ write latency；hit-first ↔ P99；refresh postpone ↔ latency spike。
-- **P**：12 类 blocked taxonomy 是统一性能分类框架，目标是形成 mutually-exclusive attribution；precedence / ownership rule 尚未关闭（X-P1-08），因此当前 Performance Attribution 仍为 PARTIAL；observable vs attributable 分层证明（X-P1-07）。
-- **H**："具体哪类损失最大，我用一个 65% 案例演示定位过程（→RQ2）。"
+**90s 回答结构**：
+- **Conclusion**：高性能 MC = 在 PPA 约束下，用足够但不过量的资源支撑并发，再通过 mapping / reorder / scheduling / maintenance control 把 sustained full RD/WR issue rate 推近可达上限。
+- **Model / Reasoning**：outstanding / RD reorder buffer / CAM / write data buffer / credit——资源不能成为大多数正常 workload 的明显瓶颈；超过需求后继续加深不是主要性能手段。CAM 特殊：它同时决定 scheduler 可见窗口，比普通 buffer 更直接影响性能，但仍有 workload-dependent saturation point。
+- **Model / Reasoning**：address mapping / page policy / reorder / bank-BG interleave → page hit + bank parallelism + BG parallelism——用更多 row hit 摊薄 ACT，用更多 bank/BG 并行隐藏 tRCD / tRC / tRRD / tFAW / tCCD_L。
+- **Model / Reasoning**：CCT → BSC ready（bank state + AC timing）→ GSC direction allow → FSC select → command issue——mapping/reorder 给出更好的候选，BSC/GSC/FSC 决定机会是否被及时转化。
+- **Model / Reasoning**：R/W switching、rank/SID switching、refresh、RFM/DRFM——靠 batching / hysteresis / postpone-pull-in 降低暴露。
+- **Model / Reasoning**：WDP / RDP / DFI——command path 就绪时 data path 不制造新 bubble。
+- **Tradeoff**：Resource sizing——太小：full / backpressure / HOL / 性能下降；太大：area / power / compare·routing / Fmax closure / queueing latency。Mapping——偏 row locality 则 page hit↑ 但 bank parallelism 可能↓；偏 interleave 则相反。R/W batching——batch 大：switching↓ 但对向 latency / starvation 压力↑。Refresh postpone——深：平均干扰↓ 但 critical burst / spike↑。
+- **Evidence / Validation**：buffer occupancy / full、credit、CAM occupancy、ACT / RD / WR command count、R/W switch 频率、refresh 命令数、command issue rate、efficiency；必要时 trace：row hit、bank/BG 分布、blocked timing（→Ch18 边界）。
+- **追问方向**："高性能 Controller 不是 buffer 越大越好：容量类资源够用且不拖后腿，真正持续提高带宽的是能不能制造并及时利用更多合法的 RD/WR command。"（追问 CAM 时补："CAM 比普通 buffer 特殊，因为 depth 同时决定 scheduler visibility，存在 workload-dependent saturation point。"）
 
-**Deep-Dive Node Links**：V1/V2/V3（Ch2）→ L1~L5（Ch3/Ch4）→ S1/S2（Ch4）→ T1~T3（Ch5）→ D1/D2（Ch6）→ M1~M5（Ch7）→ DP1~DP3（Ch8）→ O1（Ch18）。
+**Deep Dive / 深入展开**：
+- **Resource sizing / flow control**：V1 / V2 / V3 → Ch12 XMU → Ch13 CAM/CQ → Ch16 WDP/RDP；
+- **Page hit / parallelism**：L5 → L1 / L2 / L3 / L4；
+- **Scheduling / timing**：S1 / S2 / S3 → T1 / T2 / T3 → D1 → Ch14 / Ch15；
+- **Maintenance**：M1 ~ M5 → Ch7；
+- **Data delivery**：DP1 ~ DP3 → Ch16 / Ch17；
+- measurement / observability cross-check：O1 / Ch18（放 Proof，不作主体 Node link）。
 
-**Steering**：Preferred = Measurement / blocked-cycle attribution；Secondary = CAM visibility（V2）；Do-not-volunteer = PHY analog implementation。
+**追问引导**：优先引导 = **Resource sizing / saturation**（为什么 reorder buffer / WDP 不是越大越好；如何判断 capacity"够用"；为什么 CAM 特殊；saturation point 怎么判断；PPA tradeoff）；次选方向 = **Mapping → page hit / bank-BG parallelism → timing hiding**；不主动展开 = PHY analog implementation / 没有真实数据支撑的精确性能数字 / generic textbook performance formulas。
 
 ## 1.3 RQ2 — Bandwidth 为什么没跑满？如何系统定位？（Diagnosis View · O2 Playbook）
 
-**20s**：BW 不达标我不猜 scheduler，先跑固定因果链：no request → admission → visibility → dependency → candidate → timing → direction → maintenance → policy → data ready → DFI/PHY → issued-but-inefficient，逐层排除，每层对应 taxonomy 中的一类候选 blocker（cycle-level 互斥归属规则仍为 [TODO-DESIGN]）——先证明"不缺 request"，再定位是哪一类 opportunity 被浪费。
+**20s**：带宽没跑满时，我先用理论 full RD/WR command 数与实际发送数算 efficiency，确认实际损失有多少。然后沿真实 command path 找 bubble：请求是否充足 → 能否进入 CAM → 是否形成 CCT → BSC 当前是否 ready → GSC 当前方向是否允许 → FSC 是否选中 → data path / DFI 是否 ready。哪一级让本来可以形成的 RD/WR command 没发出去，就继续向该级展开。
 
-**诊断链（diagnostic traversal order，用于系统排查；≠ mutually-exclusive attribution precedence——X-P1-08 关闭前两者严格分离）**：
+**诊断链（沿真实 command path 的排查顺序）**：
 
 ```
-No useful request?（上游 / ostd）→ Admission / backpressure?（credit、XMU 反压）
-→ No scheduler visibility?（入队瓶颈、Pending 队头阻塞）→ Dependency blocked?（RAW/WAR/WAW/RMW）
-→ No eligible candidate?（CCT 空——CAM 分布 / mapping）→ Timing blocked?（BSC / counter——哪条 timing？）
-→ Direction blocked?（GSC 批量 / 切换阈值）→ Maintenance blocked?（REF / RFM / DRFM）
-→ Scheduler policy bubble?（eligible 且 ready 但未选）→ Data not ready?（WDP / link node）
-→ DFI / PHY unavailable?（ratio / phase / training）→ Issued but DQ inefficient?（BL / burst 合并 / turnaround）
+请求够不够？（上游 / ostd）→ 能不能进？（credit / XMU 反压）
+→ CAM 里有没有可见请求？（入队瓶颈 / Pending 队头阻塞）→ 有没有形成 CCT？（CAM 分布 / mapping）
+→ BSC 是否 ready？（bank FSM / AC timing——哪条 timing？）
+→ GSC 是否允许当前方向？（批量 / 切换阈值）
+→ 是否被 maintenance 占用？（REF / RFM / DRFM）
+→ FSC 是否选中？（本拍仲裁）
+→ 数据是否 ready？（WDP fetch / link node）
+→ DFI / PHY 是否可用？
+→ 最终有没有发出 full RD/WR？
 ```
 
 **九步推理模板（每个 Performance Node 都必须能走通，走不通 = PARTIAL）**：
 Symptom → Observable → Bottleneck Hypothesis → Architecture Cause → Design Knob → Expected Effect → Side Effect → Experiment → Conclusion。
 
-**示例案例 [MODEL EXAMPLE]：假设 BW = 65% Peak（演示推理模板，非项目实录；唯一宿主）**：
-- **Symptom**：streaming 为主的 workload，BW 只有 65%。
-- **Observable**：CAM occupancy 高（cam_outnum 电平持续 ≥ 阈值）＋ FSC 无命令输出拍多。
-- **Hypothesis 排除**：CAM occupancy 高 → V1 Demand shortage 不像首要原因（scheduler 已看到较多 request）；但 **V3 Admission 不能仅凭 CAM 高排除**——可能存在 credit 耗尽 + upstream 持续被 backpressure（那是下游堵塞的传播结果，未必 root cause），需继续确认 credit / fifo_full / backpressure 状态；继续分叉：candidate? / timing? / direction? / maintenance? / policy? / data?
-- **假设定位 A**：ACT 计数 / col 比偏高、tRRD/tFAW blocked cycles 占主导 → random 成分 / ACT supply 受限（L1 miss → T2）→ **Knob** = mapping（L5）/ page policy（L4）→ 预期 hit rate↑、ACT↓；副作用 = BLP 分布变化；**Experiment** = stride sweep + ACT/col 计数 + lost-slot Top5。
-- **假设定位 B**：turnaround lost cycles 占主导 → 方向切换（D1）→ **Knob** = 水线 / 批量阈值；预期 switch/sec↓；副作用 = write queue latency↑（用 R/W latency 观测验证）。
-- **Conclusion**：按 blocked 占比排序逐项修；observable 缺口（hit rate、P99 无 RTL counter）用 trace / performance model 补齐，并声明 attributable 边界（Ch18 能推/不能推表）。
+**示例推演 [MODEL 范例，简化]**：以"CAM 有请求但 CCT 偶尔为空"为例——Observable：CAM 非空 + CCT 空 → Hypothesis：分布/映射问题或依赖拦截 → 验证：按 bank 分布统计 + 依赖 trace → 结论指向对应 Node。完整分叉推演从略（避免虚构数据）。
 
 **Deep-Dive Node Links**：O2（本节，方法学）→ O1（Ch18，证据边界）→ 各 blocked reason 对应 Node（V1~DP3）。
 
-**Steering**：Preferred = 65% 案例完整走一遍；Secondary = counter 能推/不能推的诚实边界；Do-not-volunteer = SoC / NoC 内部实现。
+**追问引导**：优先引导 = efficiency 度量 + 沿 command path 逐级定位；次选方向 = counter 能推/不能推的诚实边界；不主动展开 = SoC / NoC 内部实现。
 
 ## 1.4 RQ3 — 为什么 Controller 需要深 outstanding / CAM？
 
@@ -272,13 +288,18 @@ Symptom → Observable → Bottleneck Hypothesis → Architecture Cause → Desi
 
 ## 1.7 RQ6 — Scheduler 如何选择下一条 command？
 
-**20s**：我把"能不能调"和"发不发"拆成一条六级链——CCT 提名 **Eligible**（三层 filter、per-bank 单槽、上表不可撤回）→ **BSC-ready**（bank FSM ∩ timing counter）→ **Direction-legal**（GSC）→ **Executable** → FSC **Selected**（Col>Row）→ **Issued**。policy 是可配置的 priority-first / page-hit-first 双模式 + GPR aging 兜底；aging / expired GPR 是防 starvation 的核心机制，真正的 worst-case service bound 还依赖 CCT slot release、direction progress、timing legality 等条件——无形式化 bound 时不宣称严格 cycle 上界（S3-P1-01 [TODO-DESIGN]）。
+**20s**：CS 分三层理解——**BSC** 维护每个 bank 的状态和 AC timing，告诉后级这个 bank 当前允许做什么；**GSC** 结合 CCT 请求、读写方向、SID、priority/aging、oldest/RR 等，从 normal traffic 中选出这一拍准备执行的 bank/command；**FSC** 把 GSC 的 normal command 与 refresh、DEVMGR 等请求统一仲裁，生成真正送到 DFI 的命令。命令实际执行后，通过 executed feedback 更新 BSC 状态、CQ/CCT 和 DEVMGR。policy 是 priority-first / page-hit-first 双模式 + GPR aging 兜底；aging / expired GPR 是防 starvation 的核心机制——无形式化 bound 时不宣称严格 cycle 上界（S3-P1-01 [TODO-DESIGN]）。
 
-**90s Skeleton**：C=eligible vs executable 二分是调度正确语言；M=为什么 FCFS 不行（head-of-line miss 拖死后续 hit）、hit-first 的收益来源（省 tRCD+tRP）；T=hit-first 的 P99 / 公平代价、CCT 单槽换简单与不可撤回（timing/area/verification）；P=policy A/B 对比（BW/avg latency/P99/starvation time）[X-P1-07]。
+**90s 回答结构**：
+- **Conclusion**：**BSC / GSC / FSC 不是三个同构 scheduler 串联**——BSC 管 legality/state、GSC 管 normal traffic global selection、FSC 管最终多源命令仲裁与发令。
+- **Model / Reasoning**：BSC 只看 bank state + AC timing——输出 bank legality；GSC 在 legality 允许范围内，从 CCT normal candidates 中做 policy 选择（priority-first / page-hit-first + aging）；FSC 把 GSC normal command 与 refresh / DEVMGR 汇合做最终仲裁，形成 DFI 命令；命令执行后反馈更新 BSC 状态 / CQ 释放 / DEVMGR 记账。
+- **Tradeoff**：hit-first 的 P99 / 公平代价、CCT 单槽换简单与不可撤回（timing/area/verification）。
+- **Evidence / Validation**：policy A/B 对比（BW/avg latency/P99/starvation time）[X-P1-07]；BSC legality 表 / GSC 选通信号 / FSC 输出命令流。
+- **追问方向**：为什么 FCFS 不行（head-of-line miss 拖死后续 hit）、hit-first 的收益来源（省 tRCD+tRP）；三层各管什么、边界在哪；refresh / DEVMGR 命令从哪里进入仲裁。
 
-**Deep-Dive Node Links**：S1/S2/S3（Ch4）→ T1（timing ready）→ Ch14 BSC/GSC/FSC Reference。
+**Deep-Dive Node Links**：S1（Ch4 CCT）/ S2（Ch4 GSC）/ S3（Ch4 FSC）→ T1（timing ready）→ Ch14 CS Reference。
 
-**Steering**：Preferred = eligible vs executable 二分；Secondary = hit-first 的 P99 反例；Do-not-volunteer = 三层 filter RTL。
+**追问引导**：优先引导 = BSC/GSC/FSC 三层职责边界（为什么不是串联）；次选方向 = hit-first 的 P99 反例；不主动展开 = 三层 filter RTL。
 
 ## 1.8 RQ7 — 为什么 R/W switching 是主要性能损失？batch 怎么定？
 
@@ -837,7 +858,7 @@ tCCD_L/tRRD_L 表明同 BG 的 bank 共享资源（局部命令/激活路径）�
 # 4. Command Opportunity & Reordering（S1 / S2 / S3 + L4）
 
 > **本章核心问题：当大量 request 已经可见时，如何挑出"最值得现在执行"的 command？**
-> 判定语言：**Eligible**（CCT 上表候选）→ **BSC-ready**（bank FSM ∩ timing counter）→ **Direction-legal**（GSC）→ **Executable**（三者齐备，进入 final arbitration）→ **Selected**（FSC winner）→ **Issued**（下发 + state/counter update）——"能不能调"（CQ）与"能不能发"（BSC+GSC legality）是正交判断，串联后相与 [RTL·六层口径，权威定义 → Ch14.3]。
+> 判定语言：**CCT**（Command Candidate Table，候选表）→ **BSC ready**（bank state ∩ AC timing）→ **GSC direction allow** → **FSC select** → **command issue**（下发 + state/counter update）——"能不能调"（CQ）与"能不能发"（BSC+GSC legality）是正交判断，串联后相与 [RTL·六层口径，权威定义 → Ch14.3]。
 
 ## 4.1 S1 — Command Eligibility（CORE）
 
