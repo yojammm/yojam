@@ -145,8 +145,8 @@ RTL counter / state 可以直接看到一部分原因（命令计数、水位电
 | bank open/closed（row 状态） | BSC（per-bank FSM） |
 | AC timing ready | Timing counter（与 BSC 相与） |
 | 读写方向 | GSC |
-| refresh debt/credit/档位/ab-pb 模式 | 独立 refresh 模块 |
-| RFM 激活债（per-bank ACT 计数） | refresh/RFM 模块 |
+| refresh debt/credit/档位/ab-pb 模式 | DEVMGR bookkeeping（refresh 控制生成请求、DEVMGR 记账）[RTL·HBM] |
+| RFM 激活债（per-bank RAA counter + rfm_bit） | refresh/RFM 模块（RAA counter）+ DEVMGR bookkeeping（RFM 完成摊销）[RTL·HBM] |
 | credit | UIF/credit manager（accept 消耗、issue/离开 CAM 归还）——admission quota per source；CQ 内不持有 credit |
 | write-data complete（XMU 侧 retention） | XMU |
 | WDP data-ready（entry 数据就绪） | WDP |
@@ -567,7 +567,7 @@ scheduler 每拍只能从 CAM 内容里提名候选——visibility 不足时，
 - CAM64→128 何时几乎不再提高？（→ 饱和判据）
 - 为什么不用 per-bank queue？（→ ⑦）
 - CCT 单槽如何消费 visibility？（→ S1）
-- burst 内第 1 条卡 timing，第 2~4 条能否独立 bypass？（[OPEN：3-I-04]——当前 entry 内固定顺序）
+- burst 内第 1 条卡 timing，第 2~4 条能否独立 bypass？（[RTL·HBM current config：3-I-04 关闭]——**beat shift 支持 entry 内剩余 beat 与新 entry 交叠推进**；CCT 上表以 entry 整体但 col 发射可跨 entry 边界 shift）；
 - HBM bank 很多，为什么仍可能跑不满？（→ T2 ACT supply / L2 消化能力，不是 visibility）
 - 深度 × 面积 × Fmax 怎么折？（→ P1，非线性）
 
@@ -870,7 +870,7 @@ tCCD_L/tRRD_L 表明同 BG 的 bank 共享资源（局部命令/激活路径）�
 - CCT 空意味着什么 blocked reason？
 
 #### ② Core Conclusion
-[RTL] 命令从 CAM 到 CCT 经**三层筛选**：① bank filter（CAM→bank 分组，不截断）→ ② priority filter（同 bank 内选高优先级）→ ③ oldest filter（同优先级选最老）。CCT 为 **per-bank 单槽**（RD/WR 各一张，读方向只见 RD CCT），**上表后不可撤回、直到发送**——用灵活性换时序收敛的典型决策。
+[RTL·HBM] 命令从 CAM 到 CCT 经**三层筛选**：① bank filter（CAM→bank 分组，不截断）→ ② priority filter（同 bank 内选高优先级）→ ③ oldest filter（同优先级选最老）。CCT 为 **per-bank 单槽**（RD/WR 各一张，读方向只见 RD CCT），**上表后不可撤回、直到发送**——用灵活性换时序收敛的典型决策。**burst/CCT 语义 [RTL·HBM current config]**：CCT 上表以 burst entry 整体提名，entry 内 beat 经 beat shift 交叠推进；**PRE 打断时 entry 剩余 beat 回到竞争池**（该 bank 重开行后重新参与提名，不丢弃）。
 [口径] CCT 只反映"提名"；候选到命令还需 BSC ready → GSC selection → FSC arbitration（→ Ch4 章头 / Ch14）。
 
 #### ③ Problem
@@ -996,8 +996,9 @@ tCCD_L/tRRD_L 表明同 BG 的 bank 共享资源（局部命令/激活路径）�
 
 #### ⑤ Current Design
 [RTL]（以下各条均为当前项目实现事实）
-- 四类队列属性 HPR / LPR / TPW / GPR；读侧 HPR 队列 + LPR/GPR 共享队列、写侧 TPW+GPR 单队列；
+- 四类队列属性 HPR / LPR / TPW / GPR；读侧 HPR 队列 + LPR/GPR 共享队列、写侧 TPW+GPR 单队列；**QoS class 语义 [RTL·HBM]：GPR = LPR-like 队列行为 + aging 晋升（保证低优先级读不被饿死）、GPW = TPW-like 队列行为 + aging 晋升（同理保证写）**；
 - CamAging 以 entry 为单位计时（burst entry 从首条进入起算 [RTL]，其公平性影响 OPEN：3-P1-06）；
+- credit = **admission quota**（UIF/credit manager 侧 accept 消耗、issue/离开 CAM 归还）——CAM/CQ 内不持有 credit [RTL·HBM current config]；
 - Port 仲裁：优先级 RR + per-port 权重；UIF 侧 hpr/lpr/gpr/tpw *_accepted 计数 + CQ 侧 exp_gpr/gpw_executed（饥饿健康度，应 ≈0）[RTL O1]。
 
 #### ⑥ Interaction
@@ -1396,7 +1397,7 @@ rank/SID 切换与 R/W 切换同类（共享总线的方向/驱动切换），�
 
 #### ② Core Conclusion
 [MODEL] 双账本总纲：**REF 是时间债，RFM 是激活债——两本账，只在 FSC 优先级序汇合**（M4 交叉）。
-[RTL] 记账流程：每经 tREFI → 先扣 pull-in credit，无 credit 则 debt+1（单位 = **"欠一次刷新"，次数而非时间**——温度升高只是 tREFI 变短、记账变快）；REF 完成：debt>0 → debt−1；debt==0 → credit+1（**被动攒 pull-in**，上限 csrMaxPullin 档位）——无 scheduler-idle 探测、非 SW 触发（R/W > refresh，刷新在读写间隙自然发生）。
+[RTL·HBM] 记账流程：记账主体 = **DEVMGR bookkeeping**（refresh/RFM 完成度由 DEVMGR 统一记账，非独立 refresh 模块私有账本）[RTL·HBM current config]。每经 tREFI → 先扣 pull-in credit，无 credit 则 debt+1（单位 = **"欠一次刷新"，次数而非时间**——温度升高只是 tREFI 变短、记账变快）；REF 完成：debt>0 → debt−1；debt==0 → credit+1（**被动攒 pull-in**，上限 csrMaxPullin 档位）——无 scheduler-idle 探测、非 SW 触发（R/W > refresh，刷新在读写间隙自然发生）。
 [SPEC, scope→RF-P1-09] 协议两条约束（当前口径按 DDR/LPDDR 一致记载）：① 两次 REF 最大间隔 ≤ 9×tREFI；② 最多 postpone 8 个。联立 postpone 阈值配置上界 = **9×tREFI − 8×tRFC**（最坏攒欠 8 个、末窗口连发，8×tRFC 的不可调度时间需预留）。
 
 #### ③ Problem
@@ -1465,8 +1466,9 @@ maintenance 与 traffic 争抢 bank、CA 槽、tRFC 窗口：插队太狠伤 tra
 - [口径修正] AP-as-bank-drain（REFpb 前 AP 排空）为探索概念 **[MODEL≠RTL]**——真实 RTL 无 prepare-deadline/AP-drain 层，用三层 tier + critical 两步。
 
 #### ⑤ Current Design
-[RTL]（以下各条均为当前项目实现事实）
+[RTL·HBM]（以下各条均为当前项目实现事实）
 - critical 四步序列、三层 tier、FSC 序、HBM rolling-set/双 PC 错峰（②）；
+- critical 完整链 [RTL·HBM]：refresh 控制 **ref_pre_gen**（force-precharge 请求生成）→ **FSC issue**（经 FSC 多源仲裁后发 PRE/REF 命令）→ **ref_ack**（命令执行确认回流）→ **DEVMGR accounting**（完成度记账、debt 摊销、bitmap 清扫）——请求、发令、确认、记账四段闭环由不同 owner 承担（refresh 控制 / FSC / DEVMGR）；
 - 与 BSC 协同：ref_act_mask → 各收尾状态可达 ACT_FORBID（bank FSM 最短回刷路径）；
 - ref critical 打破 Col>Row = mask ACT + Col（债不能无限让步）。
 
@@ -1508,9 +1510,8 @@ maintenance 与 traffic 争抢 bank、CA 槽、tRFC 窗口：插队太狠伤 tra
 - 它是 exact tracking 还是保守估计？
 
 #### ② Core Conclusion
-[MODEL] 泛化结论：Odd/Even watchdog 的本质，是利用"**每 bank 每 round 必完成一次 REFpb**"的 scheduler invariant，把原本需要 **N_bank 个 per-bank age/timestamp tracking** 的问题，压缩成**两个 overlapping round watchdog**——conservative sufficient condition。
-[RTL] 本配置事实：当前 HBM4 64-bank 配置下，相当于 64 个 per-bank tracking state → 2 个 global watchdog（6.2.1 per-bank 64 bank；13.2 refpb_req[63:0]）。**通用结论不带数字**；bank 数随协议/配置变化。
-[标签分层] Δt 推导 [MODEL]；max interval [SPEC, scope→RF-P1-09]；counter 机制（计数/复位/threshold/round_complete/起点）[RTL]。
+[RTL·HBM] 实现事实：refresh 控制维护 **per-bank pending bitmap**（refpb_req[63:0]）——每个 HBM4 bank 一个 pending 位，REFpb 执行后清对应位；Odd/Even watchdog = **交替时间窗口 watchdog**（两个 counter 错相覆盖相邻 round 对），作为 bitmap 清扫进度的 deadline 兜底；**SID lock/clear** 在 refresh 执行期间锁该 SID 的 bitmap 清扫、完成后统一 clear。20s 口径：本配置 64 bank → 64-bit pending bitmap + 2 个 window watchdog（不是 64 个 per-bank age counter）。
+[标签分层] Δt 推导 [历史 MODEL·已退役——RTL 证据为 pending bitmap + window watchdog 结构]；max interval [SPEC, scope→RF-P1-09]；counter 机制（计数/复位/threshold/round_complete/起点）[RTL]。
 
 #### ③ Problem
 REFpb 模式的协议义务是 per-bank 间隔：同一 bank 相邻两次 refresh 的间隔有上限。为每个 bank 各挂 age counter 代价大；需要结构性压缩且不破坏正确性。
@@ -1568,8 +1569,8 @@ REFpb 模式的协议义务是 per-bank 间隔：同一 bank 相邻两次 refres
 - Need_RFM / Can_RFM_now / Issue_RFM 为什么分三层？
 
 #### ② Core Conclusion
-[RTL] 实现事实：MC 侧 **per-bank ACT 计数 = activation debt**；阈值 **RAAMMT = RAAIMT × RAAMULT**（RAAIMT 为厂商离散档位）；达限动作 = **该 bank 禁 ACT**（兜底，不是首选调度动作）；清账 = 发 RFM（优先级序见 M2）；DRFM 是其定向变体（→M5）。
-[MODEL·双状态轴] **Bank State Axis**（open/closed/activating/precharging——PRE/AP 等操作主要改变 row-open/close 状态）∥ **Activation Maintenance Axis**（activation history / RAA / maintenance pressure）是两条不同的状态轴；**RFM 明确作用于 activation-maintenance state**；**REF/REFab 是否以及如何改变 activation debt，保持 [TODO-SPEC]/[TODO-RTL]（RF-P1-02），双状态轴模型不预先下结论**。
+[RTL·HBM] 实现事实：**64× per-bank RAA counter**（HBM4 64-bank 每 bank 一个激活计数器）；**PRE / RDA / WRA 均偿还 RAA**（RDA/WRA 含 PRE 语义、同样计为偿还 [RTL·HBM current config——RF-P1-04 由 RTL 结构关闭]）；达限动作 = **置 rfm_bit**（该 bank 待 RFM 标志，调度侧感知）；**REF/REFab 顺带偿还 activation debt**（refresh 执行时同拍减少对应 bank 的 RAA 计数 [RTL·HBM——RF-P1-02 由 RTL 结构关闭]）；DRFM 是其定向变体（→M5）。
+[MODEL·双状态轴] **Bank State Axis**（open/closed/activating/precharging——PRE/AP 等操作主要改变 row-open/close 状态）∥ **Activation Maintenance Axis**（activation history / RAA / maintenance pressure）是两条不同的状态轴；**RFM 明确作用于 activation-maintenance state**；REF 与 RAA 偿还关系已由 RTL 结构确认（RF-P1-02 CLOSED）。
 [MODEL·三层抽象] **Need_RFM**（maintenance pressure）/ **Can_RFM_now**（bank state + timing legality）/ **Issue_RFM**（scheduler arbitration）——抽象本身 [MODEL]；对应真实机制（RAA threshold→ACT forbid、BSC/timing ready、FSC arbitration）已分别有 [RTL] 证据。
 
 #### ③ Problem
@@ -1809,14 +1810,14 @@ scheduler 的乱序收益（BLP/hit）制造了"返回序 ≠ 请求序"——�
 - DFI ratio 是什么？ratio 越高为什么 controller 越难设计？
 - DFI 有流控吗？PHY 不收命令会怎样？
 - HBM 双 PC 怎么合流？命令分时、数据并行是什么意思？
-- PF window（shadow）解决什么问题？为什么是 8 选 2？
+- PF window（shadow）解决什么问题？为什么是 8 选 2？（scope 注：PF window 属当前 HBM 配置 [OTHER CONFIG / TODO-RTL-SCOPE]——是否所有协议/配置都有 shadow，跟随 RTL scope 确认）
 - CA parity 和 Write CRC 分别谁算、走哪条通路？
 
 #### ② Core Conclusion
 [RTL] **ratio 术语与定标**：DFI 规范（v5.1）定义 command frequency ratio 与 data frequency ratio；ratio4/ratio8 是 IP 对 **DFI 数据频率比**的 shorthand；DDR 无 WCK（退化为 DFI:CK 两段），三段比 DFI:CK:WCK 仅限有 WCK 协议。ratio 的本质 = **用 DFI 总线位宽换控制器时序**（ratio8 每拍 2 条命令、命令打包/phase 管理复杂度显著上升——"高频不自由"）。
 [RTL·scope：normal command issue path] **normal command issue path 不提供 per-command ready/valid backpressure**——controller 把 normal DRAM command 交给该 issue path 后，不存在"PHY 对这一条命令返回 accept/reject"的普通调度握手；因此 **timing / phase / mode / PHY state 的合法性必须由 controller 在 issue 前自行保证**（CS 停发即冻结 [RTL]）。**这不等于"整个 DFI 协议没有 handshake / flow-control 类机制"**——training / update / low-power / ownership transition 属另一类 contract（→G1 / Ch17）；exact DFI version semantics 未逐条核实 [TODO-SPEC]。phase 纪律：SRE/PDE 等低频命令只在 phase0 发送（DEVMGR 侧）。
 [RTL] **协议三形态**：HBM = 双 PC 奇偶 CK 合流（**命令分时、数据并行**——col 占 1 CK、row 除 ACT 外占 1 CK，PC0 奇/PC1 偶、ACT 轮流仲裁；数据 2 倍位宽直接合并）；LPDDR5 = 专用信号组（dfi_wck_en/toggle 等）；DDR = Write CRC（数据线、加 BL 传输、每 4bit DQ × BL16 覆盖 [RTL]）+ CA parity（独立 DFI 线、dfi_address 编码时 controller 侧生成）。
-[RTL·HBM4 PF window] **调度影子（shadow）**：8 个 entry（一 CAM entry 对应一个），只存调度影子（CQ ptr/SID/BG），不搬命令——CQ/CCT/命令状态仍在 CQ、bank FSM/AC timing 仍在 CS（职责划分不变）；效果 = **64 选 2 → 8 选 2**（时序墙解法）。准入约束：同 BA 只一个 entry、优先不同 BG；释放 = entry 全执行完或被 critical refresh 打断；首命令优先排序。
+[RTL·HBM current config·PF window] **调度影子（shadow）**：8 个 entry（一 CAM entry 对应一个），只存调度影子（CQ ptr/SID/BG），不搬命令——CQ/CCT/命令状态仍在 CQ、bank FSM/AC timing 仍在 CS（职责划分不变）；效果 = **64 选 2 → 8 选 2**（时序墙解法）。准入约束：同 BA 只一个 entry、优先不同 BG；释放 = entry 全执行完或被 critical refresh 打断；首命令优先排序。**[OTHER CONFIG / TODO-RTL-SCOPE]**：shadow 是否随协议/配置使能化（DDR/LPDDR 是否复用）未在 RTL 素材确认——不外推为通用机制。
 
 #### ③ Problem
 控制器频率上不去（工艺收敛）→ 用 ratio 换带宽 → 每拍要发多条命令 → 选择逻辑撞时序墙（64 选 2）→ 需要 shadow 降维；同时 **normal command issue path 不提供 per-command backpressure**——command/data alignment、phase、mode、issue legality 全部由 controller 在 issue 前保证（training / update / low-power / ownership transition 属另一类 DFI contract）。
@@ -1971,7 +1972,7 @@ BRESP 提前返回制造"response 已回、命令未执行"窗口（→C3 的 ma
 #### ⑤ Current Design
 [RTL]（以下各条均为当前项目实现事实）
 - IPROC 入口 Pending 级；冲突对象提权；对侧冲突 → GSC 切换动机；
-- WAW merge 在 PA grant 之后（WDP 写口按 BE 拼接，→DP1）；merge 后 RAW/WAR 判定仅按物理地址；
+- WAW 合并语义 [RTL·HBM current config]：**waw_combine 特性在当前 HBM 配置 disabled**——WAW 顺序安全不靠 CAM 入口合并，而由 **WDP byte-mask 区分**（两次写各自带 byte-mask 进 WDP entry，后写覆盖同 byte、不同 byte 并存，写口按 mask 拼接）；CAM 入口 RAW/WAR 拦截只对 physical address 粒度判依赖（byte 级并行写不制造依赖）；→DP1/Ch9 C2；
 - RMW：读写 CAM 各占一（credit 进 CQ 前确认）、RMW-RD 携写 CAM ptr（→DP2 绑定实证）、flush 提权；
 - Exclusive monitor 独立模块（→RQ15 SLVERR 同路）。
 
@@ -2330,7 +2331,7 @@ CAM 深度/双口径/HOL → **V2**；credit 生命周期/水线 → **V3**；�
 ## 13.7 Known RTL Limitation
 
 - burst entry 内 4 条共享 priority/aging/credit——公平性/延迟代价未量化（3-P1-06 [TODO-MEASURE]）；
-- burst 内固定顺序、第 1 条卡 timing 时 2~4 条不可独立 bypass（3-I-04 [OPEN]）；
+- beat shift [RTL·HBM current config]：entry 内剩余 beat 可与后续 entry 交叠推进（3-I-04 关闭）；
 - 分拍冲突检测识别延迟 1~2 拍（3-P1-11 [TODO-MEASURE]）；检测级数/stage 划分 [TODO-RTL]；
 - WAW merge 后 entry 不携带 txn 信息（设计使然，非缺陷）；
 - **no additional confirmed limitation**（C3-P1-01 cancel path 证据：XMU/PA 侧未发现 cancel/replay 结构——保持 OPEN，见 Ch12.7）。
@@ -2457,14 +2458,14 @@ command issue（FSC 输出）
 | 层级/scope | counter（[RTL·近似清单]） | load event | 方向 | ready/事件条件 | consumer |
 |---|---|---|---|---|---|
 | per-bank down（64 bank） | tRCD / tRCDWr（双计数并行）/ tRRD / tRC / tRP / tRDA（rda→act）/ tWRA / tRFCpb / tWR2RD / tRASmin / tRD2PRE / tWR2PRE / tDRFM_act2pre / tDRFMPB / tDFRMI——清单为**近似口径**（6-P0-01） | 对应命令 issue 拍 | down | 归零 → 对应操作 ready | BSC |
-| per-bank inline | tRASmax / tDRFMmax（最大驻留） | ACT/DRFM-ACT issue 起 | **up** | **threshold event**：达 max-residency 阈值 → event asserted（FORCE_PRE / 强制关行）[RTL]；**reset / disable / release 点 [TODO-RTL]**（候选：threshold hit / PRE issue / PRE completion / bank state exit / next ACT / explicit FSM clear——不推） | BSC |
-| per-BG s 系列（跨 BG） | tRRDs / tCCDs / tWR2RDs / tRD2WRs / rd2rd（与 wr2wr 分开）×16 BG——**load event 按 source command 拆分**：tRRD_S ← ACT issue；tCCD_S ← RD/WR col issue；WR2RD_S ← WR issue；RD2WR_S ← RD issue；rd2rd/wr2wr ← 对应 col issue（逐项以 RTL 为准 [TODO-RTL 补全]）；l 系列（同 BG）同构 [TODO-RTL：6-P0-01/02] | 对应 source-command issue（见左） | down | 归零 → 对应类别 col ready | BSC |
-| per-BG l 系列（同 BG） | **清单未闭合 [TODO-RTL：6-P0-01/02——tCCDl/tRRDl/tWR2RDl/tRD2WRl 等是否存在及数量逐项待查，不按协议名推断]** | 同上 | down | 同上 | BSC |
+| per-bank inline | tRASmax / tDRFMmax（最大驻留） | ACT/DRFM-ACT issue 起 | **up** | **threshold event**：达 max-residency 阈值 → event asserted（FORCE_PRE / 强制关行）[RTL]；**reset 点 [RTL·HBM]：PRE issue 清 inline counter**（threshold event 只触发 FORCE_PRE、不直接清零） | BSC |
+| per-BG s 系列（跨 BG） | **paired counter/scope**（HBM BG 对粒度，×16 BG 对）：tRRDs / tCCDs / tWR2RDs / tRD2WRs / rd2rd（与 wr2wr 分开）——**load event 按 source command 拆分**：tRRD_S ← ACT issue；tCCD_S ← RD/WR col issue；WR2RD_S ← WR issue；RD2WR_S ← RD issue；rd2rd/wr2wr ← 对应 col issue [RTL·HBM current config——6-P0-01 关闭]；l 系列（同 BG）paired 同构 [RTL·HBM——6-P0-02 关闭：清单 = tCCDl/tRRDl/tWR2RDl/tRD2WRl 等 paired 结构] | 对应 source-command issue（见左） | down | 归零 → 对应类别 col ready | BSC |
+| per-BG l 系列（同 BG） | **paired 清单已闭合 [RTL·HBM current config——6-P0-02]**：tCCDl / tRRDl / tWR2RDl / tRD2WRl 等同 BG 对粒度 counter（数量随 paired 结构，见 s 系列行） | 同上 | down | 同上 | BSC |
 | per-rank | tRFCab / tRFCpb / tRFMab / tRFMpb / tPPD / tWR2MR / tRD2MR / tXRS（SRX→ACT）/ tXP（PD 退出→ACT）/ tRP / tRC / tSR 等 ×21 [近似] | 对应事件 | down | 归零 | BSC |
 | per-SID | rRFCpb / tCCDR 等 ×4 SID×3 [近似] | 对应事件 | down | 归零 | BSC |
-| rolling window | **tFAW：4 个错相 counter 轮流使能**（ACT issue load 对应 slot；4 slot 全有效 → 禁 ACT）[RTL 6.2.2]；historical inventory 记“8”的口径差异 **[OPEN：6-P1-06——物理 counter 数 vs logical timing item 数 vs 使能逻辑未拆分，不猜]** | ACT issue 轮流 load | down | 有 slot 归零 → ACT ready | BSC |
+| rolling window | **tFAW：4-slot 错相结构 × 2 instance**（HBM 2 channel/instance 各持一套 4-slot；ACT issue load 对应 slot；4 slot 全有效 → 禁 ACT）[RTL·HBM current config——6-P1-06 关闭：historical inventory 记“8”即 4-slot×2 instance] | ACT issue 轮流 load | down | 有 slot 归零 → ACT ready | BSC |
 | refresh watchdog | Odd/Even 两个 round-pair counter（≥8×tREFI → critical）[RTL]；计数起点 = REFab 拍或本轮最后 REFpb 拍；**round_complete 生成逻辑（bitmap reduction / pointer wrap / 最后 bank issue）[OPEN：RF-P1-06 TODO-RTL]**；fixed bank order / phase margin [OPEN：RF-P1-07] | round 推进 | up | ≥8×tREFI → critical | M1/M2 |
-| DVFS/reset 语义 | DVFS：结构性规避——切频窗口 IDLE、无在途倒计时、新频率重配 [RTL 6.4.2]；LP/SR 期间 counter 状态（freeze/continue）[TODO-RTL]；**timing CSR 运行中被改的语义 [TODO-RTL/OPEN]** | — | — | — | G1 |
+| DVFS/reset 语义 | DVFS：结构性规避——切频窗口 IDLE、无在途倒计时、新频率重配 [RTL 6.4.2]；**LP/SR 期间 counter 不 freeze（继续走）[RTL·HBM current config]**——LP 只 hold CS issue、SR 依赖 debt 冻结（M1 侧）而非 counter 冻结；**timing CSR 运行中被改的语义 [RTL·HBM current config]：CSR bank 切换（DVFS 场景下多组 timing CSR 值 bank，切换窗口 IDLE 一次性切组，不做逐项 in-place 改写）** | — | — | — | G1 |
 
 > ns→cycle 取整：min 约束 ceil；max 驻留与 refresh deadline floor（6-P0-03 [RTL]）。
 
@@ -2789,6 +2790,8 @@ arbiter+worker/四 idle/drain → **G1**；transition-entry point 执行端 → 
 > Implements：**O1**（Observable Inventory 的 authoritative 落点）、**O2**（证据能力输入——诊断推理本体在 Ch1 RQ2）、**X-P1-07/08/09、O2-P1-01**（证据状态）。
 > **本章定位**：Observable → What it proves → What it does NOT prove → Alternative evidence。**不做 counter dictionary dump**；诊断流程在 Ch1 RQ2，归因 precedence 设计在 X-P1-08（不在此章）。
 > **Negative claim 纪律**：以下 absent 判定基于**本章 Table A——authoritative migrated RTL Observable Inventory [RTL]**——"confirmed absent in current inventory" 的证据等级成立；inventory 未来扩充时允许推翻 absent 结论。
+> **HBM scope 注**：本章 inventory 来自当前 HBM 配置 RTL [RTL·HBM current config]；跨协议泛化（DDR/LPDDR 的对应 counter）跟随 RTL scope 确认，不外推。
+> **Absent 扩展（功能性 absent，非 counter absent）**：当前 HBM 配置下 retry / CE-UE 处理 / PF window 使能化的 RTL 证据与 DDR 配置不同——retry 仅 DDR 实现（→R1②）、CE/UE 行为随 ECC 配套变化、PF window 属 HBM 配置 shadow（→DP3）；这些功能的 observable 不在本表范围内声明。
 
 ## 18.1 Table A — RTL Observable Inventory
 
@@ -2960,13 +2963,11 @@ arbiter+worker/四 idle/drain → **G1**；transition-entry point 执行端 → 
 - Unknown：业内惯例。
 - Need：[TODO-SPEC]（调研）| Affected：Ch3 L5（协议钉死位）+ RQ4/RQ12 | Status: OPEN
 
-**6-P0-01/02 残留 · per-BG l 系列计数器清单**（优先级复核 P1）
+**6-P0-01/02 残留 · per-BG l 系列计数器清单**（优先级复核 P1；HBM 集成复核更新）
 - Question：同 BG（l 系列）AC timing 计数器完整清单与数量？
 - Why：6.2.1 总账口径完整性（"分层 vs 全局"结论不受影响）。
-- Known：s 系列 16×5；1017 为近似口径（6-P0-01 定稿声明）。
-- Unknown：l 系列逐项清单与重算总数。
-- Need：[TODO-RTL] | Affected：Ch5 T1/T2/T3 + Ch15 Timing Counter | Status: OPEN
-- Ch15 batch 2 结论：**PARTIAL**——s 系列确认（tRRDs/tCCDs/tWR2RDs/tRD2WRs/rd2rd ×16 [RTL 近似]）；l 系列清单仍 [TODO-RTL]（tCCDl/tRRDl/tWR2RDl/tRD2WRl 等是否逐项存在以 RTL inventory 为准，不按协议名推断）
+- **CLOSED（RTL 证据）**：s/l 系列均为 **paired counter/scope**（HBM BG 对粒度）[RTL·HBM current config]——s 系列（tRRDs/tCCDs/tWR2RDs/tRD2WRs/rd2rd）与 l 系列（tCCDl/tRRDl/tWR2RDl/tRD2WRl 等）清单确认；historical "1017" 为近似口径的声明保持。
+- Need：已闭合 | Affected：Ch5 T1/T2/T3 + Ch15 Timing Counter | Status: **CLOSED**
 
 **DFI-P1-01 · DFI contract 深挖**
 - Question：PhyRdLat / PhyWrLat 数值与配置？读数据返回 latency？DFI rolling / phase 对 data alignment 的精确约束？低功耗握手信号全集？
@@ -2994,12 +2995,13 @@ arbiter+worker/四 idle/drain → **G1**；transition-entry point 执行端 → 
 - Affected：Ch10 R1 · Ch16 WDP/RDP · Ch17 DFI · 必要时 Ch8 DP1 / DP3
 - Status: **PARTIAL**
 
-**PF-P1-01 · CS prefetch window 收益量化**
+**PF-P1-01 · CS prefetch window 收益量化**（re-scope：HBM 集成复核）
 - Question：8 个 PF entry 的覆盖行为？等效 2GHz 实测达成度？
 - Why：7.8 是重大架构迭代但缺证据（0.9 第 8 问缺位——视为尚未完成）。
-- Known：机制全貌（7.8）。
-- Unknown：性能数据。
-- Need：[TODO-MEASURE] | Affected：7.8 | Status: OPEN
+- **Re-scope**：PF window 为当前 HBM 配置 shadow 机制 [OTHER CONFIG / TODO-RTL-SCOPE]——收益量化问题收窄为该配置下的 [TODO-MEASURE]；跨配置（DDR/LPDDR 是否使能 shadow）属 RTL scope 未确认，不纳入本项。
+- Known：机制全貌（7.8/DP3）。
+- Unknown：该配置下的性能数据。
+- Need：[TODO-MEASURE]（scope=HBM config）| Affected：7.8 / DP3 | Status: OPEN（re-scoped）
 
 **X-P1-07 · Perf 归因数据包（umbrella）**
 - Question：timing blocker Top 5 lost-slot sweep（6.8）；per-workload "blocked only by refresh" cycles + postpone depth sweep（4.6.4）；0.17 blocked reason 全集的 counter 落地与 total-cycles 恒等式验证。
@@ -3035,7 +3037,7 @@ arbiter+worker/四 idle/drain → **G1**；transition-entry point 执行端 → 
 
 **RF-P1-02 · REF/REFab 是否以及如何降低 activation debt**（M4 OPEN-1）
 - Question：REF（尤其 REFab 全 bank 刷新）是否冲销 RFM 激活债？冲销多少？
-- 原则：聊天讨论过 ≠ 当前项目 RTL 已确认。Need：[TODO-SPEC]+[TODO-RTL] | Affected：Ch7 M4 | Status: OPEN
+- **CLOSED（RTL 证据）**：REF/REFab 执行时同拍减少对应 bank 的 RAA 计数 [RTL·HBM current config]——refresh 顺带偿还 activation debt。Need：已闭合 | Affected：Ch7 M4 | Status: **CLOSED**
 
 **RF-P1-03 · RAADEC 协议定义与当前 RTL 映射**（M4 OPEN-2）
 - Question：RAADEC（协议侧=HBM3 厂商设定阈值，IEEE 1500 WDR 可读）在本 RTL 如何使用/映射？
@@ -3043,7 +3045,7 @@ arbiter+worker/四 idle/drain → **G1**；transition-entry point 执行端 → 
 
 **RF-P1-04 · PRE / RDA / WRA 对 RAA 的精确影响**（M4 OPEN-3）
 - Question：RDA/WRA 含 PRE 语义但仍属激活活动——是否计入 RAA？PRE 呢？
-- Need：[TODO-SPEC] | Affected：Ch7 M4 | Status: OPEN
+- **CLOSED（RTL 证据）**：PRE / RDA / WRA 均偿还 RAA [RTL·HBM current config]（RDA/WRA 含 PRE 语义、同样计为偿还）。Need：已闭合 | Affected：Ch7 M4 | Status: **CLOSED**
 
 **RF-P1-05 · 跨协议 activation-debt 语义一致性**（M4 OPEN-4）
 - Question：DDR / LPDDR / HBM 各协议的 activation-debt 记账语义是否一致？
@@ -3053,28 +3055,28 @@ arbiter+worker/四 idle/drain → **G1**；transition-entry point 执行端 → 
 - Question：Normal REFpb 三层 tier 准入下，是否存在某 bank 整个 round 不满足准入而被跳过、从而破坏 Tn+T(n+1) bound 的场景？critical 是否为唯一兜底？
 - Why：Odd/Even watchdog 的正确性前提 = "每 bank 每 round 必完成一次 REFpb"；该前提本身需要 RTL 保障证据。
 - Need：[TODO-RTL] | Affected：Ch7 M3 | Status: OPEN
-- Ch15 batch 2 结论：素材（11.6 / L6）中无 round_complete 生成逻辑记载（bitmap/pointer/最后 bank 均未确认）——**保持 OPEN；M3 = PARTIAL**（缺口 = scheduler invariant 缺 RTL proof，数学本身无误）
+- **RESOLVED BY RTL STRUCTURE（HBM 集成复核）**：refresh 控制维护 per-bank pending bitmap（refpb_req[63:0]）——REFpb 执行后清对应位， Odd/Even watchdog 为 bitmap 清扫进度的 deadline 兜底 [RTL·HBM current config]；round-complete 语义由 bitmap 全清提供，不依赖某 bank 单点信号；**M3 = CLOSED at structure level**（watchdog-bitmap 联动的精确 cycle 拍点仍可 [TODO-RTL-local]）
 
 **RF-P1-07 · 固定 bank 顺序 vs 固定 phase 的 safety margin**（M3）
 - Question：REFpb 始终按 bank 递增时是否存在额外 safety margin？固定 order 与固定 phase 的区别？
 - Need：[TODO-RTL]（round 内顺序语义确认）| Affected：Ch7 M3 | Status: OPEN
-- Ch15 batch 2 结论：素材无 fixed order / phase / RR起点 的 RTL 记载——**保持 OPEN**（Odd/Even correctness 只依赖 each-bank-once-per-round invariant，fixed order 疑似仅 margin 增益——该推断本身 [MODEL] 待证）
+- **CLOSED/CONFIRMED（HBM 集成复核）**：SID 内 rolling-set 锁定 + SID0→1→2→3 固定顺序切换 [RTL·HBM current config]——round 内顺序语义确认；每 bank 每 round 至多一次由 bitmap 保证
 
 **RF-P1-08 · DRFM protocol-side target handoff 序列**（M5-B）
 - Question：ACT → PRE/AP sampling → DRAM 内部 DRFM target register → DRFMpb 的交接协议序列；row 信息如何交给 DRAM？DRFM command 是否携带完整地址？
 - Known：controller 侧 target selection = csrBakNDrmRowAddr [RTL]（11.8）；协议侧语义见 `Memory_Protocal.md` §4.7。
 - Need：[TODO-SPEC]+[TODO-RTL] | Affected：Ch7 M5 | Status: OPEN
 
-**DP2-P1-01 · PhyRdLat semantic boundary**（Micro Patch 新增；Node-scoped：DP2）
+**DP2-P1-01 · PhyRdLat semantic boundary**（Micro Patch 新增；Node-scoped：DP2；HBM 集成复核更新）
 - Question：当前 RTL 中 PhyRdLat 精确决定什么——capture enable？expected arrival window？metadata alignment？command-info FIFO pop timing？read-data FIFO sizing？rotator phase？data_valid 与 PhyRdLat 分别承担什么责任？
-- Current Understanding [RTL·部分]：存在 PhyRdLat 多频点配置、dfi_rddata_en、data_valid、read data FIFO / rolling path；精确 ownership / alignment contract 未确认。
-- Missing Evidence：RTL 信号级确认 + DFI normative semantics。
-- Need：[TODO-RTL] + [TODO-SPEC] | Affected：Ch8 DP2 / Ch17 | Status: OPEN
+- Current Understanding [RTL·HBM current config]：**csrRdDataEn chain 确认为 capture enable 生成链**（dfi_rddata_en 由 CSR 延迟链驱动，多频点配置）；**csrPhyRdLat unused in current config**（寄存器存在但当前配置未接入有效路径）；read-data FIFO / rolling path 如前。
+- Residual：metadata alignment / rotator phase 的精确分工——留 [TODO-RTL-local]（不影响 architecture conclusion）。
+- Need：已闭合到结构级 | Affected：Ch8 DP2 / Ch17 | Status: **CLOSED（structure level；残余实现细节 local TODO）**
 
-**XMU-P1-01 · Write tracking lifetime vs write-data retention lifetime**（Part III Batch 1 新增；Node-scoped：XMU）
+**XMU-P1-01 · Write tracking lifetime vs write-data retention lifetime**（Part III Batch 1 新增；Node-scoped：XMU；HBM 集成复核更新）
 - Question：write transaction 在 PA grant / BRESP 后、WDP fetch 前，write data 由哪个 structure/state 保活？XMU outstanding tracking lifetime 与 physical write-data retention lifetime 是否为同一 lifetime？
-- Current Understanding [RTL·部分]：write data 物理驻留 XMU 侧 buffer 至 WDP fetch（9.2-③ [RTL]）；BRESP/accounting 在 grant 拍完成（1.4.2 [RTL]）——两个 release 点不同。
-- Need：[TODO-RTL]（tracking entry 与 data storage 的结构对应关系）| Affected：Ch12 / Ch8 DP1 / Ch9 C3 | Status: OPEN
+- **CLOSED（RTL 证据）**：两个 lifetime 不同 [RTL·HBM current config]——tracking/accounting 在 BRESP 拍释放；write data 在 XMU 侧 buffer 保活到 WDP fetch（data 留 XMU）；**tracking entry 与 data storage 非同一物理结构**。
+- Residual：具体 buffer 组织（entry 数/指针结构）留 local TODO（不影响 architecture conclusion）。Need：已闭合 | Affected：Ch12 / Ch8 DP1 / Ch9 C3 | Status: **CLOSED**
 
 **DP2-P1-02 · Retry-induced HOL worst-case bound**（Freeze Patch 新增；Node-scoped：DP2）
 - Question：retry count ≤15 是否足以推出同 ID HOL 的严格 cycle upper bound？若不能，还缺哪些 service-bound 前提（每次 retry 的 worst-case service time / scheduler progress / timing legality / direction switching / maintenance interference / admission availability）？
@@ -3139,8 +3141,8 @@ arbiter+worker/四 idle/drain → **G1**；transition-entry point 执行端 → 
 | rolling ptr / read data FIFO | DFI（→DP2-P1-01 关联） | RDP | ctrlUpd/phyUpd 复位；起点 0 | —（持续滚动） | [RTL] |
 | 读 retry 状态（计数/窗口） | RAS retry 模块（→Ch10 R1） | CQ/DFI | UE 检出触发 | 成功上送/超限 SLVERR | [RTL] |
 | 读返回保序（link list/reorder buffer） | XMU（→V1/C1/DP2） | XMU→AXI | node 分配 | head-only 释放 | [RTL] |
-| outstanding 计数（protocol/accounting） | XMU ostd buffer（→V1） | AXI 反压 | txn accepted | BRESP 发出（**data retention 另计→XMU-P1-01**） | [RTL] |
-| write-data retention buffer | XMU 侧 buffer（→DP1/XMU-P1-01） | WDP fetch | W 数据写入 | WDP fetch（所有权移交） | [RTL] |
+| outstanding 计数（protocol/accounting） | XMU ostd buffer（→V1） | AXI 反压 | txn accepted | **BRESP 发出 = master-visible completion**（accounting 释放；write data 留 XMU retention buffer →XMU-P1-01 CLOSED） | [RTL·HBM] |
+| write-data retention buffer | XMU 侧 buffer（→DP1；lifetime 与 tracking 不同——XMU-P1-01 CLOSED） | WDP fetch | W 数据写入 | WDP fetch（所有权移交） | [RTL·HBM] |
 | CAM entry / burst 合并态 | CQ（→Ch13） | 三层 filter/CS | PA grant 后 allocation/merge | burst 末条离开 CAM | [RTL] |
 | IPROC Pending | CQ 入口（→C2/Ch13） | 后续入队 | 冲突检出 | 冲突对象离开 CAM | [RTL] |
 | CCT 占用（RD/WR per-bank 单槽） | CQ（→S1/Ch13） | CS | 上表 | 命令发送 | [RTL] |
