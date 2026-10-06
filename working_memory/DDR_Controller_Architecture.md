@@ -1,6 +1,6 @@
-# DDR Memory Controller Architecture —— Interview Reasoning System
+# DDR Memory Controller Architecture —— 面试推理系统
 
-> **文档定位**：Memory Controller Architecture Interview Reasoning System。以 architecture problem 为入口（Level 1）、以 Architecture Node 为唯一知识实体（Level 2）、以真实 RTL 为实现证据（Level 3）。基于本人真实 RTL / Architecture 工作经验；能力目标：面对任意 workload、performance symptom、design choice 或 interviewer question，都能沿统一 architecture model 推导到 request visibility、mapping、queue、scheduler、timing、maintenance、data path、correctness 与 PPA，并能主动把追问引导到熟悉方向。
+> **文档定位**：Memory Controller Architecture 面试推理系统。以 architecture problem 为入口（Level 1）、以 Architecture Node 为唯一知识实体（Level 2）、以真实 RTL 为实现证据（Level 3）。基于本人真实 RTL / Architecture 工作经验；能力目标：面对任意 workload、performance symptom、design choice 或 interviewer question，都能沿统一 architecture model 推导到 request visibility、mapping、queue、scheduler、timing、maintenance、data path、correctness 与 PPA，并能主动把追问引导到熟悉方向。
 >
 > **第一性问题**：Memory Controller 如何在 correctness / liveness 约束下，把不规则、并发、乱序的 system transaction stream 转化成尽可能连续的 useful DRAM data transfer？
 >
@@ -41,11 +41,12 @@
 
 ```
 Host/NoC → AXI/CHI → XMU → PA(含 Address Mapping @ grant 点) → Command Window(CAM→CCT)
-        → Scheduling(FSC) → Timing Enforcement(BSC, issue 前) → DFI → PHY → DRAM
+        → CS Scheduling(BSC legality + GSC normal selection + FSC final arbitration) → DFI → PHY → DRAM
+                ↑ refresh/DEVMGR/force-precharge 等在 FSC 汇合
 ```
 
 **四条结构性注记 [RTL]**：
-1. **Timing Enforcement 不是独立流水级**：BSC 的 forbid/down counter 在 FSC 仲裁**前**给出 timing ready（可执行命令 = CCT 候选 ∩ BSC ready ∩ GSC direction-legal，六层口径见 Ch14.3），命令**下发拍**装载 counter；counter 不关心下发后 DFI 侧延迟（同批命令延迟一致，不改变间隔语义）。
+1. **CS 分层不是串联流水**：CCT demand + BSC legality（bank FSM ∩ AC timing）在 GSC 前；GSC 从 normal traffic 中做 selection（方向 / SID / priority / aging / oldest / RR）；FSC 把 GSC normal command 与 refresh、DEVMGR 等多源请求统一仲裁后发 DFI；命令**下发拍**装载 timing counter（counter 不关心下发后 DFI 侧延迟，同批命令延迟一致，不改变间隔语义）。权威定义 → Ch14.3。
 2. **Address Mapping 不是独立流水级**：读、写在 PA 前走独立通道，PA 后合流二选一；**PA grant 点**执行物理映射，物理地址写入 CAM entry，逻辑地址此后弃用。
 3. **命令流与数据流在 WDP/RDP 分合**：命令走窄通路（地址+属性），数据走宽通路（SRAM+DBI/ECC），仅以 ptr 关联。
 4. **保序点前移**：write response 在 PA grant 即返回上游，远早于数据写入 DRAM；这段窗口的顺序安全由 CAM 入口 RAW/WAR 拦截维持（→ Ch9 C2）。
@@ -55,7 +56,7 @@ Host/NoC → AXI/CHI → XMU → PA(含 Address Mapping @ grant 点) → Command
 ② PA grant：分配 CAM ptr + 物理地址映射；同时 BRESP 推入 outstanding FIFO（保序节点 = PA grant；数据收齐是送 PA 的前置条件）；
 ③ CQ 指示 WDP 从 XMU 取数入 SRAM（地址与 CAM 一致，BE 存寄存器堆）→ write data ready；
 ④ 命令经三层 filter 上 CCT → 无 hit → CS 生成 ACT → tRCD 满足 → 产生 WR 请求；
-⑤ FSC 调度 → 命令以 body/type/id 发至 DFI → PHY；
+⑤ GSC 从 normal traffic 选出命令 → FSC 与 refresh/DEVMGR 统一仲裁 → 命令以 body/type/id 发至 DFI → PHY；
 ⑥ 临近 PhyWrLat：DFI 持 ptr 向 WDP 取数 → 读出侧 ECC/DBI/CRC 编码 → PHY；取走后 WDP entry 释放。
 
 **读对照 [RTL]**：AR 拆分并在 reorder buffer（link node）分配空间，node ID 随命令下发 → 中间与写类似 → DFI 收到读数据，先入先出绑定命令信息返回 RDP → DBI/ECC 处理 → XMU 写 SRAM → 按 ID 重组 RDATA 返回上游。
@@ -146,28 +147,27 @@ RTL counter / state 可以直接看到一部分原因（命令计数、水位电
 | 读写方向 | GSC |
 | refresh debt/credit/档位/ab-pb 模式 | 独立 refresh 模块 |
 | RFM 激活债（per-bank ACT 计数） | refresh/RFM 模块 |
-| credit | PA ↔ CQ（grant 消耗、离开 CAM 归还） |
+| credit | UIF/credit manager（accept 消耗、issue/离开 CAM 归还）——admission quota per source；CQ 内不持有 credit |
 | write-data complete（XMU 侧 retention） | XMU |
 | WDP data-ready（entry 数据就绪） | WDP |
 | CCT 占用 | CQ（RD/WR 两张 per-bank 单槽） |
 | 读返回保序 | XMU link list / reorder buffer |
 | 全局转换 | DEVMGR（arbiter + worker） |
 
-## 0.7 关键设计哲学
+## 0.7 关键设计方法（Repeated Design Patterns）
+
+职责分离先于任何具体技巧：每个状态有唯一 owner（→0.6 表），跨模块只读映射；任何机制设计前先回答"改哪个状态、谁有权改"。
 
 1. **批处理摊薄切换**：读写 batch、refresh 见缝插针、rank/SID 多命令再切——切换代价是常量，batch 是唯一摊薄手段；
 2. **迟滞防乒乓**：SidSwitch 空闲阈值、水线 set/clr、渐进式读写切换、refresh critical 退出 LowTh——用时间迟滞换切换稳定性；
 3. **结构性规避**：DVFS 保证 IDLE、零旁路 counter 检查、DEVMGR 退出顺序——用系统级约束消解模块级难题；
-4. **one-state-one-owner**：一个状态一个 owner，跨模块只读映射；
-5. **protocol constraint → architecture consequence**：协议差异只研究到"改变 MC 设计"为止（例：HBM row/col bus 独立 → FSC 可同拍 row+col；DDR/LPDDR CA shared → 单拍单 command；HBM 无 DM → XMU 转 RMW）；
-6. **visibility × locality × timing supply 三角**：性能机会 = 三者之积，单一维度加强会遇饱和（→ RQ1/RQ3）；
-7. **useful issue slot**：一切机制价值的统一度量单位；
-8. **粒度统一 64B 是设计锚点口径，非协议事实**：cache line 64B = SoC 常态假设；CHI 64B = 产品配置；sub-command 64B = 内部设计选择；col command = 协议 × 位宽推导（DDR4/5、LPDDR5 = 64B [SPEC]；HBM per PC DQ32×BL8 = 32B [SPEC]，由 burst 合并/双发吸收）。
+4. **protocol constraint → architecture consequence**：协议差异只研究到"改变 MC 设计"为止（例：HBM row/col bus 独立 → FSC 可同拍 row+col；DDR/LPDDR CA shared → 单拍单 command；HBM 无 DM → XMU 转 RMW）；
+5. **性能检查先看三件事**：资源够不够（会不会 full / 反压）、命中率高不高（page hit / bank 并行）、时间藏不藏得住（tRCD / tRP / turnaround 是否被有效并行掩盖）。
 
 ## 0.8 本文使用方式
 
 **三层阅读法**：
-A 面试快复习 = Ch0 + Ch1（地图 / RQ / 回答套路 / Hook / 关键 model）；
+A 面试快复习 = Ch0 + Ch1（地图 / RQ / 回答套路 / 追问点 / 关键 model）；
 B 深入某设计问题 = Part I/II 对应 Architecture Node（11 字段模板）；
 C 查真实 RTL = Part III Implementation Reference（6+1 字段模板）。
 
@@ -190,14 +190,14 @@ Physical/System Problem → Protocol Constraint → MC Requirement → Architect
 
 ---
 
-# 1. Interview Question Graph & Answer Playbook（Navigation Layer）
+# 1. 面试问题图与回答 Playbook（Navigation Layer）
 
 ## 1.1 How to Use the Question Graph
 
 - **Root Question = interview entry；Architecture Node = 唯一知识实体；RTL Reference = 实现证据。** 32 个 Node（22 CORE / 7 LEAF / 2 CROSS-CUTTING / 1 PLAYBOOK），清单见《RESTRUCTURE_PLAN.md》Node Map 与 Part I 各章。
 - **RQ1 = Design View**（如何制造 useful issue opportunity）；**RQ2 = Diagnosis View**（opportunity 在哪一级丢掉）。两者共享同一张 Node 图：设计高性能 MC = 尽量减少各类 blocked opportunity；调试低性能 MC = 定位哪类 opportunity 被浪费。
 - **NO TECHNICAL DUPLICATION IN CH1**：同一 Architecture Conclusion——Ch1 只许摘要/导航；Part I 是唯一 architecture reasoning 正文；Part III 只有 implementation。
-- 每个 RQ 固定四段式：**① 20s Answer**（Conclusion → 一层因果 → 一个 Hook，然后停下）；**② 90s Answer Skeleton**（C-M-T-P-H，模板见 1.17）；**③ Deep-Dive Node Links**（Node → Part I 正文 → Part III RTL → 协议 / corner / PPA / measurement）；**④ Steering Hooks**（Preferred / Secondary / Do-not-volunteer）。
+- 每个 RQ 固定四段式：**① 20s Answer**（Conclusion → 一层因果 → 一个追问点，然后停下）；**② 90s 回答结构**（C-M-T-P-H，模板见 1.17）；**③ Deep-Dive Node Links**（Node → Part I 正文 → Part III RTL → 协议 / corner / PPA / measurement）；**④ 追问引导**（Preferred / Secondary / Do-not-volunteer）。
 
 ## 1.2 RQ1 — 如何设计一个高性能 Memory Controller？（Design View）
 
@@ -220,7 +220,7 @@ Physical/System Problem → Protocol Constraint → MC Requirement → Architect
 - **Scheduling / timing**：S1 / S2 / S3 → T1 / T2 / T3 → D1 → Ch14 / Ch15；
 - **Maintenance**：M1 ~ M5 → Ch7；
 - **Data delivery**：DP1 ~ DP3 → Ch16 / Ch17；
-- measurement / observability cross-check：O1 / Ch18（放 Proof，不作主体 Node link）。
+- measurement / observability cross-check：O1 / Ch18（放证据与验证，不作主体 Node link）。
 
 **追问引导**：优先引导 = **Resource sizing / saturation**（为什么 reorder buffer / WDP 不是越大越好；如何判断 capacity"够用"；为什么 CAM 特殊；saturation point 怎么判断；PPA tradeoff）；次选方向 = **Mapping → page hit / bank-BG parallelism → timing hiding**；不主动展开 = PHY analog implementation / 没有真实数据支撑的精确性能数字 / generic textbook performance formulas。
 
@@ -264,27 +264,27 @@ Symptom → Observable → Bottleneck Hypothesis → Architecture Cause → Desi
 
 **Deep-Dive Node Links**：V2（Ch2）→ Ch13 CAM/CQ Reference；HOL → C2（Ch9）；burst 双口径（storage 等效 256 vs scheduler visibility 64 entry）→ V2。
 
-**Steering**：Preferred = depth sweep proof 方法；Secondary = burst 双口径 + compare critical path；Do-not-volunteer = link list RTL 细节（留待追问）。
+**追问引导**：优先引导 = depth sweep proof 方法；次选方向 = burst 双口径 + compare critical path；不主动展开 = link list RTL 细节（留待追问）。
 
 ## 1.5 RQ4 — Address Mapping 怎么做性能调优？
 
 **20s**：mapping 是 workload geometry 与 DRAM 几何的耦合器——它同时决定 row locality 与 bank/BG 并行度的上限。本项目推荐序 {row, cs, ba, col, bg, col}（bg0/ba/bg1 交织），用 stride 通式（stride=2^k×64B：k<7 时 bank 字段滚动、k≥7 时单 bank 纯换 row）可以现场推出任何 workload 的落点。
 
-**90s Skeleton**：C=mapping 决定地址 entropy 如何散到 bank/BG/rank/row；M=stride 通式 + bank entropy + H 区间；T=rank 位放高是为避免 bus/ODT 切换（cs=[10] 被 col/ba/bg 位宽钉死）、XOR hashing 不采用（本 workload 无 power-of-two 大 stride 热点）；P=bank entropy / hit rate / ACT-per-col sweep [X-P1-07]。
+**90s 回答结构**：C=mapping 决定地址 entropy 如何散到 bank/BG/rank/row；M=stride 通式 + bank entropy + H 区间；T=rank 位放高是为避免 bus/ODT 切换（cs=[10] 被 col/ba/bg 位宽钉死）、XOR hashing 不采用（本 workload 无 power-of-two 大 stride 热点）；P=bank entropy / hit rate / ACT-per-col sweep [X-P1-07]。
 
 **Deep-Dive Node Links**：L5（Ch3）→ D2（cs 位 → Ch6）；AMAP 单一 source of truth [RTL]。
 
-**Steering**：Preferred = stride 通式现场推导；Secondary = rank 的 capacity vs parallelism/switching tradeoff（当前设计以 capacity/topology 为主维度，独立 bank state 仍可能带来并行机会）；Do-not-volunteer = DDR5 sub-channel 业内惯例（OPEN 调研，2-P0-02）。
+**追问引导**：优先引导 = stride 通式现场推导；次选方向 = rank 的 capacity vs parallelism/switching tradeoff（当前设计以 capacity/topology 为主维度，独立 bank state 仍可能带来并行机会）；不主动展开 = DDR5 sub-channel 业内惯例（OPEN 调研，2-P0-02）。
 
 ## 1.6 RQ5 — Row Locality 与 Bank/BG Parallelism 怎么权衡？
 
 **20s**：两者冲突没有闭式解——四约束公式（tCAS / tACT / tRC / tRCD）给出每 bank 命令数 H 的可行区间 [H_min, H_max]，区间内按负载取向摆位；冲突时先保 locality 下限（经验值每 bank ≥4 条，H=tACT/tCAS 解析支撑）再给 BLP。
 
-**90s Skeleton**：C=H 区间模型；M=bank 数隐藏 tRC（N_bank×H×tCAS≥tRC）、Q bank 轮转隐藏 tRCD；T=BG interleave 粒度 vs 每 bank hit 数；P=H sweep（1/2/4/8/16/32）+ hit rate/BLP utilization [X-P1-07]。
+**90s 回答结构**：C=H 区间模型；M=bank 数隐藏 tRC（N_bank×H×tCAS≥tRC）、Q bank 轮转隐藏 tRCD；T=BG interleave 粒度 vs 每 bank hit 数；P=H sweep（1/2/4/8/16/32）+ hit rate/BLP utilization [X-P1-07]。
 
 **Deep-Dive Node Links**：L1/L2/L3（Ch3）→ L4 page policy（Ch4）→ T2（ACT supply）。
 
-**Steering**：Preferred = H 区间四约束模型；Secondary = streaming vs random 反例；Do-not-volunteer = —。
+**追问引导**：优先引导 = H 区间四约束模型；次选方向 = streaming vs random 反例；不主动展开 = —。
 
 ## 1.7 RQ6 — Scheduler 如何选择下一条 command？
 
@@ -305,29 +305,29 @@ Symptom → Observable → Bottleneck Hypothesis → Architecture Cause → Desi
 
 **20s**：切换代价 = 总线 turnaround（tWTR/tRTW）+ 对侧行准备暴露（unhidden tRCD），两者都是常量，唯一摊薄手段是 batch——水线 / 时间配额 / critical / expired 四类触发；渐进式切换在对侧 column 执行期提前开行——best case 下若对侧 ACT 能足够提前完成，tRCD 被当前方向 column traffic 隐藏，切换暴露成本主要剩 bus turnaround；若 ACT opportunity 不足 / bank conflict / tRRD·tFAW block / CAM visibility 不足，仍会暴露部分 row preparation。
 
-**90s Skeleton**：C=batch 长度=摊薄分母；M=turnaround 完整账单（turnaround + unhidden row preparation 可拆分验证）；T=batch 不能无限大——write latency（read 默认优先的根因是端到端延迟责任不对称）、starvation；P=switch count/sec + turnaround lost cycles + hidden tRCD ratio [X-P1-07]。
+**90s 回答结构**：C=batch 长度=摊薄分母；M=turnaround 完整账单（turnaround + unhidden row preparation 可拆分验证）；T=batch 不能无限大——write latency（read 默认优先的根因是端到端延迟责任不对称）、starvation；P=switch count/sec + turnaround lost cycles + hidden tRCD ratio [X-P1-07]。
 
 **Deep-Dive Node Links**：D1（Ch6）→ D2（rank/SID 对照）→ T2/T3（unhidden tRCD / tWTR）→ Ch14 GSC Reference。
 
-**Steering**：Preferred = turnaround 账单 + hidden tRCD；Secondary = 90R+10W 的 write starvation；Do-not-volunteer = —。
+**追问引导**：优先引导 = turnaround 账单 + hidden tRCD；次选方向 = 90R+10W 的 write starvation；不主动展开 = —。
 
 ## 1.9 RQ8 — Timing constraint 如何形成真实 bandwidth ceiling？
 
-**20s**：每类 workload 被不同 timing 卡住——streaming hit → tCCD；random row miss → tRCD/tRC/ACT supply（tRRD/tFAW）；高 bank 并行 → tRRD/tFAW；R/W mixed → turnaround；refresh → tRFC。我用 Supply/Demand 模型统计 lost issue slot：只算"唯一因该约束无法发出的 useful command"，零 timing violation 只是 baseline。
+**20s**：每类 workload 被不同 timing 卡住——streaming hit → tCCD；random row miss → tRCD/tRC/ACT supply（tRRD/tFAW）；高 bank 并行 → tRRD/tFAW；R/W mixed → turnaround；refresh → tRFC。我用 Supply/Demand 模型统计 blocked command：只算"唯一因该约束无法发出的 full RD/WR command"，零 timing violation 只是 baseline。
 
-**90s Skeleton**：C=timing supply 决定每拍合法命令供给率；M=workload→limiting-timing 映射 + 分布式 forbid/down counter（min 约束 ceil、max 驻留 floor [RTL]）；T=分布式 counter vs 集中 timestamp（面积/时序/DVFS 五维）；P=timing blocker Top5 lost-slot sweep + min-gap 断言 [X-P1-07]。
+**90s 回答结构**：C=timing supply 决定每拍合法命令供给率；M=workload→limiting-timing 映射 + 分布式 forbid/down counter（min 约束 ceil、max 驻留 floor [RTL]）；T=分布式 counter vs 集中 timestamp（面积/时序/DVFS 五维）；P=timing blocker Top5 lost-slot sweep + min-gap 断言 [X-P1-07]。
 
 **Deep-Dive Node Links**：T1/T2/T3（Ch5）→ Ch15 Timing Counter Reference（含 ≈1017 口径声明）。
 
-**Steering**：Preferred = workload→limiting-timing 映射表；Secondary = lost issue slot 口径；Do-not-volunteer = counter 逐项清单（1017 为近似口径）。
+**追问引导**：优先引导 = workload→limiting-timing 映射表；次选方向 = blocked command 口径；不主动展开 = counter 逐项清单（1017 为近似口径）。
 
 ## 1.10 RQ9 — Controller 如何在不可延期 maintenance obligation 与 normal traffic 之间做调度？
 
 **20s**：刷新是"不可延期义务"与 traffic 共享同一个 scheduler——我的统一模型是 obligation → debt → deadline tracking → postpone → pressure → critical escalation → bank drain → maintenance issue → unavailable interval → recovery；REF 是时间债、RFM 是激活债，两本账只在 FSC 优先级序汇合。
 
-**90s Skeleton**：C=双账本 + critical 迟滞 + 两档执行粒度；M=debt 单位是"欠一次刷新"（与 tREFI 解耦）、postpone 上界 9×tREFI−8×tRFC [SPEC, protocol/mode scoped——适用范围 → RF-P1-09]、REFab 抵本轮全部 pb 债；T=postpone depth ↔ latency spike / BW、Normal REFab 压过 critical REFpb 的性价比逻辑；P=blocked_maintenance 互斥归因 + postpone depth sweep [X-P1-07]。
+**90s 回答结构**：C=双账本 + critical 迟滞 + 两档执行粒度；M=debt 单位是"欠一次刷新"（与 tREFI 解耦）、postpone 上界 9×tREFI−8×tRFC [SPEC, protocol/mode scoped——适用范围 → RF-P1-09]、REFab 抵本轮全部 pb 债；T=postpone depth ↔ latency spike / BW、Normal REFab 压过 critical REFpb 的性价比逻辑；P=blocked_maintenance 互斥归因 + postpone depth sweep [X-P1-07]。
 
-**高价值展示题（Steering 首选 Hook）——M3 Odd/Even watchdog 三档**：
+**高价值展示题（追问引导首选追问点）——M3 Odd/Even watchdog 三档**：
 - **20s**："在当前适用的 protocol/mode 下，REFpb 的硬期限是 same-bank consecutive refresh interval 不超过 9×tREFI（适用范围确认 → RF-P1-09 [TODO-SPEC]）。由于同一 bank 的连续两次 refresh 只跨相邻两个 round，可以用 Odd/Even 两个交错 watchdog 覆盖所有 adjacent round-pair；到项目设置的 early-warning threshold（例如 8×tREFI [RTL]）提前拉 critical，给 drain/PRE/REF 留余量。它本质上是把 N_bank 个 per-bank age tracking 压缩成两个 global watchdog，是一个 conservative sufficient condition。"
 - **90s**：＋Δt_bank=(Tn−xn)+x(n+1) ≤ Tn+T(n+1) 推导 [MODEL]；round 定义；**round-complete invariant 前提**（watchdog 不是无条件正确，依赖"每 bank 每 round 必完成一次 REFpb"）；固定 bank 顺序的 margin（OPEN）；8×/9× = early warning vs hard deadline 两层（hard deadline 为 protocol/mode scoped，→ RF-P1-09）；conservative vs exact。
 - **Deep-Dive**：→ M3（Ch7）→ Ch15（计数起点 = REFab 拍或本轮最后 REFpb 拍 [RTL]、哪轮清哪个 counter、round_complete 定义）→ round-complete invariant 断言 → PPA。
@@ -335,67 +335,67 @@ Symptom → Observable → Bottleneck Hypothesis → Architecture Cause → Desi
 
 **Deep-Dive Node Links**：M1~M5（Ch7）→ S2（FSC 维护优先级序）→ T2（禁 ACT）→ G1（进 LP 强制 AB）。
 
-**Steering**：Preferred = Odd/Even watchdog 展示题；Secondary = 双账本；Do-not-volunteer = PRAC/ABO 未实现细节。
+**追问引导**：优先引导 = Odd/Even watchdog 展示题；次选方向 = 双账本；不主动展开 = PRAC/ABO 未实现细节。
 
 ## 1.11 RQ10 — Throughput / Latency / QoS / Fairness 怎么权衡？
 
 **20s**：QoS 是跨层设计不是单点——AXI QoS → port 优先级 → port WRR → HPR/LPR/TPW/GPR 四分类 → 提名 policy → aging → FSC；冲突时高层压低层；aging / expired GPR 恒第一是防 starvation 的核心机制，严格 worst-case bound 见 S3-P1-01。
 
-**90s Skeleton**：C=延迟责任不对称（read 等 data、write BRESP 可提前）决定了 read 默认优先与 write batch 的共存；M=优先级注入的是 ordering，代价是 hit rate 与 P99（hit-first 让 miss 流排队）；T=QoS 与最大 BW 冲突时保 QoS 底线 + aging 上界；P=QoS 流量分布 / 饥饿健康度 counter（exp_gpr 应 ≈0）[RTL O1]、P99 为 [MODEL only] 诚实边界。
+**90s 回答结构**：C=延迟责任不对称（read 等 data、write BRESP 可提前）决定了 read 默认优先与 write batch 的共存；M=优先级注入的是 ordering，代价是 hit rate 与 P99（hit-first 让 miss 流排队）；T=QoS 与最大 BW 冲突时保 QoS 底线 + aging 上界；P=QoS 流量分布 / 饥饿健康度 counter（exp_gpr 应 ≈0）[RTL O1]、P99 为 [MODEL only] 诚实边界。
 
 **Deep-Dive Node Links**：S3（Ch4）→ S2 → V3（admission 接口）→ D1（write 提权）。
 
-**Steering**：Preferred = 全层级冲突谁压谁的结构答案；Secondary = expired GPR 上界；Do-not-volunteer = P99 具体数值（无 RTL 观测，诚实边界）。
+**追问引导**：优先引导 = 全层级冲突谁压谁的结构答案；次选方向 = expired GPR 上界；不主动展开 = P99 具体数值（无 RTL 观测，诚实边界）。
 
 ## 1.12 RQ11 — random / sequential / stride workload 分别怎么分析？
 
 **20s**：三类几何——sequential = page hit + tCCD 主导（供给型天花板）；random 通常带来 row locality 降低与 ACT pressure 增加（tRRD/tFAW/tRCD/tRC），仅在 HBM partial-write 等特定场景额外叠加 RMW amplification；stride = 用通式精确预测（stride=2^k×64B：k<7 bank 字段滚动，k≥7 单 bank 纯换 row），不需要 simulation 就能说出落点。
 
-**90s Skeleton**：C=workload geometry 经 mapping 变成 bank/row 访问模式，决定 limiting timing；M=三类各自的机会链断点与对应 Node；T=同一设计在三类下最优点不同（mapping/H 区间/batch 长度）；P=stride sweep + 三类对照的 blocked 分布 [X-P1-07]。
+**90s 回答结构**：C=workload geometry 经 mapping 变成 bank/row 访问模式，决定 limiting timing；M=三类各自的机会链断点与对应 Node；T=同一设计在三类下最优点不同（mapping/H 区间/batch 长度）；P=stride sweep + 三类对照的 blocked 分布 [X-P1-07]。
 
 **Deep-Dive Node Links**：L5/L1/L2（Ch3）→ T2/T3（Ch5）→ C2（RMW）→ M4（ACT 债）。
 
-**Steering**：Preferred = 三类 workload 对照推导；Secondary = stride 通式现场演算；Do-not-volunteer = —。
+**追问引导**：优先引导 = 三类 workload 对照推导；次选方向 = stride 通式现场演算；不主动展开 = —。
 
 ## 1.13 RQ12 — HBM / DDR / LPDDR 架构差异如何改变 controller？
 
 **20s**：协议差异改变 controller 的三个位置——粒度（64B vs 32B per col → 拆分与 burst 合并）、partial write 路径（DDR5 DM → native masked write；HBM 无 DM → XMU 转 RMW，占读写 CAM 各一）、命令通路（HBM row/col 独立 bus 可同拍 row+col、DDR/LPDDR CA shared 单拍单命令；DFI ratio / 双 PC / SID 分时）。
 
-**90s Skeleton**：C=同一 Architecture Node 在不同协议下的约束不同、机制随之变形；M=cross-protocol 对比只服务于 architecture（Protocol Fact → Controller Consequence 两行）；T=多协议共存的 RTL 代价（参数化 counter / FSM 分支）；P=cross-protocol 对比表 + per-protocol 命令 mix。
+**90s 回答结构**：C=同一 Architecture Node 在不同协议下的约束不同、机制随之变形；M=cross-protocol 对比只服务于 architecture（Protocol Fact → Controller Consequence 两行）；T=多协议共存的 RTL 代价（参数化 counter / FSM 分支）；P=cross-protocol 对比表 + per-protocol 命令 mix。
 
 **Deep-Dive Node Links**：DP3（Ch8）→ L5（粒度）→ C2（mask write vs RMW）→ D2（PC/SID）→ G1（切频分族）。
 
-**Steering**：Preferred = mask write → RMW 决策链；Secondary = HBM 同拍 row+col 与双 PC；Do-not-volunteer = 协议历史细节（归 `Memory_Protocal.md`）。
+**追问引导**：优先引导 = mask write → RMW 决策链；次选方向 = HBM 同拍 row+col 与双 PC；不主动展开 = 协议历史细节（归 `Memory_Protocal.md`）。
 
 ## 1.14 RQ13 — CAM / counter / scheduler 如何做 PPA tradeoff？
 
 **20s**：我用三张实测表回答——timing counter ≈1017 个（逻辑口径）占 scheduler 面积约 40%；WDP 占 LPDDR6 面积 10.40%；CAM/面积随 depth 持续增长且 compare/reduction/routing 让 closure 越来越难（Fmax 非线性变差）。scaling 推理放在每个 Node 的 Tradeoff 字段，数字唯一来源是 Part III synthesis / measurement——P1 只是统一索引。
 
-**90s Skeleton**：C=PPA 是横切轴不是模块；M=每类资源的 scaling 规律（CAM×entry、counter×bank/BG、mux×choose-2）；T=分布式 counter vs 集中、shadow window（64 选 2 → 8 选 2）压 critical path；P=synthesis 面积表 + Fmax + depth sweep [X-P1-07 / 6-P0-05 FF 回填]。
+**90s 回答结构**：C=PPA 是横切轴不是模块；M=每类资源的 scaling 规律（CAM×entry、counter×bank/BG、mux×choose-2）；T=分布式 counter vs 集中、shadow window（64 选 2 → 8 选 2）压 critical path；P=synthesis 面积表 + Fmax + depth sweep [X-P1-07 / 6-P0-05 FF 回填]。
 
 **Deep-Dive Node Links**：P1（索引）→ V2 / S2 / T1 / DP3 各 Node Tradeoff 字段 → Ch13~Ch17 实测表。
 
-**Steering**：Preferred = 面积/counter 实测数字；Secondary = 64 选 2→8 选 2 shadow window；Do-not-volunteer = 工艺库细节。
+**追问引导**：优先引导 = 面积/counter 实测数字；次选方向 = 64 选 2→8 选 2 shadow window；不主动展开 = 工艺库细节。
 
 ## 1.15 RQ14 — 如果重新设计一版 MC，你会改什么？
 
 **20s**：这是开放题，我有候选清单但不当场拍板——adaptive page policy（当前 close-page 为多数场景的静态选择）、mapping 可配置化增强、观测缺口补齐（hit rate / latency 无 RTL counter）、以及 burst 内命令独立性（第 1 条卡 timing 时第 2~4 条不能 bypass）。每一条我都能说出当前方案的失败 workload、改法与代价。
 
-**90s Skeleton**：C=redesign 的判断框架 = 每个 Node 的 Alternatives/Saturation 字段汇总；M=先问哪个 Node 在目标 workload 已饱和；T=改动按"证据强度"排序（有实测支撑的优先）；P=逐项用 sweep/counter 验证。
+**90s 回答结构**：C=redesign 的判断框架 = 每个 Node 的 Alternatives/Saturation 字段汇总；M=先问哪个 Node 在目标 workload 已饱和；T=改动按"证据强度"排序（有实测支撑的优先）；P=逐项用 sweep/counter 验证。
 
 **Deep-Dive Node Links**：导航型 RQ——汇总全部 Node 的 Alternatives 字段（X-P2-12 OPEN）。
 
-**Steering**：Preferred = 三推翻候选 + 失败 workload；Secondary = 各 Node Alternatives 汇总；Do-not-volunteer = —。
+**追问引导**：优先引导 = 三推翻候选 + 失败 workload；次选方向 = 各 Node Alternatives 汇总；不主动展开 = —。
 
 ## 1.16 RQ15 — Controller 如何保证 correctness 同时仍允许 aggressive reorder？
 
 **20s**：边界 = commit 分层 + 入口检测 + PNR 分域——**master-visible completion 在 BRESP（PA grant 即回）**；**command-domain PNR 在 col issue**；**read 的 recovery-domain PNR 在 RDP→XMU**（write 的数据所有权移交在 DFI 取数）。同址安全由 CAM 入口 RAW/WAR/WAW/RMW 拦截保证（ID 无关、单通路阻塞、不靠 forwarding）；WAW 用 byte-enable merge、RMW 用 flush 提权——统一模型 → Ch9 C3。
 
-**90s Skeleton**：C=reorder 自由度以"入口检测 + 单通路结构"换正确性；M=五分类保序责任表 + 依赖矩阵 + PNR 全链；T=不允许 bypass 的 HOL 代价 vs forwarding 复杂度；P=dependency sequence 断言 + min-gap + 入口检测覆盖。
+**90s 回答结构**：C=reorder 自由度以"入口检测 + 单通路结构"换正确性；M=五分类保序责任表 + 依赖矩阵 + PNR 全链；T=不允许 bypass 的 HOL 代价 vs forwarding 复杂度；P=dependency sequence 断言 + min-gap + 入口检测覆盖。
 
 **Deep-Dive Node Links**：C1/C2/C3（Ch9）→ R1（Ch10）→ M1（refresh deadline）→ G1（drain 判据）。
 
-**Steering**：Preferred = commit 双视角 + 入口检测；Secondary = WAW merge 但不做 forwarding 的原因；Do-not-volunteer = —。
+**追问引导**：优先引导 = commit 双视角 + 入口检测；次选方向 = WAW merge 但不做 forwarding 的原因；不主动展开 = —。
 
 ## 1.17 Answer Playbook — C-M-T-P-H（服务 90s Answer）
 
@@ -404,39 +404,39 @@ Symptom → Observable → Bottleneck Hypothesis → Architecture Cause → Desi
 | **C**onclusion | 先给架构结论 | 不从 RTL 细节讲起 |
 | **M**odel | 因果模型：为什么影响 BW / Latency / PPA | 尽量公式或链条 |
 | **T**radeoff | 得到什么、牺牲什么、alternatives | 至少一个 alternative |
-| **P**roof | counter / simulation / synthesis / sweep | 区分 observable vs attributable；无 Proof 方法则该结论 PARTIAL |
+| **P**roof（证据）| counter / simulation / synthesis / sweep | 区分 observable vs attributable；无 证据方法则该结论 PARTIAL |
 | **H**ook | 主动留下一个值得追问的接口 | 优先引向自己熟悉方向 |
 
-完整范例见 1.4（RQ3/CAM=64）。旧文档的"金句"各章就地保留，作为 Hook 素材。
+完整范例见 1.4（RQ3/CAM=64）。旧文档的"金句"各章就地保留，作为 追问点素材。
 
 **因果链七层 + 范例（[MODEL 范例]）**：read 默认偏向的由来——read latency sensitive（AXI read 必须等数据）→ write BRESP 可提前（端到端延迟责任不对称）→ GSC 默认偏 read、write 见缝插针 batch drain → turnaround 摊薄但 write queue latency ↑ → 用 R/W latency + turnaround cycles 验证。七层落位：Physical Problem（**shared bidirectional / half-duplex DQ** + read/write 端到端延迟责任不对称）→ Protocol Constraint（AXI response 语义）→ MC Requirement（延迟责任划分）→ Architecture Mechanism（GSC 默认 read + write drain）→ RTL State（方向态/配额计数）→ Performance Cost（write latency↑ 换 turnaround↓）→ Observed Counter（R/W latency 分向统计）。
 
 ## 1.18 Answer Depth — 20s / 90s / Deep Dive 三档规范
 
-- **20s**：Conclusion + 一层因果 + 一个 Hook，**然后停下**——不主动倒出所有细节；
+- **20s**：Conclusion + 一层因果 + 一个 追问点，**然后停下**——不主动倒出所有细节；
 - **90s**：C-M-T-P-H 完整骨架（1.17）；
 - **Deep Dive**：仅当 interviewer 继续追问时，沿 Node Link 进入：Architecture Node（Part I）→ Current Design → RTL Reference（Part III）→ Protocol Detail → Corner Case → PPA → Measurement。
 - 三档答案共用同一套事实，差异只在展开深度——禁止三档之间相互矛盾。
 
-## 1.19 Hook Strategy
+## 1.19 追问点策略
 
-三类 Hook：
-- **A. Tradeoff Hook**："这个方案 BW 更高，但 P99 / latency 会变差。"
-- **B. Counterexample Hook**："这个结论对 streaming 成立，random 下完全不同。"
-- **C. Measurement Hook**（本人重点）："这个问题最后不是靠直觉，而是靠 blocked-cycle attribution / counter 才定位出来的。"
+三类追问点：
+- **A. Tradeoff 追问点**："这个方案 BW 更高，但 P99 / latency 会变差。"
+- **B. 反例追问点**："这个结论对 streaming 成立，random 下完全不同。"
+- **C. 测量追问点**（本人重点）："这个问题最后不是靠直觉，而是靠 blocked-cycle attribution / counter 才定位出来的。"
 
-**逐 RQ Steering 总表**：
+**逐 RQ 追问引导总表**：
 
-| RQ | Preferred Hook | Secondary | Do-not-volunteer |
+| RQ | 优先引导 | 次选方向 | 不主动展开 |
 |---|---|---|---|
 | RQ1 | blocked-cycle attribution | CAM visibility | PHY analog |
 | RQ2 | 65% 案例全流程 | counter 能推/不能推边界 | SoC/NoC 内部 |
 | RQ3 | depth sweep proof | burst 双口径+compare path | link list RTL |
 | RQ4 | stride 通式现场推导 | rank 哲学 | DDR5 sub-channel 惯例（OPEN） |
 | RQ5 | H 区间四约束 | streaming vs random 反例 | — |
-| RQ6 | eligible vs executable | hit-first P99 反例 | filter RTL |
+| RQ6 | BSC/GSC/FSC 三层职责边界 | hit-first P99 反例 | filter RTL |
 | RQ7 | turnaround 账单+hidden tRCD | 90R+10W starvation | — |
-| RQ8 | workload→limiting-timing 表 | lost issue slot 口径 | counter 逐项清单 |
+| RQ8 | workload→limiting-timing 表 | blocked command 口径 | counter 逐项清单 |
 | RQ9 | Odd/Even watchdog 展示题 | 双账本 | PRAC/ABO 未实现细节 |
 | RQ10 | 全层级冲突结构 | expired GPR 上界 | P99 数值 |
 | RQ11 | 三类 workload 对照 | stride 通式 | — |
@@ -450,7 +450,7 @@ Symptom → Observable → Bottleneck Hypothesis → Architecture Cause → Desi
 
 # Part I — Performance Foundations
 
-> 每个 Architecture Node 按 **11 字段模板**展开：① Interview Entry ② Core Conclusion ③ Problem ④ Performance & Correctness Model ⑤ Current Design ⑥ Interaction（≥3 Node，真实因果边）⑦ Alternatives ⑧ Tradeoff & Saturation Point ⑨ Proof（含九步诊断闭环，走不通 = PARTIAL）⑩ Interview Follow-up Graph（≥2 层）⑪ Interview Hook。RTL 细节一律指向 Part III（生成后互链）。**模板是问题清单不是答案清单**：某字段无可靠依据时写 OPEN / PARTIAL + closure path，不补 generic answer（Evidence Discipline，见 0.8）。
+> 每个 Architecture Node 按 **11 字段模板**展开：① 面试切入点 ② Core Conclusion ③ Problem ④ Performance & Correctness Model ⑤ Current Design ⑥ Interaction（≥3 Node，真实因果边）⑦ Alternatives ⑧ Tradeoff & Saturation Point ⑨ 证据与验证（含九步诊断闭环，走不通 = PARTIAL）⑩ 追问展开（≥2 层）⑪ 追问点。RTL 细节一律指向 Part III（生成后互链）。**模板是问题清单不是答案清单**：某字段无可靠依据时写 OPEN / PARTIAL + closure path，不补 generic answer（Evidence Discipline，见 0.8）。
 
 # 2. Demand, Outstanding & Visibility（V1 / V2 / V3）
 
@@ -459,7 +459,7 @@ Symptom → Observable → Bottleneck Hypothesis → Architecture Cause → Desi
 
 ## 2.1 V1 — Demand / Outstanding（CORE）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - outstanding 多大才够？"太大增加 latency"是排队论推论还是实测？
 - AFIFO 为什么能一物两用（跨时钟域 FIFO = outstanding buffer）？
 - link node 数 96/224 怎么来的？
@@ -497,13 +497,13 @@ Symptom → Observable → Bottleneck Hypothesis → Architecture Cause → Desi
 #### ⑧ Tradeoff & Saturation Point
 outstanding 加深收益递减为 [MODEL] 推断：demand 充足、NoC latency 可隐藏时，加深的边际收益趋于下降、queueing latency 上升；具体饱和点与 BW/latency 曲线无项目数据（1-P1-14 / 1-Q-02 [TODO-MEASURE]）；失败场景：单 ID 独占 list（list 不可复用但 head 持续推进，不阻塞自身）。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - sweep：outstanding depth → BW / P99 曲线 [TODO-MEASURE→X-P1-07]；
 - 运行时 [RTL O1]：ostd 计数（dbg_obv，V1 侧）；lpr/tpw fifo_full 电平（V3 侧证据，交叉引用）；
 - 诊断闭环（V1 只管 Demand；Admission 证据归 V3）：Symptom（idle_no_request 高）→ Observable（**Ch18 authoritative inventory 已确认 request-arrival / queue-empty / demand-occupancy 无 direct RTL observable** [TODO-MEASURE→X-P1-07]；可用证据 = ostd 间接证据 + arrival/occupancy trace/model）→ Hypothesis（上游 supply 不足 / outstanding depth 不足）→ Knob（ostd depth / upstream concurrency）→ Experiment（outstanding sweep + arrival/occupancy trace）→ Conclusion（Demand 是否为瓶颈）。
 - 边界注记：fifo_full / credit==0 是 V3（Admission）证据，不得作为 V1 判据。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么 AFIFO 能兼任 outstanding buffer？（CDC 与缓冲都是"深度换时序"）
 - double：outstanding 翻倍 → 饱和点判断？
 - workload：大包/小包 mix 下 node 与 CAM 谁先满？（→V2 burst packing）
@@ -511,13 +511,13 @@ outstanding 加深收益递减为 [MODEL] 推断：demand 充足、NoC latency �
 - failure：AW/W 悬挂的自饿边界？（→Ch9 liveness）
 - redesign：BRESP 点后移的代价？（→C3）
 
-#### ⑪ Interview Hook
-**Concept Hook**："我会先区分'真的没有 work'和'有 work 但进不来'：前者是 V1 Demand（idle_no_request），后者才是 V3 Admission（blocked_admission，证据是 fifo_full / credit）。这两类混在一起，很容易误判 controller 的瓶颈。"
+#### ⑪ 追问点
+**概念追问点**："我会先区分'真的没有 work'和'有 work 但进不来'：前者是 V1 Demand（idle_no_request），后者才是 V3 Admission（blocked_admission，证据是 fifo_full / credit）。这两类混在一起，很容易误判 controller 的瓶颈。"
 
 
 ## 2.2 V2 — Scheduler Visibility（CORE）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - 为什么 CAM 是 32/64/96，不是 16 / 256？
 - 为什么 global CAM，不用 per-bank queue？
 - burst=4 买到什么？"等效 256 commands"是什么口径？
@@ -558,12 +558,12 @@ scheduler 每拍只能从 CAM 内容里提名候选——visibility 不足时，
 - 失效场景 [MODEL]：mapping（L5）不变、entropy 不降时，加深主要买 queueing latency 与 compare 代价；机会收益是否仍存在取决于上述七因素；
 - 饱和点对比（random vs streaming 谁先饱和）：无项目数据，OPEN [TODO-MEASURE]（closure = depth×workload sweep 16/32/64/96/128）。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - sweep：CAM depth 16/32/64/96/128 × {random, streaming, stride} → BW / P99 / area / timing [TODO-MEASURE→X-P1-07]；
 - 运行时 [RTL O1]：cam_outnum16/24/32 占用电平（top 侧累计）；burst packing rate [TODO-MEASURE 3-Q-02]；HOL Pending cycle loss [TODO-MEASURE 3-Q-03]；
 - 诊断闭环：Symptom（blocked_no_candidate 高）→ Observable（CAM 占用低 = 入队瓶颈 / 占用高但 CCT 空 = 分布问题）→ Hypothesis（L5 mapping vs V3 admission）→ Knob → Experiment（stride sweep + bank-ready 分布）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - CAM64→128 何时几乎不再提高？（→ 饱和判据）
 - 为什么不用 per-bank queue？（→ ⑦）
 - CCT 单槽如何消费 visibility？（→ S1）
@@ -571,13 +571,13 @@ scheduler 每拍只能从 CAM 内容里提名候选——visibility 不足时，
 - HBM bank 很多，为什么仍可能跑不满？（→ T2 ACT supply / L2 消化能力，不是 visibility）
 - 深度 × 面积 × Fmax 怎么折？（→ P1，非线性）
 
-#### ⑪ Interview Hook
-**Measurement Hook**："CAM depth 的甜点高度 workload-dependent：streaming 主要看 locality/burst 是否已经够，random 主要看 deeper window 是否还能增加 BLP——谁先饱和不能靠直觉，我会用 depth×workload sweep 判断。"
+#### ⑪ 追问点
+**测量追问点**："CAM depth 的甜点高度 workload-dependent：streaming 主要看 locality/burst 是否已经够，random 主要看 deeper window 是否还能增加 BLP——谁先饱和不能靠直觉，我会用 depth×workload sweep 判断。"
 
 
 ## 2.3 V3 — Admission / Credit / Backpressure（CORE）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - credit 如何工作？grant 与归还的精确时点？
 - 全链路 backpressure point 有几个？哪个最容易 throughput collapse？
 - 水线为什么和 GSC 读写切换联动？
@@ -613,21 +613,21 @@ scheduler 每拍只能从 CAM 内容里提名候选——visibility 不足时，
 - credit 粒度 vs 计数代价；水线阈值 = write latency 与 switch 频率的折中（→D1 的 sweep 复用）；
 - 失效场景：credit 数 ≠ CAM 深度配合失当 → 永久少量空转或假满；clock gate 场景的反压边界 [TODO-RTL：DM-P2-02 联动]。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - 运行时 [RTL O1]：credit（dbg_obv）、fifo_full 电平、exp_gpr/gpw 饥饿健康度（应 ≈0）；
 - sweep：水线阈值 × GSC 参数联合 sweep（→D1 复用）[TODO-MEASURE→X-P1-07]；
-- 断言：credit 守恒（grant 消耗 + 归还 = 常数；conservation 检查 → 各 Node Proof）；
+- 断言：credit 守恒（grant 消耗 + 归还 = 常数；conservation 检查 → 各 Node 证据）；
 - 诊断闭环：Symptom（admission 类 blocked 高）→ Observable（credit 0 / fifo_full）→ Hypothesis（下游不放行 → V2 出口堵塞 or WDP 满）→ Knob → Experiment → Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - credit 翻倍会怎样？（→ ⑧ 失配场景）
 - entry vs command 粒度的公平性量化？（[OPEN：3-P1-06]）
 - 水线阈值 sweep 与 GSC 参数谁主导？（→ D1）
 - clock gate / DFS 时反压链如何收敛？（→ G1）
 - 低 QoS 请求来自高优先 port，谁压谁？（→ S3 / RQ10）
 
-#### ⑪ Interview Hook
-**Concept Hook**："把 no-request 与 blocked-admission 分开后，诊断时才能区分'没有 work'（V1）和'有 work 但进不来'（V3）——这是 taxonomy v2 必须拆 admission 的原因。"
+#### ⑪ 追问点
+**概念追问点**："把 no-request 与 blocked-admission 分开后，诊断时才能区分'没有 work'（V1）和'有 work 但进不来'（V3）——这是 taxonomy v2 必须拆 admission 的原因。"
 
 
 ---
@@ -639,7 +639,7 @@ scheduler 每拍只能从 CAM 内容里提名候选——visibility 不足时，
 
 ## 3.1 L5 — Address Mapping / Workload Geometry（CORE）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - mapping 怎么调优？你先报什么——位图还是指标？
 - 为什么是 {row, cs, ba, col, bg, col}？换 RBC / XOR hashing 会怎样？
 - stride=4KB 的 workload 落在哪些 bank？不用 simulation 能判断吗？
@@ -681,13 +681,13 @@ mapping 是 workload geometry 与 DRAM 几何的耦合器：它同时决定 row-
 - [RTL + MODEL] cs 位放高省 rank-to-rank 切换开销（data-bus / ODT / DQS），但浪费跨 rank 独立 bank state 的并行度；**cs 位置被 col/bg/ba 总位宽钉死在 [10]，不能单独调高**——要更大 rank 连续段只能加伪交织位或换更大 page 颗粒 [RTL]；
 - [MODEL] 改映射的收益上限受 workload entropy 支配：entropy 不降、access pattern 不变时，单纯重排位图的收益有限。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - 验证框架：**两硬指标 + pattern 纪律**——① page hit rate（col 命中已开 row 比例；顺序流接近满 hit，random 达该负载理论上限）；② tCCD_S 满足占比（col 背靠背跨 BG 的比例）；纪律 = random + linear 两类、64B~512B 粒度、**一套映射同时服务两类负载**（只跑 linear 会选出偏科配置）；
 - [口径·RTL] hit rate 与 tCCD_S 占比均需 per-command row/BG 状态——**RTL counter 推不出**（命令计数只有 mix），靠 trace / 模型统计（证据边界 → Ch18）；
 - Closure：stride sweep 64B→MB → hit rate / row conflict / bank entropy / BG entropy / BW [TODO-MEASURE→X-P1-07]；"当前位图在双负载下最优"同一 sweep 关闭；
 - 诊断闭环：Symptom（blocked_no_candidate 高 / ACT 供给受限）→ Observable（ACT/col 比、命令 mix [RTL O1]）→ Hypothesis（mapping entropy / stride 形态）→ Knob（位图）→ Expected（hit↑ / ACT↓）→ Side effect（BLP 分布变化）→ Experiment（stride sweep）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么 BG 两位拆开夹 BA？（顺序流滚动次序：同 bank 滚 col[2:0] 8 连发 → 翻 bg0 → 滚 ba → 翻 bg1）
 - double：bg1 从 [6] 移到 [7] 会怎样？（每 BA 段从 16 条变 32 条，H 区间移动 → 3.3）
 - workload：stride=4KB 落在哪？（BG0/BG2 的 ba0 两 bank 交替，每 bank col 每 2 拍 +1——k=6 行）
@@ -695,13 +695,13 @@ mapping 是 workload geometry 与 DRAM 几何的耦合器：它同时决定 row-
 - failure：非 2^n 容量配置错误会怎样？（非法物理地址——空洞交换的职责）
 - redesign：什么时候值得引入 hashing？（k≥7 大 stride 热点真实存在时 [TODO-DESIGN]）
 
-#### ⑪ Interview Hook
-**Measurement Hook**："mapping 调优我先报指标和 pattern 集合，再报结论——一套映射必须同时服务 random 和 linear，只跑 linear 会选出偏科配置。"
+#### ⑪ 追问点
+**测量追问点**："mapping 调优我先报指标和 pattern 集合，再报结论——一套映射必须同时服务 random 和 linear，只跑 linear 会选出偏科配置。"
 
 
 ## 3.2 L1 — Row Locality（CORE）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - 什么叫 page hit？你的设计里有几个"page hit"概念？
 - hit rate 在策略选择里扮演什么角色？它是唯一的决定因素吗？
 - sequential traffic 一定要追求 row hit 吗？什么时候宁可牺牲？
@@ -736,24 +736,24 @@ DRAM 的行缓冲语义使"先开行再连发"远优于"开行即关"——row l
 #### ⑧ Tradeoff & Saturation Point
 [MODEL] hit rate 提升的收益在 ACT 供给不再是瓶颈时饱和（此后 T3/tCCD 接管）；random 负载下 hit 率有该负载理论上限（再调 mapping/policy 无益）；hit-first 提名的 P99 代价 → Ch4 S2。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - Closure：RowHitRate→BW 与 RowHitRate→P99 两张曲线 [TODO-MEASURE→X-P1-07]；hit rate 用 trace/模型统计（RTL counter 只给 ACT/col 近似）；
 - 诊断闭环：Symptom（ACT/col 偏高、tRRD/tFAW blocked 占主导）→ Observable（ACT 计数/col 计数 [RTL O1]）→ Hypothesis（hit rate 低：mapping entropy / page policy / 可见窗口不足）→ Knob（L5 位图 / L4 策略 / V2 深度）→ Experiment（stride sweep + hit 统计）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么静态判定（①②）与动态判定（③）要分开？（时序位置与信息量不同：入口无 BSC 状态）
 - double：hit rate 翻倍 BW 一定翻倍吗？（否——ACT 供给退出瓶颈后由 T3 接管）
 - workload：random 的 hit 上限是多少？（由 entropy 决定，2.4 指标定义）
 - failure：page_match_next 与映射配置不一致会怎样？（AMAP 单源消除该可能 [RTL]）
 - redesign：hit 判定前移到 PA？（信息不足——PA 点无 BSC 状态）
 
-#### ⑪ Interview Hook
-**Counterexample Hook**："顺序流不一定追求 row hit——HBM bank 多到并行能掩盖 ACT 时，把位图偏向 BLP 反而更优；hit 与并行谁值钱由 H 区间决定（→3.3）。"
+#### ⑪ 追问点
+**反例追问点**："顺序流不一定追求 row hit——HBM bank 多到并行能掩盖 ACT 时，把位图偏向 BLP 反而更优；hit 与并行谁值钱由 H 区间决定（→3.3）。"
 
 
 ## 3.3 L2 — Bank-Level Parallelism（CORE）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - locality 和 BLP 冲突时怎么找最佳点？
 - 为什么"每 bank 4~8 条命令"是下限？
 - HBM bank 那么多，为什么还是可能跑不满？
@@ -789,11 +789,11 @@ DRAM 的行缓冲语义使"先开行再连发"远优于"开行即关"——row l
 #### ⑧ Tradeoff & Saturation Point
 [MODEL] BLP 饱和点：当 T2 的 ACT 供给（tRRD/tFAW）先于 DQ 饱和时，再加 bank 并行无收益（HBM bank 多仍可能跑不满的两个原因之一；另一个是 V2 可见性不足）；Q/H 摆位失衡时单侧浪费。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - Closure：4~8 commands/bank 最优点 sweep（1/2/4/8/16/32）[TODO-MEASURE→X-P1-07]；H 区间用真实 timing 参数代入验证；
 - 诊断闭环：Symptom（BLP 利用不足 / ACT blocked 高）→ Observable（ACT/col、命令 mix、bank-ready 分布 [MODEL]）→ Hypothesis（H 摆位 / 可见性 / ACT 供给谁先饱和）→ Knob（L5 位图 / V2 深度）→ Experiment（H sweep × workload）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么 tRC 由 N_bank 隐藏而不是靠更深队列？（tRC 是 bank 物理时间，只能用别的 bank 填）
 - double：bank 数翻倍 H_bank 减半意味着什么？（bank 位可更低 / 更倾向 BLP）
 - workload：random 下有效 BLP 怎么算？（可见窗口内不同 bank 期望数）
@@ -801,13 +801,13 @@ DRAM 的行缓冲语义使"先开行再连发"远优于"开行即关"——row l
 - failure：全部请求落同一 bank 会怎样？（T2 ACT 链 + 单 bank tRC 直接暴露）
 - redesign：CCT 每拍提名多 bank？（S1 单槽的消费瓶颈讨论）
 
-#### ⑪ Interview Hook
-**Tradeoff Hook**："BLP 和 locality 用的是同一批地址位——H 区间就是这两位的租约合同；先保 locality 下限，剩下的位全租给并行。"
+#### ⑪ 追问点
+**Tradeoff 追问点**："BLP 和 locality 用的是同一批地址位——H 区间就是这两位的租约合同；先保 locality 下限，剩下的位全租给并行。"
 
 
 ## 3.4 L3 — Bank-Group Parallelism（CORE）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - BG 交织为什么能"白吃"带宽？
 - bg0 和 bg1 两位为什么拆开放、还要夹住 BA？
 - tCCD_S / tCCD_L 怎么影响调度？
@@ -841,36 +841,37 @@ tCCD_L/tRRD_L 表明同 BG 的 bank 共享资源（局部命令/激活路径）�
 #### ⑧ Tradeoff & Saturation Point
 [MODEL] BG 并行的收益在 BGactive 数足够摊平 tCCD_L 后饱和；BG 数少的协议（部分 DDR4 无 BG）此 Node 退化——L3 为协议相关 Node。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - 指标：tCCD_S 满足占比（跨 BG 背靠背比例；RTL counter 推不出，trace/模型 [口径]；direct observable 边界 → Ch18 Table A/B）；Closure：交织位摆位 sweep × {random, linear} [TODO-MEASURE→X-P1-07]；
 - 诊断闭环：Symptom（tCCD_L blocked 占比高）→ Observable（命令 mix / BG 面分布 [MODEL]）→ Hypothesis（BG 交织不足）→ Knob（bg 位摆位）→ Experiment（sweep + tCCD_S 占比）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么拆开两位而不是集中？（滚动次序让 8 连发 → BG 翻转 → BA 滚动形成层次化并行）
 - double：BG 数翻倍会怎样？（H 区间整体移动；tCCD_L 摊薄上限变化）
 - workload：stride=4KB 时 BG 表现？（k=6：仅 bg1 滚动，BG0/BG2 交替——L5 通式表）
 - protocol：哪些协议有 BG？（DDR4（2BG 起）/ DDR5 / HBM3/4；LPDDR 视代际——[SPEC]，具体 per-protocol 布局 → Memory_Protocal.md）
 - failure：BG 位与容量空洞交换冲突？（空洞交换在 row 高位，不干扰 BG [RTL]）
 
-#### ⑪ Interview Hook
-**Tradeoff Hook**："BG 交织几乎是零硬件面积的并行度旋钮——它只是把同一条命令流换到更便宜的 timing 类别（tCCD_S）。"
+#### ⑪ 追问点
+**Tradeoff 追问点**："BG 交织几乎是零硬件面积的并行度旋钮——它只是把同一条命令流换到更便宜的 timing 类别（tCCD_S）。"
 
 # 4. Command Opportunity & Reordering（S1 / S2 / S3 + L4）
 
 > **本章核心问题：当大量 request 已经可见时，如何挑出"最值得现在执行"的 command？**
-> 判定语言：**CCT**（Command Candidate Table，候选表）→ **BSC ready**（bank state ∩ AC timing）→ **GSC direction allow** → **FSC select** → **command issue**（下发 + state/counter update）——"能不能调"（CQ）与"能不能发"（BSC+GSC legality）是正交判断，串联后相与 [RTL·六层口径，权威定义 → Ch14.3]。
+> 判定语言：**CCT**（Command Candidate Table，候选表）→ **BSC ready**（bank state ∩ AC timing）→ **GSC direction allow** → **FSC select** → **command issue**（下发 + state/counter update）——"能不能调"（CQ）与"能不能发"（BSC+GSC legality）是正交判断，串联后相与 [RTL，权威定义 → Ch14.3]。
 
 ## 4.1 S1 — Command Eligibility（CORE）
 
-#### ① Interview Entry
-- 什么叫 eligible？什么叫 executable？为什么必须分两个词？
+#### ① 面试切入点
+- CCT 候选从哪里来？为什么每 bank 只有一个提名？
+- CCT 上表后到真正发令中间还要过几关？
 - 为什么每 bank 只提名一条（CCT 单槽），不是两条？
 - CCT 上表后为什么不可撤回？换来了什么？
 - CCT 空意味着什么 blocked reason？
 
 #### ② Core Conclusion
 [RTL] 命令从 CAM 到 CCT 经**三层筛选**：① bank filter（CAM→bank 分组，不截断）→ ② priority filter（同 bank 内选高优先级）→ ③ oldest filter（同优先级选最老）。CCT 为 **per-bank 单槽**（RD/WR 各一张，读方向只见 RD CCT），**上表后不可撤回、直到发送**——用灵活性换时序收敛的典型决策。
-[口径] CCT 只反映"提名"（eligible），命令下发还需 BSC timing 检查（executable 判定在 Ch5 T1）。
+[口径] CCT 只反映"提名"；候选到命令还需 BSC ready → GSC selection → FSC arbitration（→ Ch4 章头 / Ch14）。
 
 #### ③ Problem
 每拍最终只能发有限命令（DDR/LPDDR 单条、HBM row+col 双发），必须从可见集合收敛到 per-bank 候选——S1 是 visibility（V2）到 selection（S2）之间的"提名"层：粒度是 bank（bank 间并行天然保证），bank 内收敛到单条。
@@ -884,7 +885,7 @@ tCCD_L/tRRD_L 表明同 BG 的 bank 共享资源（局部命令/激活路径）�
 [RTL]（以下各条均为当前项目实现事实）
 - 三层 filter 流水线（①②③如 ②）；
 - CCT per-bank、深度随 bank 数（不是任意值）；进入 CCT 的候选不再带优先级语义（提名竞争只发生在 priority filter——CCT 层无新旧竞争，4-P0-03/04 定稿）；
-- CS 侧口径 [RC-1 六层]：Eligible（CCT 上表）→ BSC-ready（bank FSM ∩ counter）→ Direction-legal（GSC）→ Executable（三者齐备）→ Selected（FSC）→ Issued（下发 + counter load + FSM update + CCT release）——authoritative 定义见 Ch14.3 / Ch9 C3。
+- CS 链路 [RTL·HBM current config]：CCT 上表候选 + BSC ready（bank FSM ∩ AC timing）→ GSC normal selection（从 CCT normal candidates 中选）→ FSC 最终仲裁（GSC normal command + refresh/DEVMGR）→ 发 DFI + counter load + FSM update + CCT release——authoritative 定义见 Ch14.3。
 
 #### ⑥ Interaction
 ← **V2**（CAM 内容与 burst entry 粒度决定可提名集）；← **C2**（依赖拦截后的可见集）；↔ **T1**（BSC ready 相与）；→ **S2**（FSC 仲裁的输入）；→ **T3**（col 密度）；cross-check：O2 no-candidate 归因（CCT 空 = blocked_no_candidate）。
@@ -897,11 +898,11 @@ tCCD_L/tRRD_L 表明同 BG 的 bank 共享资源（局部命令/激活路径）�
 #### ⑧ Tradeoff & Saturation Point
 [RTL+MODEL] 单槽 + 不可撤回 = 时序收敛与验证简单的代价是在位阻塞；[MODEL] 饱和判据：CCT 空且 CAM 非空 = 提名层问题（V2 分布 / mapping），CCT 非空但 FSC 无输出 = 下游问题（T1/S2/D1）——两者是 RQ2 诊断链的分界证据。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - Closure：CCT 单槽 vs 双槽的 BW/时序/面积对比 [TODO-DESIGN→必要时 MEASURE]；CCT 占用分布 trace；
 - 诊断闭环：Symptom（blocked_no_candidate 高）→ Observable（CCT 空率、CAM 占用 cam_outnum [RTL O1]）→ Hypothesis（可见性不足 / mapping 集中 / 依赖拦截）→ Knob（V2 深度 / L5 位图）→ Experiment（occupancy trace + stride sweep）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么单槽不可撤回能换时序？（命令生成器对稳定输入的流水化）
 - double：双槽会怎样？（在位阻塞缓解 vs 时序/面积代价 [TODO-DESIGN]）
 - workload：全部命令集中一个 bank？（CCT 成为该 bank 串行点）
@@ -909,13 +910,13 @@ tCCD_L/tRRD_L 表明同 BG 的 bank 共享资源（局部命令/激活路径）�
 - failure：expired GPR 撞上 timing-blocked 在位候选？（等在位发送 + GSC 方向解锁两级保证 [RTL]，严格 bound → S3-P1-01）
 - redesign：提名与 timing 判定合并成一层？（正交性丧失，各自演进/验证困难 [RTL 设计理由]）
 
-#### ⑪ Interview Hook
-**Concept Hook**："eligible 和 executable 是两个正交判断——CQ 决定能不能调，BSC 决定能不能发，相与之后才是可执行命令。这两个词分开，调度器的验证都能少一半。"
+#### ⑪ 追问点
+**概念追问点**："CCT 是提名层、CS 是发令层——CQ 决定可见什么，BSC/GSC/FSC 决定怎么发出。两层分开，调度器的验证都能少一半。"
 
 
 ## 4.2 S2 — Command Selection / Reordering（CORE）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - 为什么必须 reorder？FCFS 到底差在哪？
 - hit-first 一定最好吗？它的 P99 代价多大？
 - hit 流会不会饿死 miss 流？
@@ -937,8 +938,8 @@ tCCD_L/tRRD_L 表明同 BG 的 bank 共享资源（局部命令/激活路径）�
 
 #### ⑤ Current Design
 [RTL]（以下各条均为当前项目实现事实）
-- 双模式可配（② 的两个优先序）；oldest filter 在延迟确定性模式下使全链退化为 oldest-first；
-- FSC：Col > Row（根因：col 产生数据传输，保证 DQ 不空转）；ACT > PRE（需求驱动优先于服务性操作——ACT 的触发源是 CCT 上真实 miss，PRE 之后不一定有跟随）；critical ref 经 mask ACT+Col 打破常态序（→M2）；
+- 双模式可配（② 的两个优先序）；oldest filter 在延迟确定性模式下使全链退化为 oldest-first；**GSC 只从 normal traffic 的 CCT candidates 中选——refresh / DEVMGR / force-precharge 不走 GSC，它们在 FSC 汇合** [RTL]；
+- FSC（最终仲裁层）：输入 = GSC normal command + refresh / DEVMGR 请求；Col > Row（根因：col 产生数据传输，保证 DQ 不空转）；ACT > PRE（需求驱动优先于服务性操作——ACT 的触发源是 CCT 上真实 miss，PRE 之后不一定有跟随）；critical ref 经 mask ACT+Col 打破常态序（→M2）；FSC 每拍至多发一条 DFI 命令；dfi_busy 在当前实现 tie 0 [RTL·HBM current config]；
 - 每拍命令数由协议钉死：DDR/LPDDR CA 复用 → 单条；HBM row/col 线独立 → 可同拍 row+col（FSC 可流水化双发）[SPEC→架构]。
 
 #### ⑥ Interaction
@@ -953,11 +954,11 @@ tCCD_L/tRRD_L 表明同 BG 的 bank 共享资源（局部命令/激活路径）�
 #### ⑧ Tradeoff & Saturation Point
 [MODEL] hit-first 收益在 hit rate 趋零（纯 random）时消失，此时 close page + ACT 分散（→L4）更优；policy bubble（eligible 且 ready 但未选）是本 Node 的专属损失类（taxonomy blocked_policy）。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - Closure：priority-first vs page-hit-first 的 BW / avg latency / P99 / starvation time 对比 [TODO-MEASURE→X-P1-07]；RowHitRate→BW 与 →P99 两张曲线同 sweep；
 - 诊断闭环：Symptom（blocked_policy 占比高）→ Observable（命令 mix、方向状态 [RTL O1]）→ Hypothesis（双模式配置 / 提名序与到达结构不匹配）→ Knob（模式切换）→ Experiment（A/B + P99 统计）→ Conclusion（P99 为 [MODEL only] 观测，声明边界）。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么 expired GPR 在 priority filter 恒第一而不是迁队列？（晋升 = 队列内打标记，避免跨队列迁移的时序代价）
 - double：两个模式间动态切换会怎样？（hysteresis 需求 + 抖动风险 [TODO-DESIGN]）
 - workload：random 下还 reorder 吗？（收益转移：hit-first 无效，但 BG 交织/批处理仍有效）
@@ -965,13 +966,13 @@ tCCD_L/tRRD_L 表明同 BG 的 bank 共享资源（局部命令/激活路径）�
 - failure：hit 风暴 + ACT 供给不足？（自愈失效场景——回落到 aging 保底 [INFERENCE→S3]）
 - redesign：把 policy 做成 per-bank？（配置维度上升，收益未知 [TODO-DESIGN]）
 
-#### ⑪ Interview Hook
-**Counterexample Hook**："hit-first 不是永远正确——random 下它免费也无用；而 delay-SLA 流量要的甚至不是快，是可预测。所以我把它做成两模式可配。"
+#### ⑪ 追问点
+**反例追问点**："hit-first 不是永远正确——random 下它免费也无用；而 delay-SLA 流量要的甚至不是快，是可预测。所以我把它做成两模式可配。"
 
 
 ## 4.3 S3 — QoS / Aging / Fairness（CORE）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - QoS 的完整层级是什么？冲突时谁压谁？
 - 低优先级请求怎么保证不被饿死？
 - "优先级调度会降低整体性能"——怎么理解？
@@ -1010,12 +1011,12 @@ tCCD_L/tRRD_L 表明同 BG 的 bank 共享资源（局部命令/激活路径）�
 #### ⑧ Tradeoff & Saturation Point
 [MODEL] aging 阈值过短 → GPR 频繁晋升、优先级语义被稀释（接近无 QoS）；过长 → 饥饿窗口拉大；[口径] 最优阈值无项目数据——OPEN [TODO-MEASURE]。S3 与 S2 的冲突（QoS vs hit-first）即 RQ10 的核心问题，无闭式解，靠双模式配置 + 观测。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - [RTL O1] hpr/lpr/gpr/tpw accepted 分布、exp_gpr/gpw（≈0 健康度）、fifo_full（V3 侧）；
 - Closure：P50/P99 latency 与 starvation time（trace/模型 [MODEL only]）；aging 阈值 sweep [TODO-MEASURE→X-P1-07]；starvation bound 形式化 [S3-P1-01 TODO-DESIGN]；
 - 诊断闭环：Symptom（某类流量 latency 异常 / exp_gpr 非零）→ Observable（accepted 分布、方向状态）→ Hypothesis（优先级配置 / D1 方向压制）→ Knob（队列映射 / aging / 水线）→ Experiment（分布统计 + A/B）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么晋升不迁队列？（时序代价 vs 语义清晰 [RTL 决策]）
 - double：aging 阈值减半会怎样？（晋升频率↑，QoS 稀释 [MODEL]）
 - workload：10% 实时流 + 90% bulk？（确定性模式 + port 权重的组合）
@@ -1023,13 +1024,13 @@ tCCD_L/tRRD_L 表明同 BG 的 bank 共享资源（局部命令/激活路径）�
 - failure：exp_gpr 持续非零说明什么？（防饿死机制被压制的健康度报警）
 - redesign：Scheduler 背长期公平的锅会怎样？（复杂度爆炸 + 与 port/NoC 职责重复——边界声明）
 
-#### ⑪ Interview Hook
-**Tradeoff Hook**："我能明确说出 QoS 的边界画在哪：Scheduler 只管短期延迟优先级，长期带宽保障画在 port 仲裁和 NoC——这个边界本身就是架构决策，不是缺功能。"
+#### ⑪ 追问点
+**Tradeoff 追问点**："我能明确说出 QoS 的边界画在哪：Scheduler 只管短期延迟优先级，长期带宽保障画在 port 仲裁和 NoC——这个边界本身就是架构决策，不是缺功能。"
 
 
 ## 4.4 L4 — Page Policy（CORE；宿主 Scheduling 章，属 Locality 域）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - open page 还是 close page？怎么选？
 - HBM 类负载为什么常配 close page？"天然 close"这个说法准确吗？
 - 三寄存器机制怎么工作？
@@ -1065,12 +1066,12 @@ row open/close 是把 L1 的 hit 机会转换成实际收益的执行器：open 
 #### ⑧ Tradeoff & Saturation Point
 [RTL·已知缺陷] idle-timeout 型 close 有延迟毛刺（idle 计满才发 PRE，恰逢新 ACT 需多等 tRP）；PTW 类负载直接 disable AP、用 pre-idle 或完全 open。饱和：bank 数高到 ACT 可被完全并行掩盖时，open page 的边际收益趋零（HBM 情形 [MODEL]）。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - [RTL O1] AP 使用率（RDA+WRA / col 计数）是 page policy 行为的命令面观测；
 - Closure：close vs open × {streaming, GPU-revisit, random} 的 BW / latency 对比、per-bank 配置收益 [TODO-MEASURE→X-P1-07]；adaptive 判据研究 [TODO-DESIGN]；
 - 诊断闭环：Symptom（ACT/col 偏高且 hit 低）→ Observable（AP 使用率、ACT 计数）→ Hypothesis（page policy 与负载失配）→ Knob（三寄存器逐 bank 配置）→ Experiment（配置 sweep + AP 使用率）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么 AP 是"无感 close"？（precharge 搭在最后一笔 col 的总线上，零额外命令拍）
 - double：tRASmax 到期前的窗口多大？（协议参数 [SPEC]，scope 类问题）
 - workload：GPU blend 流怎么配？（disable AP / open page）
@@ -1078,8 +1079,8 @@ row open/close 是把 L1 的 hit 机会转换成实际收益的执行器：open 
 - failure：pre-idle 毛刺场景？（新 ACT 恰在 PRE 后 → 多等 tRP）
 - redesign：adaptive policy 值得做吗？（判据 + 统计代价 [TODO-DESIGN]）
 
-#### ⑪ Interview Hook
-**Tradeoff Hook**："page policy 不是二选一，是三寄存器的连续旋钮——bank 越多 close 越香，但 GPU 重访流一行配置就能反例给你看。"
+#### ⑪ 追问点
+**Tradeoff 追问点**："page policy 不是二选一，是三寄存器的连续旋钮——bank 越多 close 越香，但 GPU 重访流一行配置就能反例给你看。"
 
 # 5. Timing Supply（T1 / T2 / T3）
 
@@ -1088,7 +1089,7 @@ row open/close 是把 L1 的 hit 机会转换成实际收益的执行器：open 
 
 ## 5.1 T1 — Timing Supply 总纲（CORE）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - timing constraint 为什么是真实带宽 ceiling？
 - random / streaming / mixed workload 分别被什么 timing 卡住？
 - 为什么不用一个 global cycle counter + timestamp？
@@ -1098,7 +1099,7 @@ row open/close 是把 L1 的 hit 机会转换成实际收益的执行器：open 
 #### ② Core Conclusion
 [RTL] 执行层：**五级分布式 counter**（bank / BG / rank / SID / window 三型：down / inline / window）——**所有命令无旁路地通过 counter 检查**才可下发，timing 永不违反是**结构性保证**（非验证 luck）。归 Ch15 的资源事实：≈1017 逻辑 counter（HBM4，近似口径），占调度模块面积 ~40% [MEASURED]。
 [MODEL] 归因层：**Supply/Demand 模型**——持续带宽上限 = min(DQ peak, Column Supply, Row Supply)；tCCD 限制已开 row 的 col 发射速度（Column Supply），tRRD/tFAW/tRC 限制新 row 打开速度（Row Supply）。谁的供给最低，谁就是 sustained BW 瓶颈。
-[口径] "零 timing violation" 只是 **correctness baseline**，不是性能成就；性能问题 = DRAM 本来 legal-to-issue，architecture/policy 没有 issue（lost issue slot 口径，对齐 Ch0.4）。
+[口径] "零 timing violation" 只是 **correctness baseline**，不是性能成就；性能问题 = DRAM 本来 legal-to-issue，architecture/policy 没有 issue（对齐 Ch0.4 blocked reason）。
 
 #### ③ Problem
 DRAM 的 timing constraint（tCCD / tRRD / tFAW / tRC / tRFC）本身是**协议 / device 给定**；architecture 的性能价值在于：能否通过 locality / parallelism / interleaving / scheduling / maintenance scheduling 把这些 timing window **隐藏、错峰或摊薄**。因此 **timing constraint ≠ implementation defect，但 exposed blocked_timing cycles 也绝不是固定的 protocol tax**——供给不足时 blocked_timing 是机会链第五环断点。
@@ -1126,7 +1127,7 @@ BW_sustained ≤ min( BW_DQ_peak,
 - O(1) 语义：检查 = 归零判断的固定常数比较，**与 CAM/队列深度无关** [RTL]；"严格算法复杂度 O(1)"的表述边界 OPEN（6-P1-07）。
 
 #### ⑥ Interaction
-← **S1**（Eligible→BSC-ready→Direction-legal→Executable 六层口径，RC-1 已收口——见 Ch14.3）；→ **T2/T3**（本总纲的两个子供给）；← **L1/L2**（H 区间与 hit 决定各供给项的富裕度）；→ **M2/M4**（tRFC forbid / RFM 禁 ACT 占用供给窗口）；→ **D1**（tWTR/tRTW 窗口）；→ **G1**（DVFS 结构性规避的前提是 IDLE，0.13.4 分档）；cross-check：O2 lost-slot Top5 sweep、min-gap 断言（L 域）。
+← **S1**（CCT 上表候选）+ **S2**（GSC selection）+ **S3**（priority 注入）——BSC ready 与这些正交（权威定义 → Ch14.3）；→ **T2/T3**（本总纲的两个子供给）；← **L1/L2**（H 区间与 hit 决定各供给项的富裕度）；→ **M2/M4**（tRFC forbid / RFM 禁 ACT 占用供给窗口）；→ **D1**（tWTR/tRTW 窗口）；→ **G1**（DVFS 结构性规避的前提是 IDLE，0.13.4 分档）；cross-check：O2 lost-slot Top5 sweep、min-gap 断言（L 域）。
 
 #### ⑦ Alternatives
 - **集中时间戳记账**（每命令记 issue time，检查做减法）[MODEL·五维对照]：位宽统一大、比较需算术单元、持续 toggle 耗电、集中比较易成关键路径、记账表与协议耦合 vs 分布式（小位宽/1bit 归零比较/归零静默门控友好/各级并行/增删层级容易）。本设计在"多协议一套 IP + 多层级并行检查"约束下选分布式 [RTL 决策记录]；
@@ -1136,12 +1137,12 @@ BW_sustained ≤ min( BW_DQ_peak,
 #### ⑧ Tradeoff & Saturation Point
 [MEASURED] counter 面积占调度模块 ~40%（LPDDR6 表）；[RTL] 门控时钟友好——down counter 归零即静默，1017 的平均活动率远低于表面数字。[MODEL] timing constraint 的**存在**是协议固有；**暴露成多少 timing loss 由 workload 与 architecture 是否成功隐藏 / 错峰决定**——优化不是消灭 timing requirement，而是降低它在 useful-issue timeline 上的暴露比例（cross-check：L1 / L2 / L3 / D1 / M2）。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - [MEASURED] 面积双表（LPDDR6 @SF4 1GHz / HBM4 @SF4 1.6GHz 双 PC 合并——全表见 Ch15）；
-- Closure：timing blocker **Top 5（tCCD / tRCD / tRRD+tFAW / tWTR+tRTW / tRFC）各 lost issue slot 占比 sweep** [TODO-MEASURE→X-P1-07（原 6-Q-02）]；timing-1→blocked / timing→allowed 边界统计（6-Q-03）；counter FF 数回填 [TODO-MEASURE：6-P0-05]；
+- Closure：timing blocker **Top 5（tCCD / tRCD / tRRD+tFAW / tWTR+tRTW / tRFC）各 blocked command 占比 sweep** [TODO-MEASURE→X-P1-07（原 6-Q-02）]；timing-1→blocked / timing→allowed 边界统计（6-Q-03）；counter FF 数回填 [TODO-MEASURE：6-P0-05]；
 - 诊断闭环：Symptom（blocked_timing 占比高）→ Observable（命令 mix + 方向状态 [RTL O1]，细分归因 [MODEL]）→ Hypothesis（按映射表对号入座：hit 结构 / miss 率 / mixed 度）→ Knob（上游 L1/L5/V2）→ Experiment（workload sweep）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么不用 timestamp？（⑦ 五维；追问"bank 极多呢"→ OPEN 6-P1-08）
 - double：tFAW 窗口大小变化的 BW 影响？（公式第 3 项）
 - workload：50/50 R/W mixed 的瓶颈在哪？（turnaround 窗口 → D1 账单 + tWTR/tRTW）
@@ -1149,13 +1150,13 @@ BW_sustained ≤ min( BW_DQ_peak,
 - failure：timing 寄存器运行中被 SW 修改？（配置一致性风险——[OPEN 6-I-04，TODO-DESIGN]）
 - redesign：counter 做成频率感知？（DVFS 结构性规避后无必要 [RTL 设计理由]）
 
-#### ⑪ Interview Hook
-**Measurement Hook**："timing 的学习不是背 1017 个 counter，是背'哪类 workload 被哪条 timing 卡'的映射——Top5 lost-slot sweep 一跑，瓶颈自动排序，优化顺序不用吵。"
+#### ⑪ 追问点
+**测量追问点**："timing 的学习不是背 1017 个 counter，是背'哪类 workload 被哪条 timing 卡'的映射——Top5 lost-slot sweep 一跑，瓶颈自动排序，优化顺序不用吵。"
 
 
 ## 5.2 T2 — ACT Supply（CORE）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - ACT 为什么是稀缺资源？它的约束全集是什么？
 - tRCDWR / ACTIVE_WR 是什么？为什么写能提前进？
 - tFAW 的 rolling window 怎么实现？边界 off-by-one 怎么保证？
@@ -1193,11 +1194,11 @@ Column Demand 无限、Row Supply 有限：打开新 row 的速度被四层 timi
 #### ⑧ Tradeoff & Saturation Point
 [MODEL] tFAW / tRRD 是协议级安全义务（防止 wordline 应力），不可优化只可"错峰消化"；ACT 供给饱和判据：tRRD/tFAW blocked cycles 持续占主导且 DQ 有 idle → Row Supply 是瓶颈（T1 公式第 2~4 项最小）。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - Closure：tRRD/tFAW blocked cycles 量化（Top5 sweep 的一部分）[TODO-MEASURE→X-P1-07]；tFAW min-gap 断言（L 域）；
 - 诊断闭环：Symptom（ACT 类 blocked 高）→ Observable（ACT 计数、命令 mix [RTL O1]）→ Hypothesis（miss 率高：L1/L5？还是纯供给限制：tRRD/tFAW 窗口）→ Knob（mapping/page policy）→ Experiment（stride sweep）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么 ACTIVE_WR 只有写窗口？（tRCDWR<tRCD 是协议给写的 timing 优惠 [SPEC]）
 - double：tFAW=4 的窗口如果放宽？（公式第 3 项放松，random BW ↑）
 - workload：多少 miss 率会打到 tFAW？（tACT/tCAS 与窗口的函数 [MODEL]）
@@ -1205,13 +1206,13 @@ Column Demand 无限、Row Supply 有限：打开新 row 的速度被四层 timi
 - failure：tRASmax 与 page policy 冲突？（tRASmax 是兜底不是策略——FORCE_PRE 优先级高于业务 col [RTL]）
 - redesign：把 tRRD/tFAW 检查做成预测式？（预判下一 ACT 时刻 vs 现在禁止——复杂度换提前量 [TODO-DESIGN]）
 
-#### ⑪ Interview Hook
-**Tradeoff Hook**："ACT 是全场最贵的命令——它买的是 H 条 col 的服务权；所以所有调度优化最后都在回答同一个问题：怎么让每个 ACT 被更多的 col 摊薄。"
+#### ⑪ 追问点
+**Tradeoff 追问点**："ACT 是全场最贵的命令——它买的是 H 条 col 的服务权；所以所有调度优化最后都在回答同一个问题：怎么让每个 ACT 被更多的 col 摊薄。"
 
 
 ## 5.3 T3 — Column Supply（CORE）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - streaming workload 为什么卡在 tCCD？
 - 一拍能发几条命令？为什么 HBM 可以两条？
 - BG 交织怎么"白吃"带宽？
@@ -1249,11 +1250,11 @@ DQ 连续性由 col 流的供给密度决定：col 序列 timing（tCCD_S/L、tW
 #### ⑧ Tradeoff & Saturation Point
 [MODEL] tCCD_S 与 tCCD_L 的差值就是 BG 交织收益的上限；Column Supply 饱和判据：DQ 打满且 tCCD blocked 主导、ACT 供给富裕 → 优化对象转向 burst 结构（DP3）而非并行度。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - Closure：tCCD blocked cycles 占比、timing-1→blocked 边界统计 [TODO-MEASURE→X-P1-07]；tCCD_S 满足占比（trace/模型 [口径]）；
 - 诊断闭环：Symptom（DQ 未打满 + tCCD blocked 主导）→ Observable（命令 mix [RTL O1]）→ Hypothesis（BG 交织不足 / hit 供给不足 / 方向切换过频）→ Knob（L3 位图 / L1 / D1 水线）→ Experiment（对照 sweep）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么同 BG 是 tCCD_L？（BG 内 bank 共享局部命令路径 [SPEC·协议 why → Memory_Protocal.md]）
 - double：tCCD_S=L 的协议（无 BG）怎么办？（L3 退化，供给只剩 L1/L2）
 - workload：纯 streaming 的理论上限怎么算？（T1 公式第 1 项代数）
@@ -1261,8 +1262,8 @@ DQ 连续性由 col 流的供给密度决定：col 序列 timing（tCCD_S/L、tW
 - failure：tCCD 计数器与容量空洞交换冲突？（不同层无交叠 [RTL]）
 - redesign：col 命令合包（多条 col 打包一次 CA）？（协议 CA 编码限制 [SPEC]→RQ12）
 
-#### ⑪ Interview Hook
-**Measurement Hook**："判断一个 controller 的 col 供给健康度，我只看一个数：tCCD_S 满足占比——它直接告诉你 BG 交织有没有把便宜的 timing 类别用满。"
+#### ⑪ 追问点
+**测量追问点**："判断一个 controller 的 col 供给健康度，我只看一个数：tCCD_S 满足占比——它直接告诉你 BG 交织有没有把便宜的 timing 类别用满。"
 
 # 6. Transition Amortization（D1 / D2）
 
@@ -1271,7 +1272,7 @@ DQ 连续性由 col 流的供给密度决定：col 序列 timing（tCCD_S/L、tW
 
 ## 6.1 D1 — Direction Switching（CORE）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - 为什么 R/W switching 是最大性能损失之一？
 - read/write batch 长度怎么定？
 - 90% read + 10% write 时 write 饿死怎么办？
@@ -1311,11 +1312,11 @@ DQ 是**共享的双向（half-duplex）数据总线**——同一时间窗口�
 #### ⑧ Tradeoff & Saturation Point
 [MODEL] batch 收益饱和：R/W 比例极偏（90/10）时 write starvation 压过摊薄收益——配额/critical 兜底接管；[RTL·已知代价] write queue latency 随 batch 增大上升（read 优先的直接后果，需分方向 latency 观测验证 [TODO-MEASURE]）。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - Closure：不同 GSC 阈值（配额/水线）的 BW / read latency / write latency / switch count/sec 曲线 [TODO-MEASURE→X-P1-07（原 5-Q-03）]；BW_loss,RW 量化与 T_switch 拆分（5-Q-01/02）；
 - 诊断闭环：Symptom（turnaround lost cycles 高）→ Observable（命令 mix、方向状态 [RTL O1]）→ Hypothesis（配额过小 / 水线过灵敏 / R/W 比例抖动）→ Knob（配额/水线）→ Expected（switch/sec↓）→ Side effect（write latency↑）→ Experiment（阈值 sweep + 分方向 latency）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么时间配额比 command count 稳？（burst 长度混合下 count 失真 [RTL 决策]；系统性论证 TODO）
 - double：batch 翻倍 write latency 变多少？（分方向 latency 曲线 [TODO-MEASURE]）
 - workload：50/50 均匀混合的最优 batch？（turnaround 与 latency 的交点）
@@ -1323,13 +1324,13 @@ DQ 是**共享的双向（half-duplex）数据总线**——同一时间窗口�
 - failure：critical write 撞上 read 配额未满？（例外③接管——防饿死优先于摊薄 [RTL]）
 - redesign：GSC 决策做成自适应？（判据与抖动风险 [TODO-DESIGN]）
 
-#### ⑪ Interview Hook
-**Measurement Hook**："判断方向管理健康度我看三个数：switch count/sec、turnaround lost cycles、hidden tRCD ratio——第三个为 0 说明渐进切换在 best case 工作，不为 0 就要查对侧 ACT opportunity。"
+#### ⑪ 追问点
+**测量追问点**："判断方向管理健康度我看三个数：switch count/sec、turnaround lost cycles、hidden tRCD ratio——第三个为 0 说明渐进切换在 best case 工作，不为 0 就要查对侧 ACT opportunity。"
 
 
 ## 6.2 D2 — Rank / SID Switching（LEAF）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - rank 是为容量还是性能？"多 rank 一定低效"对吗？
 - 为什么一个 transaction 不拆到两个 rank？
 - cs 位为什么钉死在 [10]？
@@ -1364,11 +1365,11 @@ rank/SID 切换与 R/W 切换同类（共享总线的方向/驱动切换），�
 #### ⑧ Tradeoff & Saturation Point
 [MODEL] rank 并行饱和：单 rank bank 数已足够掩盖 tRC/tRCD 时，跨 rank 并行边际收益趋零、只剩切换开销——"rank 为容量"的定量版本；反之（bank 少 + 重访流）双 rank 可反超。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - Closure：rank switching 损失量化 + dual-rank vs single-rank 反超场景 [TODO-MEASURE（2-Q-03）→X-P1-07]；SidSwitch 阈值 sweep；
 - 诊断闭环：Symptom（rank 面 turnaround 高）→ Observable（命令 mix 的 rank 分布 [MODEL]）→ Hypothesis（地址散布 / SidSwitch 过松）→ Knob（L5 cs 位 / SidSwitch 阈值）→ Experiment（sweep）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么 rank 切换贵在 ODT/DQS 而不是"rank 访问慢"？（共享总线物理切换 [SPEC/RTL]；"rank 访问慢"是错误直觉）
 - double：4 rank 呢？（切换频率与并行度进一步权衡）
 - workload：重访流 + 双 rank？（独立 bank state 反超场景 [TODO-MEASURE]）
@@ -1376,8 +1377,8 @@ rank/SID 切换与 R/W 切换同类（共享总线的方向/驱动切换），�
 - failure：SidSwitch=0 的乒乓场景？（断续流量切换开销爆炸 [MODEL]）
 - redesign：SID 分时改并行 core？（core 面积 / DFI 合流复杂度 → RQ12）
 
-#### ⑪ Interview Hook
-**Tradeoff Hook**："rank 的每一点性能收益都是借的——借 bank state 并行，还的是 bus/ODT/DQS 切换；cs 位钉死在 [10] 就是这笔借贷的合同条款。"
+#### ⑪ 追问点
+**Tradeoff 追问点**："rank 的每一点性能收益都是借的——借 bank state 并行，还的是 bus/ODT/DQS 切换；cs 位钉死在 [10] 就是这笔借贷的合同条款。"
 
 # 7. Refresh / Activation Maintenance（M1 ~ M5）
 
@@ -1386,7 +1387,7 @@ rank/SID 切换与 R/W 切换同类（共享总线的方向/驱动切换），�
 
 ## 7.1 M1 — Refresh Obligation / Debt（CORE）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - tREFI 到底是什么义务？debt/credit 怎么记账？
 - 为什么不能无限 postpone？上限怎么算？
 - "debt 单位与 tREFI 解耦"是什么意思？
@@ -1422,12 +1423,12 @@ rank/SID 切换与 R/W 切换同类（共享总线的方向/驱动切换），�
 #### ⑧ Tradeoff & Saturation Point
 [MODEL] postpone 深度 ↔ latency spike 的均值/方差曲线（4-Q-03 [TODO-MEASURE→X-P1-07]）；debt 上限受 9×tREFI−8×tRFC 硬顶——超过即 correctness 风险，不是性能选择。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - [RTL O1] REFpb/REFab executed 计数；CSR 档位状态（dbg_obv）；
 - Closure：per-workload "blocked only by refresh" cycles + postpone depth sweep [TODO-MEASURE→X-P1-07（原 4-Q-03）]；
 - 诊断闭环：Symptom（blocked_maintenance 尖峰）→ Observable（REF 计数、critical 事件）→ Hypothesis（debt 积压 > 消化：tREFI 档位 vs 流量密度）→ Knob（档位/阈值）→ Experiment（depth sweep）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么 debt 单位用次数？（与 tREFI/温度解耦）
 - double：postpone 阈值翻倍？（撞 9×tREFI 硬顶——公式封死）
 - workload：idle 密集型负载被动 pull-in 够吗？（间隙自然发生 ✓；极端差异 [TODO-MEASURE]）
@@ -1435,13 +1436,13 @@ rank/SID 切换与 R/W 切换同类（共享总线的方向/驱动切换），�
 - failure：档位切换瞬间 debt 超新档阈值？（立即 critical 兜底 [RTL]）
 - redesign：refresh 做成 QoS 流量？（与 PA/QoS 无交集是当前架构决策 [RTL]）
 
-#### ⑪ Interview Hook
-**Tradeoff Hook**："postpone 是把 refresh 的代价从'高频小额'换成'低频大额'——上界 9×tREFI−8×tRFC 封死了换汇率的自由度，剩下的全是均值/方差偏好。"
+#### ⑪ 追问点
+**Tradeoff 追问点**："postpone 是把 refresh 的代价从'高频小额'换成'低频大额'——上界 9×tREFI−8×tRFC 封死了换汇率的自由度，剩下的全是均值/方差偏好。"
 
 
 ## 7.2 M2 — Refresh Scheduling（CORE）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - REFab / REFpb / REFsb 怎么选？互相怎么折算？
 - critical refresh 的完整执行序列？
 - Normal REFpb 为什么只能选 bank empty？
@@ -1480,12 +1481,12 @@ maintenance 与 traffic 争抢 bank、CA 槽、tRFC 窗口：插队太狠伤 tra
 #### ⑧ Tradeoff & Saturation Point
 [MODEL] 三层 tier 的含义：tier1/2 免费（无打扰/仅等待）、tier3（force-PRE）有真实代价——调度压力集中在 tier3 触发率；critical 突发不可调度窗口 = 连发 REF + 全禁 ACT（互斥归因对象）。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - [RTL O1] REFpb/REFab/RFMpb 计数、ref critical 状态（dbg_obv）；
 - Closure：per-workload blocked-only-by-refresh + postpone depth sweep [TODO-MEASURE→X-P1-07]；13.3 refresh 归因三维校准 [MODEL only]；
 - 诊断闭环：Symptom（refresh spike）→ Observable（REF 计数、tier 分布 [MODEL]）→ Hypothesis（tier3 触发率高：流量覆盖全 bank / postpone 过深）→ Knob（档位/postpone/ab-pb）→ Experiment（depth sweep + tier 统计）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么 Normal REFab 压过 critical REFpb？（一条还全部债 vs 只还一条）
 - double：tier3 占比 50% 说明什么？（流量覆盖全 bank，REFpb 粒度收益消失）
 - workload：什么负载下 REFpb 优于 REFab？（bank 覆盖稀疏、其他 bank 可隐藏）
@@ -1493,13 +1494,13 @@ maintenance 与 traffic 争抢 bank、CA 槽、tRFC 窗口：插队太狠伤 tra
 - failure：进 SR 时还有 critical？（drain 判据 = bank 全关 ∧ critical 刷完 [RTL]→G1）
 - redesign：REFpb 真并行（多 bank 同时）？（协议编码限制 [SPEC]）
 
-#### ⑪ Interview Hook
-**Tradeoff Hook**："refresh 调度的一切技巧都在回答'怎么让 tier3 少发生'——三层准入 + 两步 critical + 性价比优先级序，全部服务这一个目标。"
+#### ⑪ 追问点
+**Tradeoff 追问点**："refresh 调度的一切技巧都在回答'怎么让 tier3 少发生'——三层准入 + 两步 critical + 性价比优先级序，全部服务这一个目标。"
 
 
 ## 7.3 M3 — Refresh Deadline Tracking（LEAF · 高价值展示题）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - 为什么不用 per-bank refresh timer？
 - 9×tREFI 和 8×tREFI 分别是什么？
 - Odd/Even 两个 counter 怎么覆盖所有情况？
@@ -1540,12 +1541,12 @@ REFpb 模式的协议义务是 per-bank 间隔：同一 bank 相邻两次 refres
 #### ⑧ Tradeoff & Saturation Point
 [MODEL] 收益：O(N_bank)→O(1) 状态压缩 + 结构性保证；代价：conservative（提前拉 critical 的性能余量）+ 对 invariant 的依赖（invariant 破坏 = bound 失效——不是渐进退化而是保护消失）。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - [RTL] counter 值/阈值比较（ref critical 经 dbg_obv 可观测）；验证 = min-gap 同族的 round 间隔覆盖 + round-complete invariant 断言；
 - Closure：RF-P1-06（invariant 保障）[TODO-RTL]；RF-P1-07（固定顺序 margin）[TODO-RTL]；
 - 诊断闭环：Symptom（critical 频发但 debt 低）→ Observable（Odd/Even 计数值）→ Hypothesis（round 拉长：tier3 阻塞 / REFpb 供给不足）→ Knob（→M2）→ Experiment（round 时长分布 trace）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么检查相邻两个 round 就够？（同 bank 相邻 REF 只跨相邻 round——几何事实）
 - double：bank 数翻倍，压缩率怎么变？（N_bank→2 收益随 N_bank 增大）
 - workload：什么流量会破坏 invariant？（特定 bank 长期被 CAM 占住 → tier 全堵 → RF-P1-06 结论）
@@ -1553,13 +1554,13 @@ REFpb 模式的协议义务是 per-bank 间隔：同一 bank 相邻两次 refres
 - failure：counter 被错误清零会怎样？（bound 失效——保护依赖错相清零时机正确 [RTL]）
 - redesign：exact tracking 什么时候值得？（N_bank 小到 counter 便宜 / 需要精确 deadline 的场景）
 
-#### ⑪ Interview Hook
-**Measurement Hook（展示链）**："这是一道完整的 Protocol Requirement → Mathematical Sufficient Bound → Scheduler Invariant → RTL State Compression → PPA/Performance Tradeoff 链条题——20 秒讲结论，或从 Δt 推导讲起，取决于你想往哪层走。"
+#### ⑪ 追问点
+**测量追问点（展示链）**："这是一道完整的 Protocol Requirement → Mathematical Sufficient Bound → Scheduler Invariant → RTL State Compression → PPA/Performance Tradeoff 链条题——20 秒讲结论，或从 Δt 推导讲起，取决于你想往哪层走。"
 
 
 ## 7.4 M4 — Activation Maintenance / RFM（LEAF）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - RFM 和 REF 有什么本质区别？
 - RAA / RAAIMT / RAAMMT / RAAMULT 各是什么？
 - ACT 怎么"欠债"？RFM 怎么"还债"？
@@ -1598,12 +1599,12 @@ RowHammer 使 ACT 本身成为风险行为：高频激活同一 row 需要对相
 #### ⑧ Tradeoff & Saturation Point
 [MODEL] RAAIMT 档位选择 = 维护频率 vs 风险覆盖（离散档位 → 防护粒度阶梯化）；禁 ACT 兜底意味着 activation debt 处理不当时性能骤降——是 safety net 不是调度策略。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - [RTL O1] RFMpb executed 计数、ACT 计数（debt 增速）；禁 ACT 事件直接 counter 缺口 [TODO-RTL] 待确认；
 - Closure：带宽税模型校准（per-workload RFM 频率实测）[TODO-MEASURE]；四个 OPEN（RF-P1-02~05）逐项关闭；
 - 诊断闭环：Symptom（禁 ACT 频发 / RFM 计数异常）→ Observable（ACT/RFM 计数）→ Hypothesis（RAAIMT 档位过低 / hammer 型流量）→ Knob（档位——若可配）/ 上游限流 → Experiment（流量重放）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么禁 ACT 是兜底而不是调度策略？（safety 优先——性能让位风险控制）
 - double：RAAIMT 档位降一半会怎样？（RFM 频率↑、带宽税↑ [MODEL 公式]）
 - workload：hammer 型流量画像？（同 row 高频激活——计数集中少数 bank）
@@ -1611,13 +1612,13 @@ RowHammer 使 ACT 本身成为风险行为：高频激活同一 row 需要对相
 - failure：REF 能顺便还激活债吗？（RF-P1-02 OPEN——当前不假设）
 - redesign：debt 记账放 DRAM 侧？（PRAC 演进方向 [SPEC→BOUNDARY]）
 
-#### ⑪ Interview Hook
-**Concept Hook**："bank FSM 管的是 row 开没开，activation debt 管的是 row 被打了多少下——两条状态轴、两个 owner，混在一起讨论 RowHammer 是最常见的概念错误。"
+#### ⑪ 追问点
+**概念追问点**："bank FSM 管的是 row 开没开，activation debt 管的是 row 被打了多少下——两条状态轴、两个 owner，混在一起讨论 RowHammer 是最常见的概念错误。"
 
 
 ## 7.5 M5 — DRFM / Directed Maintenance（LEAF）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - DRFM 和 RFM 的区别？"directed"定向的是什么？
 - target row 怎么指定？controller 还是 DRAM 决定？
 - 为什么 DRFM 序列是 maintenance state machine 而不是普通 REF？
@@ -1654,12 +1655,12 @@ RowHammer 使 ACT 本身成为风险行为：高频激活同一 row 需要对相
 #### ⑧ Tradeoff & Saturation Point
 [MODEL] DRFM 的收益上限 = 风险 row 的聚集度（越集中越省）；采样/标记机制的精度（BRC 覆盖范围）决定防护完备性——协议侧参数。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - [RTL] DRFM 命令下发路径存在（DEVMGR→FSC）；**executed 计数缺失**（X-P1-09 [TODO-RTL]——补计数或确认已有未列出）；
 - Closure：handoff 序列确认 [TODO-SPEC/RTL：RF-P1-08]；DRFM 频率与 hammer 流量关联 [TODO-MEASURE，依赖 X-P1-09 关闭]；
 - 诊断闭环（受限）：当前 DRFM 频发只能经 csr 状态间接推断——观测补齐后走标准九步。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么由 DEVMGR 而不是 refresh 模块生成？（定向维护是"设备管理事件"语义——与 M2 优先级序汇合但生成源不同 [RTL]）
 - double：BRC 覆盖范围翻倍会怎样？（防护↑、单次 DRFM 代价↑ [MODEL]）
 - workload：aggressor row 分散 vs 集中的代价曲线？（DRFM 收益上限，→⑧）
@@ -1667,8 +1668,8 @@ RowHammer 使 ACT 本身成为风险行为：高频激活同一 row 需要对相
 - failure：target register 未被正确 sampling？（handoff 断链——协议序列待确认项）
 - redesign：controller 侧做 victim row 跟踪？（DRAM 内部 remap 不可见——[SPEC 边界]）
 
-#### ⑪ Interview Hook
-**Boundary Hook**："聊 DRFM 我会先切两层：controller 选哪个 row（我做过），DRAM 怎么用这个信息（协议定义）——混在一起答最容易把 spec 义务说成自己的实现。"
+#### ⑪ 追问点
+**边界追问点**："聊 DRFM 我会先切两层：controller 选哪个 row（我做过），DRAM 怎么用这个信息（协议定义）——混在一起答最容易把 spec 义务说成自己的实现。"
 
 
 ---
@@ -1681,7 +1682,7 @@ RowHammer 使 ACT 本身成为风险行为：高频激活同一 row 需要对相
 
 ## 8.1 DP1 — Write Data Availability（CORE）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - 写数据什么时候必须 ready？谁在等它？
 - WDP 满了会阻塞 admission 吗？
 - credit 什么时候还、WDP entry 什么时候释放——为什么是两个时刻？
@@ -1724,11 +1725,11 @@ RowHammer 使 ACT 本身成为风险行为：高频激活同一 row 需要对相
 #### ⑧ Tradeoff & Saturation Point
 [MODEL] WDP 深度不足 → fetch head-block → data ready 推迟 → write batch（D1）被截断；过深 → SRAM 面积（10.40% 已是 LPDDR6 第四大模块）；饱和判据 = fetch FIFO 非空率与 data-ready 推迟量的联合观测 [TODO-MEASURE：当前无直接 counter]。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - Closure：WDP 深度 sweep × 写密集负载 → blocked_data / write latency [TODO-MEASURE→X-P1-07]；fetch FIFO 非空率 trace；
 - 诊断闭环：Symptom（write 侧 blocked_data 高）→ Observable（当前无 WDP 直接 counter——经 Ch0.4 恒等式 + fetch FIFO trace 反推 [TODO-MEASURE]）→ Hypothesis（WDP 容量 / tphy_wrlat 窗口 / 写突发）→ Knob（WDP 深度 / DFI prefetch）→ Experiment → Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么 WAW merge 选"后写者胜"而不是读改写？（BE 拼接零读开销；checkbit 读出侧编码的配套设计）
 - double：WDP 深度减半会怎样？（fetch head-block 提前、write batch 截断）
 - workload：写突发 + 长 tphy_wrlat？（飞行期占用峰值——容量模型第一项）
@@ -1736,13 +1737,13 @@ RowHammer 使 ACT 本身成为风险行为：高频激活同一 row 需要对相
 - failure：DFI 一直不来取数？（所有权在 ⑦ 才移交——⑦ 前错误可拦、⑦ 后只能中断 →C3）
 - redesign：SRAM 双口化？（面积代价 vs 取消 DFI prefetch [TODO-DESIGN]）
 
-#### ⑪ Interview Hook
-**Concept Hook**："写通路最容易被误解的一点：WDP 满了 admission 照样放行——它堵的是取数不是进门。credit 和 WDP entry 是两个独立资源、两个独立释放点。"
+#### ⑪ 追问点
+**概念追问点**："写通路最容易被误解的一点：WDP 满了 admission 照样放行——它堵的是取数不是进门。credit 和 WDP entry 是两个独立资源、两个独立释放点。"
 
 
 ## 8.2 DP2 — Read Return / Reorder（CORE）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - DFI 没有 AXI ID，读数据怎么和命令对上？
 - PhyRdLat 配错了会怎样？rolling 是什么？
 - 读方向的不可回滚点是命令下发还是数据进 XMU？
@@ -1785,12 +1786,12 @@ scheduler 的乱序收益（BLP/hit）制造了"返回序 ≠ 请求序"——�
 #### ⑧ Tradeoff & Saturation Point
 [MODEL] head-only 保序的代价 = 同 ID 流水的 HOL（混挂场景在途 ID>32 时显现 [RTL]）；返回带宽饱和 = 每 core 每拍 1 op（HBM4=2）——重放型负载先撞 link node（前置资源）。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - [RTL O1] 无读延迟/返回带宽直接观测——[MODEL only]（trace 后处理）声明边界；
 - Closure：link list 8/16/32/64 对 reorder/area/HOL 影响（1-Q-03）[TODO-MEASURE→X-P1-07]；HOL cycles 统计；
 - 诊断闭环：Symptom（读 latency 异常 / 同 ID 流卡顿）→ Observable（trace：node 占用、head 等待）→ Hypothesis（node 耗尽 / HOL / retry 窗口）→ Knob（node 数 / 流量整形）→ Experiment（trace sweep）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么 node 索引能直接当 SRAM 地址？（元数据与数据同址——link node 设计的核心省法 [RTL]）
 - double：node 数翻倍 vs FIFO 加深？（前置资源 vs 弹性吸收的不同作用点）
 - workload：多 ID 乱序 interleave 的收益？（返回带宽利用率）
@@ -1798,13 +1799,13 @@ scheduler 的乱序收益（BLP/hit）制造了"返回序 ≠ 请求序"——�
 - failure：UE 恰好在 exclusive read？（monitor 独立模块、同路 SLVERR [RTL]）
 - redesign：retry ≤15 次数有界，能否推出同 ID HOL 的严格 cycle bound？（次数有界 ≠ 时间有界——依赖 service bound 前提，**DP2-P1-02 [TODO-DESIGN]**）
 
-#### ⑪ Interview Hook
-**Concept Hook**："读通路两句话：① 乱序发生在 XMU 视角，DFI 域内命令与数据是 FIFO 保序——谈保序先说清哪个域；② read 有两个 PNR——command PNR 在 RD issue，recovery PNR 在 RDP→XMU——不说明 domain，'不可回滚'这个词没有意义。"
+#### ⑪ 追问点
+**概念追问点**："读通路两句话：① 乱序发生在 XMU 视角，DFI 域内命令与数据是 FIFO 保序——谈保序先说清哪个域；② read 有两个 PNR——command PNR 在 RD issue，recovery PNR 在 RDP→XMU——不说明 domain，'不可回滚'这个词没有意义。"
 
 
 ## 8.3 DP3 — DFI Command/Data Contract（CORE）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - DFI ratio 是什么？ratio 越高为什么 controller 越难设计？
 - DFI 有流控吗？PHY 不收命令会怎样？
 - HBM 双 PC 怎么合流？命令分时、数据并行是什么意思？
@@ -1844,11 +1845,11 @@ scheduler 的乱序收益（BLP/hit）制造了"返回序 ≠ 请求序"——�
 #### ⑧ Tradeoff & Saturation Point
 [MODEL] ratio 提高的收益/复杂度曲线：ratio4→8 带宽翻倍但打包/shadow/预取三件套成本上身——16GHz 是当前迭代的工程答案；PF window 饱和 = entry 内命令全部可执行且双发不空凑时的收益峰值。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - Closure：PF window miss/underfill 时的有效 command rate（7-Q-03 / PF-P1-01）[TODO-MEASURE→X-P1-07]；ratio4→ratio8 的 freq/命令每拍/面积/功耗/BW 效率定量比较（7-Q-01）；64 选 2→8 选 2 的 critical path 改善量（7-Q-02 / synthesis）；
 - 诊断闭环：Symptom（每拍发不满 2 条）→ Observable（PF entry 占用、双发率 [MODEL/trace]）→ Hypothesis（准入约束过滤 / AC timing 不满足 / shadow 空）→ Knob（准入策略 / entry 数）→ Experiment（双发率 trace）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么 shadow 不搬命令？（职责不变是架构声明——CQ/CS 控制权保留，只降选择维度）
 - double：8 entry → 16 会怎样？（时序再平衡 [TODO-DESIGN]）
 - workload：双发不空凑什么时候发生？（同 BA 冲突 / AC timing）
@@ -1856,8 +1857,8 @@ scheduler 的乱序收益（BLP/hit）制造了"返回序 ≠ 请求序"——�
 - failure：critical refresh 打断 PF entry？（释放条件之一——高优先级事件打断 [RTL]）
 - redesign：DFI 加流控？（协议契约不支持——controller 侧自限 [SPEC 边界]）
 
-#### ⑪ Interview Hook
-**Tradeoff Hook**："ratio8 的三件套——命令打包、shadow 降维、写数据预取——是同一个决策的三张账单：用控制器复杂度买工艺频率。"
+#### ⑪ 追问点
+**Tradeoff 追问点**："ratio8 的三件套——命令打包、shadow 降维、写数据预取——是同一个决策的三张账单：用控制器复杂度买工艺频率。"
 
 
 ---
@@ -1874,7 +1875,7 @@ scheduler 的乱序收益（BLP/hit）制造了"返回序 ≠ 请求序"——�
 
 ## 9.1 C3 — Commit / PNR（LEAF · 全局 correctness terminology anchor）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - write 的 commit 到底发生在哪一刻？为什么说不设单一 committed？
 - read 的"不可回滚点"为什么有两个？
 - RMW 中途出错，数据会坏在 DRAM 里吗？
@@ -1925,12 +1926,12 @@ scheduler 的乱序收益（BLP/hit）制造了"返回序 ≠ 请求序"——�
 #### ⑧ Tradeoff & Saturation Point
 [MODEL] 六术语的粒度已覆盖当前全部五链；若未来引入新链（如加密路径），需按"撤销/PNR/retry/中断/收敛"五问重新入表——矩阵是该 Node 的扩展点。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - [RTL] C3 六术语与 DP1 八段/DP2 七段生命周期逐段对齐；五链矩阵与 Ch10/Ch11 [RTL] 记载一一对应；
 - 验证：BRESP↔grant 拍对齐断言、col issued 后无撤回路径断言、retry 窗口边界断言（L 域）；
 - 诊断闭环（correctness 版）：Symptom（数据不一致报告）→ Observable（UE/中断源、poison 标记）→ Hypothesis（越界写 / PNR 后错误路径）→ 定位（哪条链哪个 domain）→ 收敛（retry/中断/poison）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么 BRESP 敢在写入前返回？（入口拦截 + 颗粒命令序的结构保证 →C2）
 - double：BRESP 后掉电怎么办？（master 已认为成功，数据可能丢失——系统级风险，非 controller 契约 [RTL 口径]）
 - workload：RMW 密集流的 poison 行为？（坏行带 checkbit 持久化、读出报 UE）
@@ -1938,13 +1939,13 @@ scheduler 的乱序收益（BLP/hit）制造了"返回序 ≠ 请求序"——�
 - failure：retry 第 16 次仍 UE？（SLVERR + 中断——次数有界 ≠ 时间有界，DP2-P1-02）
 - redesign：给 write 加 rollback？（推翻 PNR 前移设计——代价见 ⑦）
 
-#### ⑪ Interview Hook
-**Concept Hook**："谈 write completion 我必须反问一句：你问的是哪个 completion——master 看到的、controller 的命令 PNR、还是 DRAM 侧的物理完成？三个时间点差着整个调度深度。"
+#### ⑪ 追问点
+**概念追问点**："谈 write completion 我必须反问一句：你问的是哪个 completion——master 看到的、controller 的命令 PNR、还是 DRAM 侧的物理完成？三个时间点差着整个调度深度。"
 
 
 ## 9.2 C2 — Dependency（CORE）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - BRESP 提前返回后，同地址 read 立刻进来，怎么保证读到该 write？
 - RAW/WAR/WAW/RMW 分别怎么处理？为什么只有 WAW 做 merge？
 - 冲突检测为什么放 CAM 入口、为什么与 AXI ID 无关？
@@ -1985,12 +1986,12 @@ BRESP 提前返回制造"response 已回、命令未执行"窗口（→C3 的 ma
 #### ⑧ Tradeoff & Saturation Point
 [MODEL] 入口阻塞的代价随冲突率上升（RMW 密集 / 乒乓同址流）；flush 提权是缓解不是取消；分拍检测的 1~2 拍识别延迟在高冲突流下放大 HOL。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - [RTL] 冲突注入序列断言（RAW/WAR/WAW/RMW 各覆盖）；放行时机断言（离开 CAM 拍）；
 - Closure：HOL Pending cycle loss（3-Q-03）、分拍检测 latency/throughput 影响（3-P1-11）、RMW ratio 0~100% 曲线（3-Q-04）[TODO-MEASURE→X-P1-07]；
 - 诊断闭环：Symptom（blocked_dependency 高）→ Observable（命令 mix 的同址度、RMW 占比）→ Hypothesis（真依赖 / 伪共享 / RMW 窗口）→ Knob（上游分配 / 粒度）→ Experiment（地址分布重放）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么 RAW 不做 forwarding？（转发需要数据通路旁路 + 冲突数据比较——单通路阻塞以结构换正确 [RTL 决策]）
 - double：冲突率翻倍吞吐掉多少？（HOL 模型 [TODO-MEASURE]）
 - workload：什么流量触发对侧切换例外？（read-after-write 乒乓）
@@ -1998,13 +1999,13 @@ BRESP 提前返回制造"response 已回、命令未执行"窗口（→C3 的 ma
 - failure：merge entry 与新 incoming 冲突？（merge 后仍按物理地址检测 [RTL]）
 - redesign：入口检测放 XMU（更早）？（txn 信息在、但物理地址未映射——位置不可行 [RTL 结构]）
 
-#### ⑪ Interview Hook
-**Concept Hook**："RAW/WAR 入口拦截是数据正确性机制，不是 AXI 保序义务——协议里 slave 根本不维护地址序。把这两件事分开，ordering 的讨论能省十分钟。"
+#### ⑪ 追问点
+**概念追问点**："RAW/WAR 入口拦截是数据正确性机制，不是 AXI 保序义务——协议里 slave 根本不维护地址序。把这两件事分开，ordering 的讨论能省十分钟。"
 
 
 ## 9.3 C1 — Ordering（CORE）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - AXI 的保序义务到底有哪些？哪些是 controller 额外保证的？
 - 同 ID 两笔 read，第二笔数据先回来，内部发生什么？
 - 不同 ID 允许乱序，为什么还需要 link list？
@@ -2042,12 +2043,12 @@ BRESP 前移把"顺序承诺"从数据完成时刻提前到 grant 时刻——or
 #### ⑧ Tradeoff & Saturation Point
 [MODEL] 混挂 HOL 饱和：在途 ID ≤ 32 时混挂零代价；[RTL] 单 ID 持续发包占住 list——head 持续推进、不阻塞自身，代价仅该 list 不可复用。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - [RTL] 同 ID 顺序断言（link list 序）、异 ID 交织断言、BRESP-grant 对齐断言；
 - Closure：link list 8/16/32/64 sweep（1-Q-03）、BRESP 前移的上游 observed latency 收益（1-Q-04）[TODO-MEASURE→X-P1-07]；
 - 诊断闭环：Symptom（同 ID 流卡顿）→ Observable（trace：list 占用、head 等待）→ Hypothesis（混挂 HOL / 单 ID 独占）→ Knob（ID 分配 / list 数）→ Experiment（trace sweep）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么同 ID 必同链？（head-only 释放的保序结构前提 [RTL]）
 - double：list 32→64？（混挂 HOL 窗口缩小、面积↑）
 - workload：单 ID 持续大流？（list 独占但 head 推进——不饿死自身）
@@ -2055,8 +2056,8 @@ BRESP 前移把"顺序承诺"从数据完成时刻提前到 grant 时刻——or
 - failure：异方向同地址 + 无 C2 拦截会怎样？（读旧数据——C2 是 ③ 类可见性的控制器半边）
 - redesign：ordering 全交 NoC？（slave 义务仍在——协议不允许 [SPEC]）
 
-#### ⑪ Interview Hook
-**Concept Hook**："被问'ordering 靠什么'，我先反问：你问的是协议义务还是正确性保险？前者只有同 ID 同方向，后者是我自加的入口拦截——一句话划清边界。"
+#### ⑪ 追问点
+**概念追问点**："被问'ordering 靠什么'，我先反问：你问的是协议义务还是正确性保险？前者只有同 ID 同方向，后者是我自加的入口拦截——一句话划清边界。"
 
 # 10. RAS / Recovery（R1）
 
@@ -2067,7 +2068,7 @@ BRESP 前移把"顺序承诺"从数据完成时刻提前到 grant 时刻——or
 
 ## 10.1 R1 — RAS / Retry / Recovery（LEAF）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - ECC / CRC / CA parity 分别在哪一级检测？
 - 读 UE 为什么能 retry？写 UE 为什么只能中断？
 - BRESP 之后写数据坏了怎么办？
@@ -2109,12 +2110,12 @@ RAS 的本质约束来自 C3：**PNR 之后错误只能 containment**——所�
 #### ⑧ Tradeoff & Saturation Point
 [MODEL] retry 的性能代价 = node 占用 HOL + 重走调度链的带宽消耗；上限 15 是工程值（寄存器可配），无形式化最优——DP2-P1-02 关联；[RTL] 无隔离机制意味着单点坏 region 的影响面由 SW 管理（坦承边界 = 答辩加分）。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - [RTL] UE 注入测试（记忆库错误注入→SLVERR/中断/poison 链路）、retry 计数边界断言、poison 持久化断言；
 - Closure：retry 窗口的性能代价 trace [TODO-MEASURE→X-P1-07]；中断聚合模型 SW 侧验证；
 - 诊断闭环（correctness 版引用 C3 模板）：Symptom（SLVERR/UE 中断）→ Observable（中断源 CSR、retry 计数）→ Hypothesis（单 bit 漂移 / hammer / 电源）→ **Detection Point**（RDP UE / CA parity / WDP 编码侧）→ **Candidate Failure Domain**（检测点仅给观察位置：RDP UE 候选含 DRAM/DQ/PHY/sampling/upstream；CA parity 强指向 CA path）→ **Corroborating Evidence**（syndrome / link diagnostics / 错误注入重放）→ Root Cause / Containment（retry / 隔离上报）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么 write 不做 retry？（BRESP 已回——C3 master-visible 不可撤 [RTL]）
 - double：retry 上限 15→30？（HOL 时间上限变化——DP2-P1-02）
 - workload：hammer 场景 RAS 行为？（RFM 兜底 + poison 累积 →M4）
@@ -2122,8 +2123,8 @@ RAS 的本质约束来自 C3：**PNR 之后错误只能 containment**——所�
 - failure：RMW 读回双 bit 错？（poison 落盘——数据不静默损坏 [RTL]）
 - redesign：region 隔离进 controller？（quarantine 表 + 访问拦截——当前归 SW [BOUNDARY→TODO-DESIGN 候选]）
 
-#### ⑪ Interview Hook
-**Concept Hook（scoped）**："在本 DDR retry path 中，read UE 如果在 recovery PNR（RDP→XMU）前被发现，还有 retry 机会；一旦跨过 recovery PNR、或当前 protocol/configuration 根本没有 retry path（LPDDR/HBM），就只能向上游暴露错误 / 中断。write 则因为 master-visible completion 很早（BRESP），当前 RTL 在其后只做 containment。retry、poison、中断都是这套 domain 边界的推论。"
+#### ⑪ 追问点
+**概念追问点（scoped）**："在本 DDR retry path 中，read UE 如果在 recovery PNR（RDP→XMU）前被发现，还有 retry 机会；一旦跨过 recovery PNR、或当前 protocol/configuration 根本没有 retry path（LPDDR/HBM），就只能向上游暴露错误 / 中断。write 则因为 master-visible completion 很早（BRESP），当前 RTL 在其后只做 containment。retry、poison、中断都是这套 domain 边界的推论。"
 
 # 11. Global State Transition（G1）
 
@@ -2132,7 +2133,7 @@ RAS 的本质约束来自 C3：**PNR 之后错误只能 containment**——所�
 
 ## 11.1 G1 — Global State Transition / Quiesce（LEAF）
 
-#### ① Interview Entry
+#### ① 面试切入点
 - 低功耗进入前为什么要全链路排空？排空到哪一层？
 - 七种全局转换（六 worker 类 + DSME 分支归属 OPEN）怎么保证互斥？"arbiter 是 mutex 不是 sequencer"什么意思？
 - SR 进入的判据是什么？SR 期间 refresh 债怎么办？
@@ -2173,12 +2174,12 @@ RAS 的本质约束来自 C3：**PNR 之后错误只能 containment**——所�
 #### ⑧ Tradeoff & Saturation Point
 [RTL] 互斥 = 转换串行化（不能并发低功耗+训练——按优先级排队）；[RTL·已知边界] 无看门狗 → 依赖 SW 轮询；DSME 序列细节与 clock gate 转换未展开（DM-P2-02 [TODO-RTL]）。
 
-#### ⑨ Proof（含诊断闭环）
+#### ⑨ 证据与验证（含诊断闭环）
 - [RTL O1] LP 进出计数（SRE/SRX/PDE/PDX）、双状态 CSR、dbg_obv FSM 全景；
 - 断言：drain 判据（SRE 拍 bank 全 IDLE ∧ critical 完）、折算时点（PRE_SRE）、互斥（无并发 grant）；
 - 诊断闭环：Symptom（LP 后首命令异常 / 转换卡住）→ Observable（csrArbState、worker 阶段）→ Hypothesis（drain 未完成即进 / SRX 序列未走完）→ Knob（idle 阈值 csrIdleForSr / SW 流程）→ Experiment（进出压力重放）→ Conclusion。
 
-#### ⑩ Interview Follow-up Graph
+#### ⑩ 追问展开
 - why：为什么 arbiter 不保留序列知识？（新增转换只加 worker——扩展性 [RTL 设计理由]）
 - double：两种低功耗同时请求？（优先级 SW_LP > HW_LP 排队）
 - workload：驻留期来流量怎么办？（XMU 接纳 = 唤醒源，序列不撕裂 [RTL]）
@@ -2186,8 +2187,8 @@ RAS 的本质约束来自 C3：**PNR 之后错误只能 containment**——所�
 - failure：drain 中 critical ref 到来？（critical 补完是 drain 判据一部分——顺序内解决 [RTL]）
 - redesign：把 done 语义改成进入完成？（驻留态无"完成"——退出才可验证 [RTL 语义]）
 
-#### ⑪ Interview Hook
-**Concept Hook**："全局转换我一句话：**arbiter 是 mutex 不是 sequencer**——互斥、优先级、grant/done 三件事，序列全在 worker；所以支持新协议转换时，arbiter 一行不改。"
+#### ⑪ 追问点
+**概念追问点**："全局转换我一句话：**arbiter 是 mutex 不是 sequencer**——互斥、优先级、grant/done 三件事，序列全在 worker；所以支持新协议转换时，arbiter 一行不改。"
 
 # Part III — RTL Implementation Reference
 
@@ -2340,20 +2341,20 @@ CAM 深度/双口径/HOL → **V2**；credit 生命周期/水线 → **V3**；�
 # 14. BSC / GSC / FSC — RTL Implementation Reference
 
 > Implements：**S1/S2**（提名→选择链）、**T1/T2/T3**（timing ready 组合）、**D1**（方向所有权/渐进切换）、**D2**（SID/rank 切换执行）、**M2**（维护优先级序与 mask/force-PRE 执行）、**M3**（watchdog critical 触发消费端）。
-> **本章只写实现**：Eligible→Executable→Selected→Issued 四层事件在 RTL 的落点；architecture reasoning（为什么 hit-first/为什么 batching）→ Ch4/Ch5/Ch6。
+> **本章只写实现**：CCT→BSC legality→GSC normal selection→FSC final arbitration→issue→Executed Feedback 各事件在 RTL 的落点；architecture reasoning（为什么 hit-first/为什么 batching）→ Ch4/Ch5/Ch6。
 
 ## 14.1 Module Boundary
 
 | 模块 | 负责 | 不负责 |
 |---|---|---|
 | **BSC** | per-bank FSM（IDLE/ACTIVTING/ACTIVE_WR/ACTIVE/PRE_WAIT/FORCE_PRE/WRA_RDA/PRECHARGE/ACT_FORBID）、row open/close 状态、ACT/PRE/REF 状态迁移、bank 侧 legality 组合（与 timing counter 相与） | 最终 policy 仲裁（FSC）；timing counter 的独立清单归属（logical owner = Timing Enforcement，物理位置嵌 BSC 侧——→Ch15 口径） |
-| **GSC** | R/W direction ownership、四类切换触发、执行时间配额、渐进式切换、read 默认优先 + 两例外、SID 切换迟滞执行（SidSwitch） | bank FSM 状态；timing counter；FSC 最终选择 |
-| **FSC** | 从 executable 集合选最终命令（Col>Row、Col 内 RR、Row 内 critical ref>ACT>PRE>non-critical ref）、维护插队执行、协议每拍单/双命令下发（HBM row+col） | 创造 timing legality；改写 C2 依赖判定结果 |
+| **GSC** | normal traffic selection：R/W direction ownership、四类切换触发、执行时间配额、渐进式切换、read 默认优先 + 两例外、SID 切换迟滞执行（SidSwitch）、priority/aging/oldest/RR 决策块（只消费 CCT normal candidates，不碰 refresh/DEVMGR） | bank FSM 状态；timing counter；refresh/DEVMGR 仲裁（→FSC）；最终 DFI 命令生成 |
+| **FSC** | 将 GSC normal command 与 refresh / DEVMGR 等多源请求统一仲裁为最终 DFI 命令（Col>Row、Col 内 RR、Row 内 critical ref>ACT>PRE>non-critical ref）、协议每拍单/双命令下发（HBM row+col） | 消费 GSC 结果；多源汇合点；创造最终命令流 |
 
 ## 14.2 Owned State
 
 - **BSC**：per-bank FSM 状态（9 态 [RTL]）、open-row 地址、tRCDWR/tRCD 双计数出口逻辑、FORCE_PRE / ACT_FORBID / PRE_WAIT 请求态、ref_act_mask / drfm 需求输入锁存；open-row 归 BSC 独占（owner 表）；
-- **GSC**：当前读写方向态、切换阶段态（渐进式中）、执行时间配额计数、水线/critical/expired 反应逻辑、SidSwitch 迟滞计数 [RTL]；
+- **GSC**：当前读写方向态、切换阶段态（渐进式中）、执行时间配额计数、水线/critical/expired 反应逻辑、normal grant pointer（GSC→FSC 的本拍 normal selection 结果）、SidSwitch 迟滞计数 [RTL]；
 - **FSC**：仲裁轮询态（Col 内 RR 指针）、维护 vs 业务仲裁态、协议双发 lane 状态（HBM）[RTL]；
 - **不硬塞**：timing counter 明细 → Ch15；refresh debt → M1 域。
 
@@ -2377,29 +2378,42 @@ ACT 下发（act_executedIntl）：IDLE → ACTIVTING（tRCD/tRCDWR 双计数并
 
 四设计洞察 [RTL]：① tRCD/tRCDWR 双计数出口 + ACTIVE_WR 仅写窗口（tRCDWR<tRCD 写提前进入；无 tRCDWR 协议等值配置、窗口 0 退化无害）；② PRE_WAIT 可抢占 vs FORCE_PRE 不可抢占（服务让位业务 = Col>Row 在状态机层的落实）；**AP 与 FORCE_PRE 是两个独立机制**（AP 属性来自 page-last 判定、收口走 WRA_RDA；FORCE_PRE 收口 = 显式 PRE → PRECHARGE）；③ WRA_RDA 统一收口 AP（无需显式 PRE——显式 PRE 在支持 AP 的设计里很少的原因）；④ ACT_FORBID 从任何收尾状态可达（refresh mask 优先级最高，保证最短回刷路径）。
 
-## 14.3 Critical Pipeline（四层事件链，回答 §十 关键问题）
+## 14.3 Critical Pipeline（三层 CS 结构：BSC legality / GSC normal selection / FSC final arbitration）
 
 ```
-CCT 上表【Eligible point——candidate 已提名并持有，owner = CQ/CCT；上表后不可撤回，直到发送】
-→ BSC legality【BSC-ready point：bank FSM 态 legality ∩ timing-counter legality（AND [RTL 5.1]）；fail → blocked_timing/bank-state block】
-→ GSC direction legality【Direction-legal point：当前方向 / switching-phase / SID·rank 约束过滤（BSC 之后、FSC 之前串联 [RTL 5.1]）；fail → blocked_direction】
-→ Executable point【= Eligible ∩ BSC-ready ∩ Direction-legal——具备进入 final selection 的完整资格】
-→ FSC arbitration【Col>Row；Col 内 RR；Row 内 critical ref > ACT > PRE > non-critical ref [RTL 5.5.1]】【Selected point；fail → blocked_policy】
-→ command issue【Issued point = 驱动 DFI + counter load + bank FSM update + CCT release feedback 同源 [RTL：counter"命令下发时启动倒计时"、FSM 触发 = act/pre/rda_executed 类事件 → state/counter update 在 actual issue 拍]】
-→ CCT release feedback → CQ 重新筛选【feedback signal 细节 [TODO-RTL]】
+CCT 上表【candidate point——candidate 已提名并持有，owner = CQ/CCT；上表后不可撤回，直到发送】
+→ BSC legality【per-bank legality：bank FSM 态 ∩ timing counter（AND [RTL 5.1]）；fail → blocked_timing/bank-state block】
+→ GSC normal selection【从 CCT normal candidates 中选——方向 ownership / switching phase / SID 约束 / priority+aging / oldest / RR；fail → blocked_direction / blocked_policy（GSC 层）】
+→ FSC final arbitration【多源汇合：GSC normal command + refresh + DEVMGR + force-precharge；Col>Row；Col 内 RR；Row 内 critical ref > ACT > PRE > non-critical ref [RTL 5.5.1]；本拍未选 → blocked_policy】
+→ command issue【驱动 DFI + counter load + bank FSM update + CCT release feedback 同源；dfi_busy 当前 tie 0 [RTL·HBM current config]】
+→ Executed Feedback【命令实际执行后反馈：BSC FSM 状态转移 / CQ 释放 CCT slot / DEVMGR accounting（→ 14.3.1）】
 ```
 
-> **RC-1 RESOLVED（Part III Batch 2 Freeze Patch）**：RTL evidence wins——executable 的 authoritative 口径 = **Eligible ∩ BSC-ready ∩ Direction-legal**；Part I 原"executable = CCT∩BSC ready"为过窄表述，已做 terminology-only correction（architecture reasoning 不变）。六层各自对应唯一 blocked 类：BSC-ready fail→blocked_timing；Direction-legal fail→blocked_direction；Executable 未选→blocked_policy。
+> **三层不是三级同构 scheduler 串联**：BSC 只做 legality（"这个 bank 现在能做什么"）；GSC 只在 normal traffic 内做 selection（"这一拍选谁"）；FSC 做最终多源仲裁（"所有候选中谁真正发去 DFI"）。三者职责正交，数据关系见 14.1 边界表。
+
+> **RC-1 历史注（Part III Batch 2 Freeze Patch）**：早期版本曾用 Eligible→BSC-ready→Direction-legal→Executable→Selected→Issued 六层串行链描述 CS；RTL 集成复核后确认 BSC/GSC/FSC 是职责分离的三层（非六层流水），Executed Feedback 亦非可选收尾而是 BSC/CQ/DEVMGR 的常规更新路径——本节已按 RTL 结构重写。
 
 关键问题逐答（以 RTL 为准）：
-1. **Eligible→Executable（六层）**：Eligible（上表）→ BSC-ready（bank FSM ∩ counter AND）→ Direction-legal（GSC 过滤）→ Executable（三者齐备、进入 final arbitration 的完整资格）——Executable 生成拍 = Direction-legal 输出拍（概念级 [RTL]；精确 cycle [TODO-RTL]）；
-2. **bank-state-ready vs counter-ready**：**AND**（相与）[RTL 5.1]；
-3. **GSC 参与级**：BSC 之后、FSC 之前（串联过滤 [RTL 5.1]）——**与 Part I S1"CCT∩BSC ready"的窄口径存在表述差**（见 Summary RTL Evidence Conflict RC-1）；
-4. **FSC 序**：Col>Row / critical ref>ACT>PRE>non-critical ref [RTL 5.5.1 确认，非照抄]；
+1. **GSC selection 输入**：CCT normal candidates + 方向 ownership + switching phase + SID 约束 + priority/aging + oldest/RR（九决策块见 14.2 GSC 行）；
+2. **BSC-ready vs counter-ready**：**AND**（相与）[RTL 5.1]；
+3. **GSC 与 BSC 关系**：GSC 在 BSC legality 判定之后消费候选（candidate 先过 legality 再进入 selection）——不是串联 scheduler；
+4. **FSC 多源**：GSC normal command + refresh + DEVMGR + force-precharge 汇合；FSC 序 = Col>Row / critical ref>ACT>PRE>non-critical ref [RTL 5.5.1 确认，非照抄]；
 5. **critical ref mask 实现位置**：禁 ACT = ref_act_mask → BSC FSM 收尾态转 ACT_FORBID [RTL]；mask RD/WR = 待 PRE bank 不接业务 [RTL]；force PRE = BSC FORCE_PRE 态（触发源②）[RTL]；打破 Col>Row = FSC 序对 critical ref 的例外 [RTL]；
 6. **渐进式对侧 ACT**：GSC 渐进阶段放宽对侧 ACT 合法性（当前侧 col 继续）[RTL 行为]；具体允许/禁止信号 [TODO-RTL]；
-7. **HBM row+col 同拍**：row/col 线独立 → 可同拍 [SPEC→RTL 能力]；FSC 内部是双 lane 还是同拍两类 winner——[TODO-RTL]（素材未明确，不推断）；
+7. **HBM row+col 同拍**：row/col 线独立 → 可同拍 [SPEC→RTL 能力]；FSC 内部是双 lane 还是同拍两类 winner——[TODO-RTL]（素材未明确，不推断）；dfi_busy 当前 tie 0 [RTL·HBM current config]；
 8. **CCT release feedback**：issue 后释放、CQ 重筛 [RTL 行为]；信号名 [TODO-RTL]。
+
+### 14.3.1 Executed Feedback（命令执行后的状态回收）
+
+```
+command issue（FSC 输出）
+├─ BSC bank FSM：act/pre/rda/wra_executed 事件 → 状态转移（ACTIVTING/ACTIVE/PRECHARGE/WRA_RDA/...）
+├─ timing counter：命令下发拍装载 → 下拍开始倒计时（→Ch15）
+├─ CQ/CCT：issue 反馈 → CCT slot 释放 → CQ 重新筛选（bank 内第二候选获得提名机会）
+└─ DEVMGR：maintenance 命令记账（refresh/RFM 完成度、debt 摊销）→ M1 bookkeeping [RTL·HBM]
+```
+
+反馈与 issue 同源（同一命令事件派生多路 update），不经过独立 confirmation stage——FSM/counter/CQ 的 update 拍 = actual issue 拍 [RTL：counter"命令下发时启动倒计时"、FSM 触发 = act/pre/rda_executed 类事件]。
 
 ## 14.4 Resource / Backpressure Lifetime
 
@@ -2408,6 +2422,7 @@ CCT 上表【Eligible point——candidate 已提名并持有，owner = CQ/CCT�
 | CCT slot | CQ 上表 | 至命令发送 | issue 反馈释放 | bank 内第二候选等待（→S1） |
 | bank FSM row 态 | ACT issue | tRCD→ACTIVE→col 期→PRE | PRECHARGE 收尾/WRA_RDA 内部收口 | 决定 col 合法性（→T3） |
 | direction ownership | GSC 切换完成 | 配额期内 | 配额满/critical/expired/自然切 | 对侧全阻塞（→D1 账单） |
+| normal grant pointer | GSC selection 完成（本拍） | 到 FSC 消费（同拍） | FSC 仲裁后（下一拍重选或保持） | GSC 无输出 → FSC 只剩 refresh/DEVMGR 可发 |
 | switch quota（时间配额） | 方向切换时启动 | 计时中 | 配额满触发切换 | 过小→switch 频繁；过大→对侧 latency |
 | FORCE_PRE 态 | tRASmax/critical 触发 | PRE 下发前 | PRECHARGE | 不可被业务抢占（vs PRE_WAIT 可抢占 [RTL]） |
 | maintenance reservation | ref_act_mask | critical 序列期 | tRFC 满 forbid 撤销 | 全 bank 禁 ACT（→T2/M2） |
@@ -2418,12 +2433,13 @@ CCT 上表【Eligible point——candidate 已提名并持有，owner = CQ/CCT�
 
 ## 14.6 Known RTL Limitation
 
-> **Ch14 = FROZEN**（Part III Batch 2 Final Freeze Patch：RC-1 RESOLVED 六层口径；本节 limitation 为冻结时登记项，reopen 条件同全局。）
+> **Ch14 = FROZEN**（Part III Batch 2 Final Freeze Patch + RTL 集成复核：三层 CS 结构 [BSC legality / GSC normal selection / FSC final arbitration]；RC-1 六层口径为历史版本，见 14.3 历史注。本节 limitation 为冻结时登记项，reopen 条件同全局。）
 
 - GSC 渐进切换的允许/禁止具体信号 [TODO-RTL]；
 - HBM FSC 双发内部结构（双 lane vs 同拍双 winner）[TODO-RTL]；
 - CCT release feedback 信号名 [TODO-RTL]；
-- executable 组合的精确 cycle 拍点 [TODO-RTL]。
+- GSC normal selection 的精确 cycle 拍点（selection 相对 BSC legality 输出的 latency）[TODO-RTL]；
+- FSC 多源汇合的输入 priority 详表（refresh vs DEVMGR vs normal 的相对序）[TODO-RTL]。
 # 15. Timing Counter — RTL Implementation Reference
 
 > Implements：**T1/T2/T3**（五级 counter 的 ready/forbid 生成）、**M2**（tRFC forbid）、**M3**（Odd/Even watchdog 的 RTL 侧）、**M4**（tDRFM 家族）、**P1**（面积/数量口径）。
@@ -2460,7 +2476,7 @@ command issue event（act/pre/rd/wr/rda/wra/ref/rfm…）
 → counter load（value = CSR 配置；方向 = down/up）
 → counting（非零期间 forbid 对应命令类 ready 拉低【backpressure point】；
    归零后静默【门控时钟友好】）
-→ ready 输出 → BSC 相与 → executable（→Ch14）
+→ ready 输出 → BSC 相与 → 可发 CCT（→Ch14）
 inline 分支：上行计数 → 阈值比较 → 事件（FORCE_PRE 等）
 window 分支：错相 slot 轮流 load → 全有效 → forbid（tFAW）
 watchdog 分支：round-pair 累计 → 阈值 → critical 事件（→M2）
@@ -2821,7 +2837,7 @@ arbiter+worker/四 idle/drain → **G1**；transition-entry point 执行端 → 
 | blocked_timing | —（无 per-timing blocker counter） | ready 态(dbg_obv)+命令 mix | **Top5 lost-slot sweep**（6-Q-02 口径） | 细分归因 model-only |
 | blocked_direction | —（无 switch/sec counter） | 方向态+命令 mix | switch count/turnaround/hidden tRCD | 三项全 model |
 | blocked_maintenance | **REFpb/REFab/RFMpb 计数 + ref_critical** | +tier 分布 [MODEL] | blocked-only-by-refresh / postpone sweep | **DRFM absent（X-P1-09）** |
-| blocked_policy | —（无 eligible-but-not-selected counter） | executable 态+selected 对比（模型） | 归因序列 | X-P1-08 的直接输入缺口 |
+| blocked_policy | FSC selected 拍 vs GSC 可用拍对比（模型） | — | 归因序列 | X-P1-08 的直接输入缺口 |
 | blocked_data | —（无 WDP counter） | fetch FIFO/恒等式反推 | WDP histogram | **absent→[TODO-MEASURE]** |
 | blocked_DFI_PHY | —（无 global unavailable counter） | DEVMGR FSM+CS 停发 | 握手 trace | normal path 无握手信号可观测 |
 | issued-but-inefficient | 命令 mix（部分） | — | bytes/BE/RMW/AP 效率 | **payload 侧 absent**→O2-P1-01 证据现状 |
@@ -2980,7 +2996,7 @@ arbiter+worker/四 idle/drain → **G1**；transition-entry point 执行端 → 
 
 **PF-P1-01 · CS prefetch window 收益量化**
 - Question：8 个 PF entry 的覆盖行为？等效 2GHz 实测达成度？
-- Why：7.8 是重大架构迭代但缺 Proof（0.9 第 8 问缺位——视为尚未完成）。
+- Why：7.8 是重大架构迭代但缺证据（0.9 第 8 问缺位——视为尚未完成）。
 - Known：机制全貌（7.8）。
 - Unknown：性能数据。
 - Need：[TODO-MEASURE] | Affected：7.8 | Status: OPEN
