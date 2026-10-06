@@ -138,7 +138,8 @@ total cycles = issued_useful
 | refresh debt/credit/档位/ab-pb 模式 | 独立 refresh 模块 |
 | RFM 激活债（per-bank ACT 计数） | refresh/RFM 模块 |
 | credit | PA ↔ CQ（grant 消耗、离开 CAM 归还） |
-| write data ready | XMU / WDP |
+| write-data complete（XMU 侧 retention） | XMU |
+| WDP data-ready（entry 数据就绪） | WDP |
 | CCT 占用 | CQ（RD/WR 两张 per-bank 单槽） |
 | 读返回保序 | XMU link list / reorder buffer |
 | 全局转换 | DEVMGR（arbiter + worker） |
@@ -2938,14 +2939,22 @@ arbiter+worker/四 idle/drain → **G1**；transition-entry point 执行端 → 
 - **Ch17 batch 3 结论：PARTIAL**——已确认 [RTL]：ratio 术语与定标、phase0 纪律、rolling ptr 在 DFI（起点 0/ctrlUpd·phyUpd 复位）、PhyWrLat 取数节奏（tphy_wrlat·多 cycle）、dfi_rddata_en 定时 vs data_valid 分离、PF window 结构、normal path 无 per-command 握手（scope 已收窄）；仍 OPEN：latency 数值档 / rolling 全语义 / 低功耗握手全集。
 - Need：[TODO-SPEC]（DFI v5.x）+ [TODO-RTL] | Affected：Ch8 DP3 / Ch17 | Status: **PARTIAL**
 
-**7-P1-04 · CA parity responsibility boundary**（Part III batch 3 更新）
-- Question：谁生成 parity？谁检测？谁 latch/report？error 后 normal path 是否继续？是否 retry/retrain？
-- Ch17 结论：**generation = controller 侧**（dfi_address 编码时生成 [RTL]）；detection / latch / report / reset-retrain 语义未确认 [TODO-SPEC/RTL]；Detection domain ≠ root-cause domain 原则适用（CA parity error 强指向 CA path，非自动物理根因）。
+**7-P1-04 · CA parity responsibility boundary**（Part III batch 3 更新；Phase 5 Final Micro Patch schema 补全）
+- Question：谁生成 parity？谁检测？谁 latch/report？error 后 normal command path 是否继续？是否 retry / retrain / reset？
+- Why：CA parity 跨越 controller / DFI / PHY / RAS 边界——ownership 不清会混淆 generation、detection、error reporting、recovery responsibility，并影响 R1 / DP3 的 correctness boundary。
+- Known：generation = **controller 侧**（dfi_address 编码阶段生成 [RTL]）；Detection domain ≠ root-cause domain（CA parity error 强指向 CA path，非自动物理根因）。
+- Unknown：detection owner；latch owner；report / interrupt owner；parity error 后 normal command path 是否继续；是否 retry；是否 retrain / reset；exact protocol responsibility boundary。
+- Need：[TODO-SPEC] + [TODO-RTL]
+- Affected：Ch10 R1 · Ch17 DFI · 必要时 Ch8 DP3
 - Status: **PARTIAL**
 
-**7-P1-05 · Write CRC protocol scope**（Part III batch 3 更新）
-- Question：哪些 protocol enable？generation 所在 module？覆盖粒度？controller vs PHY 责任？error feedback？
-- Ch17 结论：generation = WDP 读出侧 [RTL]；传输 = 增加 BL 方式；覆盖 = 每 4bit DQ × BL16 [RTL·DDR]；协议适用范围 / error feedback 通路 [TODO-SPEC]。
+**7-P1-05 · Write CRC protocol scope**（Part III batch 3 更新；Phase 5 Final Micro Patch schema 补全）
+- Question：哪些 protocol enable？generation 在哪？覆盖粒度？controller vs PHY responsibility？error feedback？retry / recovery？
+- Why：Write CRC 的 protocol applicability、generation/checking boundary、error feedback path 会影响 DP1 data path、R1 error handling、DP3 DFI contract——不能把当前 DDR RTL 行为泛化到所有 protocol。
+- Known：generation = **WDP readout side** [RTL]；当前 DDR 实现：transmission uses extra BL；coverage = 每 4bit DQ × BL16 [RTL·DDR]（**不外推至 LPDDR / HBM / 其他 DDR generation**）。
+- Unknown：exact protocol applicability；controller vs PHY checking responsibility；CRC error feedback path；retry / recovery semantics；是否存在 protocol-specific difference。
+- Need：[TODO-SPEC] + [TODO-RTL]
+- Affected：Ch10 R1 · Ch16 WDP/RDP · Ch17 DFI · 必要时 Ch8 DP1 / DP3
 - Status: **PARTIAL**
 
 **PF-P1-01 · CS prefetch window 收益量化**
@@ -3044,7 +3053,7 @@ arbiter+worker/四 idle/drain → **G1**；transition-entry point 执行端 → 
 - Question：9×tREFI 间隔上限、最多 8 次 postpone、上界 9×tREFI−8×tRFC 分别适用于哪些 protocol（DDR4/5、LPDDR4/5/6、HBM3/4）与 refresh mode（ab/pb/sb）？
 - Current Understanding：正文按 DDR/LPDDR 一致口径记载（legacy 4-P0-02 定稿 [SPEC]）；未逐协议 / 逐 mode 复核，不假设 HBM 一致。
 - Missing Evidence：逐 protocol / mode 的 SPEC 条款定位。
-- Need：[TODO-SPEC] | Affected：Ch0.6 / Ch7 M1·M3 / L11 | Status: OPEN
+- Need：[TODO-SPEC] | Affected：Ch0.6 / Ch7 M1·M3 / Memory_Protocal.md（协议适用范围 detail 承接） | Status: OPEN
 
 ## A.3 P2：细节 / 数值
 
@@ -3083,7 +3092,8 @@ arbiter+worker/四 idle/drain → **G1**；transition-entry point 执行端 → 
 | RFM 激活债（per-bank ACT 计数） | refresh/RFM 模块（Ch7 M4） | FSC（达限禁 ACT） | ACT 计数 | RFM 清账（REF 冲销语义 OPEN→RF-P1-02） | [RTL] |
 | DRFM 命令生成 | DEVMGR（地址 = csrBakNDrmRowAddr，Ch7 M5） | FSC / timing counter | DEVMGR 触发生成 | tDRFM 生命周期（三寄存器） | [RTL] |
 | credit（PA↔CQ） | credit 机制（PA grant 消耗） | PA 仲裁 | PA grant | 命令离开 CAM（burst 末条） | [RTL] |
-| write data ready | XMU/WDP（数据收齐才送 PA，→C1/DP1） | PA/FSC | WDP 数据到位 | 数据被消费/所有权移交 | [RTL] |
+| write-data complete（XMU 侧：数据收齐/retention） | XMU（→V1/DP1；XMU-P1-01） | PA / WDP fetch 通路 | W 数据收齐（txn data complete） | WDP fetch（internal buffer ownership transfer） | [RTL] |
+| WDP data-ready（WDP 侧：entry 数据就绪） | WDP（→DP1） | FSC（WR 可发前提）/ DFI write-data path | WDP fetch 完成、数据入 SRAM/merge 完成 | DFI 取走数据 / WDP entry 释放 | [RTL] |
 | WDP entry 生命周期 | WDP（→DP1） | DFI 取数 | fetch 受理 | DFI 取走（ownership transfer） | [RTL] |
 | write BE/DM | WDP 寄存器堆（→DP1） | WAW/RMW merge、DM 生成、编码 | 数据写入/merge | entry 释放 | [RTL] |
 | WDP fetch FIFO | CQ→WDP 通路（→DP1） | WDP | CQ push | WDP 有位受理 | [RTL] |
