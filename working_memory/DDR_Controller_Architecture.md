@@ -430,7 +430,7 @@ Symptom → Observable → Bottleneck Hypothesis → Architecture Cause → Desi
 | RQ | 优先引导 | 次选方向 | 不主动展开 |
 |---|---|---|---|
 | RQ1 | blocked-cycle attribution | CAM visibility | PHY analog |
-| RQ2 | 65% 案例全流程 | counter 能推/不能推边界 | SoC/NoC 内部 |
+| RQ2 | efficiency 度量 + 沿 command path 逐级定位 | counter 能推/不能推边界 | SoC/NoC 内部 |
 | RQ3 | depth sweep proof | burst 双口径+compare path | link list RTL |
 | RQ4 | stride 通式现场推导 | rank 哲学 | DDR5 sub-channel 惯例（OPEN） |
 | RQ5 | H 区间四约束 | streaming vs random 反例 | — |
