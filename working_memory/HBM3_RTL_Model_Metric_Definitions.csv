@@ -1,0 +1,37 @@
+﻿Metric / Column,Source Type,Definition / Measurement Boundary,Formula / Unit,What it tells you / Caveat
+RTL_total_cycles,RTL_RAW,实际RTL仿真完成该case所用总cycle。必须保证RTL与Model完成相同工作量。,cycle,总体吞吐时间基准。只有completed work一致时才适合与Model_total_cycles直接比较。
+MODEL_total_cycles,MODEL_RAW,Python模型完成同一case所用总cycle。,cycle,模型预测总体执行时间。
+CALC_total_cycles_abs_error_pct,DERIVED,模型总cycle相对RTL总cycle的绝对百分比误差。,ABS(MODEL_total_cycles-RTL_total_cycles)/RTL_total_cycles*100%,越小表示总执行时间相关性越好；它不是latency error，也不是“每个cycle误差”。
+RTL_efficiency,RTL_RAW,实际RTL仿真的HBM命令/数据效率，必须使用你现有RTL统计脚本的固定定义。,ratio or %,RTL性能主指标；不要在不同case间更换定义。
+MODEL_efficiency,MODEL_RAW,模型按与RTL一致或已明确映射的效率定义输出。,ratio or %,模型性能预测。HBM3/HBM4若峰值归一化不同，必须单独说明。
+CALC_efficiency_abs_error_pct,DERIVED,模型效率相对RTL效率的绝对百分比误差。,ABS(MODEL_efficiency-RTL_efficiency)/RTL_efficiency*100%,用于模型相关性；注意efficiency本身若以%填入，RTL和Model必须都用相同格式。
+RTL_write_lat_avg_cyc,RTL_RAW,实际仿真写平均latency：AW -> B，完全沿用当前RTL仿真统计口径。,cycle,反映系统/接口可见写延迟；Burst/response细节沿用现有脚本，不在本表重新定义。
+MODEL_write_lat_avg_cyc,MODEL_RAW,模型写平均latency：对应命令产生 -> 对应write data完成写入。,cycle,作为Model侧写latency counterpart。与RTL比较时必须记住起止事件不是同一个接口层。
+CALC_write_lat_avg_abs_error_pct,DERIVED,写平均latency的绝对百分比差。,ABS(MODEL_write_lat_avg_cyc-RTL_write_lat_avg_cyc)/RTL_write_lat_avg_cyc*100%,用于engineering correlation；由于RTL=AW->B、Model=cmd-create->data-write，边界不同，不能把误差完全解释为模型timing误差。
+RTL_write_lat_P99_cyc,RTL_RAW,RTL写latency分布的P99，latency边界仍为AW -> B。,cycle,99%的写请求不超过该延迟；看tail latency。
+MODEL_write_lat_P99_cyc,MODEL_RAW,Model写latency分布P99：命令产生 -> write data完成写入。,cycle,模型tail latency。
+CALC_write_lat_P99_abs_error_pct,DERIVED,写P99的绝对百分比差。,ABS(MODEL_write_lat_P99_cyc-RTL_write_lat_P99_cyc)/RTL_write_lat_P99_cyc*100%,用于tail趋势相关性；同样受两侧measurement boundary不同影响。
+RTL_read_lat_avg_cyc,RTL_RAW,实际仿真读平均latency：AR -> R，完全沿用当前RTL仿真统计口径。,cycle,Burst时first R或last R由你原有仿真脚本定义，本CSV不改变。
+MODEL_read_lat_avg_cyc,MODEL_RAW,模型读平均latency：对应读命令产生 -> 对应link node释放。,cycle,作为Model侧读latency counterpart。
+CALC_read_lat_avg_abs_error_pct,DERIVED,读平均latency的绝对百分比差。,ABS(MODEL_read_lat_avg_cyc-RTL_read_lat_avg_cyc)/RTL_read_lat_avg_cyc*100%,用于engineering correlation；注意RTL与Model测量层级不同。
+RTL_read_lat_P99_cyc,RTL_RAW,RTL读latency P99：AR -> R。,cycle,观察tail latency。
+MODEL_read_lat_P99_cyc,MODEL_RAW,Model读latency P99：读命令产生 -> link node释放。,cycle,模型tail latency。
+CALC_read_lat_P99_abs_error_pct,DERIVED,读P99的绝对百分比差。,ABS(MODEL_read_lat_P99_cyc-RTL_read_lat_P99_cyc)/RTL_read_lat_P99_cyc*100%,看tail趋势是否一致；不要忽略边界差异。
+RTL_ACT / RTL_RD / RTL_WR / RTL_PRE / RTL_REFpb,RTL_RAW,实际RTL仿真对应DRAM command executed count。,count,用于command mix、ACT/COL、refresh行为等相关性。必须统一统计窗口。
+MODEL_ACT / MODEL_RD / MODEL_WR / MODEL_PRE / MODEL_REFpb,MODEL_RAW,模型对应DRAM command executed count。,count,与RTL command count逐项比较可帮助定位总BW误差来自哪里。
+CALC_RTL_ACT_per_COL,DERIVED,RTL ACT命令数 / (RTL RD + RTL WR)。,ACT/(RD+WR),越低通常表示每次ACT服务更多column command；它是command-level locality proxy，不等于精确row-hit rate。
+CALC_MODEL_ACT_per_COL,DERIVED,Model ACT命令数 / (MODEL RD + MODEL WR)。,ACT/(RD+WR),与RTL_ACT_per_COL对照可定位模型对page locality的刻画是否一致。
+RTL_row_hit_pct,RTL_RAW / OPTIONAL,只有RTL真实trace/counter能够直接得到精确row hit时才填；否则留空。,%,不要用ACT/COL反推出一个伪精确row-hit值。
+MODEL_row_hit_pct,MODEL_RAW,模型可根据bank open-row state直接统计的精确row hit比例。,%,若RTL无同口径observable，只用于模型内部分析，不做RTL correlation。
+RTL_CAM_occ_avg / RTL_CAM_occ_P95,RTL_RAW / OPTIONAL,只有实际RTL trace能重建CAM occupancy分布时填写；若RTL只有阈值驻留counter则留空。,entries,平均/P95体现scheduler visibility压力。
+MODEL_CAM_occ_avg / MODEL_CAM_occ_P95,MODEL_RAW,模型逐cycle统计CAM occupancy得到。,entries,用于CAM depth saturation和queue pressure分析。
+RTL_link_occ_peak,RTL_RAW / OPTIONAL,实际RTL能够获取link-node occupancy峰值时填写，否则留空。,entries,判断in-flight资源是否逼近上限。
+MODEL_link_occ_peak,MODEL_RAW,模型link-node occupancy峰值。,entries,用于outstanding/link node sweep。
+RTL_RW_switch_count,RTL_RAW / OPTIONAL,实际RTL统计R/W方向切换次数；无counter/trace则留空。,count,用于证明batch/turnaround机制。
+MODEL_RW_switch_count,MODEL_RAW,模型统计R/W方向切换次数。,count,结合efficiency和latency看batch tradeoff。
+RTL_refresh_critical_count,RTL_RAW / OPTIONAL,实际RTL refresh critical/mandatory进入次数，按现有RTL可观测定义填写。,count,用于refresh postpone实验。
+MODEL_refresh_critical_count,MODEL_RAW,模型对应refresh critical事件计数。,count,用于对照refresh策略及其burstiness。
+Can_Infer,ANALYSIS_TEXT,该组实验在控制变量成立时可以支持的架构结论。,text,不是自动结论；必须结合实际数据填写/验证。
+Interpretation_Rule,ANALYSIS_TEXT,预先定义的数据判读规则。,text,用于防止看到结果后再事后改故事。
+Run_Status,USER_INPUT,实验状态，例如TODO/RUNNING/DONE/INVALID。,text,建议无效run不要删除，标INVALID并在Notes写原因。
+Notes,USER_INPUT,配置差异、异常、脚本版本、测量窗口等备注。,text,建议记录RTL commit/hash、model version、seed以及任何非baseline配置。
